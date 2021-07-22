@@ -125,6 +125,13 @@ bool spapr_ovec_test(SpaprOptionVector *ov, long bitnr)
     return test_bit(bitnr, ov->bitmap) ? true : false;
 }
 
+bool spapr_ovec_empty(SpaprOptionVector *ov)
+{
+    g_assert(ov);
+
+    return bitmap_empty(ov->bitmap, OV_MAXBITS);
+}
+
 static void guest_byte_to_bitmap(uint8_t entry, unsigned long *bitmap,
                                  long bitmap_offset)
 {
@@ -200,8 +207,8 @@ SpaprOptionVector *spapr_ovec_parse_vector(target_ulong table_addr, int vector)
     return ov;
 }
 
-int spapr_ovec_populate_dt(void *fdt, int fdt_offset,
-                           SpaprOptionVector *ov, const char *name)
+int spapr_dt_ovec(void *fdt, int fdt_offset,
+                  SpaprOptionVector *ov, const char *name)
 {
     uint8_t vec[OV_MAXBYTES + 1];
     uint16_t vec_len;
