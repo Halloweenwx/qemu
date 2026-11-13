@@ -11,19 +11,20 @@
  */
 
 #include "qemu/osdep.h"
-#include "sysemu/hostmem.h"
-#include "sysemu/sysemu.h"
+#include "system/hostmem.h"
 #include "qom/object_interfaces.h"
 #include "qemu/memfd.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
+#include "qapi/qapi-builtin-type-infos.h"
+#include "qom/object.h"
+#include "migration/cpr.h"
+#include "system/kvm.h"
+#include <linux/kvm.h>
+#include "qapi/qapi-type-infos-common.h"
 
-#define TYPE_MEMORY_BACKEND_MEMFD "memory-backend-memfd"
+OBJECT_DECLARE_SIMPLE_TYPE(HostMemoryBackendMemfd, MEMORY_BACKEND_MEMFD)
 
-#define MEMORY_BACKEND_MEMFD(obj)                                        \
-    OBJECT_CHECK(HostMemoryBackendMemfd, (obj), TYPE_MEMORY_BACKEND_MEMFD)
-
-typedef struct HostMemoryBackendMemfd HostMemoryBackendMemfd;
 
 struct HostMemoryBackendMemfd {
     HostMemoryBackend parent_obj;
@@ -31,33 +32,87 @@ struct HostMemoryBackendMemfd {
     bool hugetlb;
     uint64_t hugetlbsize;
     bool seal;
+    /*
+     * NOTE: this differs from HostMemoryBackend's guest_memfd_private,
+     * which represents an internally private guest-memfd that only backs
+     * private pages.  Instead, this flag marks the memory backend will
+     * 100% use the guest-memfd pages in-place.
+     */
+    OnOffAuto guest_memfd;
 };
 
-static void
+static bool
 memfd_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
 {
     HostMemoryBackendMemfd *m = MEMORY_BACKEND_MEMFD(backend);
-    char *name;
-    int fd;
+    g_autofree char *name = host_memory_backend_get_name(backend);
+    int fd = cpr_find_fd(name, 0);
+    uint32_t ram_flags;
 
     if (!backend->size) {
         error_setg(errp, "can't create backend with size 0");
-        return;
+        return false;
     }
 
-    fd = qemu_memfd_create(TYPE_MEMORY_BACKEND_MEMFD, backend->size,
-                           m->hugetlb, m->hugetlbsize, m->seal ?
-                           F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL : 0,
-                           errp);
-    if (fd == -1) {
-        return;
+    if (fd >= 0) {
+        goto have_fd;
     }
 
-    name = host_memory_backend_get_name(backend);
-    memory_region_init_ram_from_fd(&backend->mr, OBJECT(backend),
-                                   name, backend->size,
-                                   backend->share, fd, errp);
-    g_free(name);
+    if (m->guest_memfd == ON_OFF_AUTO_ON) {
+        /*
+         * NOTE: guest-memfd ignores seal=on/off because it always
+         * implicitly seals the FD by definition.
+         */
+        if (!backend->share) {
+            error_setg(errp, "guest-memfd=on must be used with share=on");
+            return false;
+        } else if (m->hugetlb) {
+            error_setg(errp, "guest-memfd=on doesn't support hugetlb=on");
+            return false;
+        }
+
+        fd = kvm_create_guest_memfd(backend->size,
+                                    GUEST_MEMFD_FLAG_MMAP |
+                                    GUEST_MEMFD_FLAG_INIT_SHARED,
+                                    errp);
+    } else {
+        fd = qemu_memfd_create(TYPE_MEMORY_BACKEND_MEMFD, backend->size,
+                               m->hugetlb, m->hugetlbsize, m->seal ?
+                               F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL : 0,
+                               errp);
+    }
+
+    if (fd < 0) {
+        return false;
+    }
+    if (!cpr_save_fd(name, 0, fd, errp)) {
+        close(fd);
+        return false;
+    }
+
+have_fd:
+    backend->aligned = true;
+    ram_flags = backend->share ? RAM_SHARED : RAM_PRIVATE;
+    ram_flags |= backend->reserve ? 0 : RAM_NORESERVE;
+    ram_flags |= backend->guest_memfd_private ? RAM_GUEST_MEMFD_PRIVATE : 0;
+    return memory_region_init_ram_from_fd(&backend->mr, OBJECT(backend), name,
+                                          backend->size, ram_flags, fd, 0, errp);
+}
+
+static int
+memfd_backend_get_guest_memfd(Object *o, Error **errp)
+{
+    HostMemoryBackendMemfd *m = MEMORY_BACKEND_MEMFD(o);
+
+    return m->guest_memfd;
+}
+
+static void
+memfd_backend_set_guest_memfd(Object *o, int value, Error **errp)
+{
+    HostMemoryBackendMemfd *m = MEMORY_BACKEND_MEMFD(o);
+
+    m->guest_memfd = value;
 }
 
 static bool
@@ -77,26 +132,22 @@ memfd_backend_set_hugetlbsize(Object *obj, Visitor *v, const char *name,
                               void *opaque, Error **errp)
 {
     HostMemoryBackendMemfd *m = MEMORY_BACKEND_MEMFD(obj);
-    Error *local_err = NULL;
     uint64_t value;
 
     if (host_memory_backend_mr_inited(MEMORY_BACKEND(obj))) {
-        error_setg(&local_err, "cannot change property value");
-        goto out;
+        error_setg(errp, "cannot change property value");
+        return;
     }
 
-    visit_type_size(v, name, &value, &local_err);
-    if (local_err) {
-        goto out;
+    if (!visit_type_uint64(v, name, &value, errp)) {
+        return;
     }
     if (!value) {
-        error_setg(&local_err, "Property '%s.%s' doesn't take value '%"
-                   PRIu64 "'", object_get_typename(obj), name, value);
-        goto out;
+        error_setg(errp, "Property '%s.%s' doesn't take value '%" PRIu64 "'",
+                   object_get_typename(obj), name, value);
+        return;
     }
     m->hugetlbsize = value;
-out:
-    error_propagate(errp, local_err);
 }
 
 static void
@@ -106,7 +157,7 @@ memfd_backend_get_hugetlbsize(Object *obj, Visitor *v, const char *name,
     HostMemoryBackendMemfd *m = MEMORY_BACKEND_MEMFD(obj);
     uint64_t value = m->hugetlbsize;
 
-    visit_type_size(v, name, &value, errp);
+    visit_type_uint64(v, name, &value, errp);
 }
 
 static bool
@@ -132,7 +183,7 @@ memfd_backend_instance_init(Object *obj)
 }
 
 static void
-memfd_backend_class_init(ObjectClass *oc, void *data)
+memfd_backend_class_init(ObjectClass *oc, const void *data)
 {
     HostMemoryBackendClass *bc = MEMORY_BACKEND_CLASS(oc);
 
@@ -141,26 +192,30 @@ memfd_backend_class_init(ObjectClass *oc, void *data)
     if (qemu_memfd_check(MFD_HUGETLB)) {
         object_class_property_add_bool(oc, "hugetlb",
                                        memfd_backend_get_hugetlb,
-                                       memfd_backend_set_hugetlb,
-                                       &error_abort);
+                                       memfd_backend_set_hugetlb);
         object_class_property_set_description(oc, "hugetlb",
-                                              "Use huge pages",
-                                              &error_abort);
-        object_class_property_add(oc, "hugetlbsize", "int",
+                                              "Use huge pages");
+        object_class_property_add(oc, "hugetlbsize", "uint64",
+                                  &uint64_type_info,
                                   memfd_backend_get_hugetlbsize,
                                   memfd_backend_set_hugetlbsize,
-                                  NULL, NULL, &error_abort);
+                                  NULL, NULL);
         object_class_property_set_description(oc, "hugetlbsize",
-                                              "Huge pages size (ex: 2M, 1G)",
-                                              &error_abort);
+                                              "Huge pages size (ex: 2M, 1G)");
     }
+
+    object_class_property_add_enum(oc, "guest-memfd", "OnOffAuto",
+                                   &OnOffAuto_type_info,
+                                   memfd_backend_get_guest_memfd,
+                                   memfd_backend_set_guest_memfd);
+    object_class_property_set_description(oc, "guest-memfd",
+                                          "Use guest memfd");
+
     object_class_property_add_bool(oc, "seal",
                                    memfd_backend_get_seal,
-                                   memfd_backend_set_seal,
-                                   &error_abort);
+                                   memfd_backend_set_seal);
     object_class_property_set_description(oc, "seal",
-                                          "Seal growing & shrinking",
-                                          &error_abort);
+                                          "Seal growing & shrinking");
 }
 
 static const TypeInfo memfd_backend_info = {

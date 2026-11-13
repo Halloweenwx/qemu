@@ -21,7 +21,7 @@
 #define HW_SD_ALLWINNER_SDHOST_H
 
 #include "qom/object.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "hw/sd/sd.h"
 
 /**
@@ -38,6 +38,12 @@
 /** Allwinner sun5i family and newer (A13, H2+, H3, etc) */
 #define TYPE_AW_SDHOST_SUN5I TYPE_AW_SDHOST "-sun5i"
 
+/** Allwinner sun50i-a64 */
+#define TYPE_AW_SDHOST_SUN50I_A64 TYPE_AW_SDHOST "-sun50i-a64"
+
+/** Allwinner sun50i-a64 emmc */
+#define TYPE_AW_SDHOST_SUN50I_A64_EMMC  TYPE_AW_SDHOST "-sun50i-a64-emmc"
+
 /** @} */
 
 /**
@@ -45,19 +51,14 @@
  * @{
  */
 
-#define AW_SDHOST(obj) \
-    OBJECT_CHECK(AwSdHostState, (obj), TYPE_AW_SDHOST)
-#define AW_SDHOST_CLASS(klass) \
-     OBJECT_CLASS_CHECK(AwSdHostClass, (klass), TYPE_AW_SDHOST)
-#define AW_SDHOST_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(AwSdHostClass, (obj), TYPE_AW_SDHOST)
+OBJECT_DECLARE_TYPE(AwSdHostState, AwSdHostClass, AW_SDHOST)
 
 /** @} */
 
 /**
  * Allwinner SD Host Controller object instance state.
  */
-typedef struct AwSdHostState {
+struct AwSdHostState {
     /*< private >*/
     SysBusDevice busdev;
     /*< public >*/
@@ -70,6 +71,12 @@ typedef struct AwSdHostState {
 
     /** Interrupt output signal to notify CPU */
     qemu_irq irq;
+
+    /** Memory region where DMA transfers are done */
+    MemoryRegion *dma_mr;
+
+    /** Address space used internally for DMA transfers */
+    AddressSpace dma_as;
 
     /** Number of bytes left in current DMA transfer */
     uint32_t transfer_cnt;
@@ -109,11 +116,12 @@ typedef struct AwSdHostState {
     uint32_t startbit_detect;   /**< eMMC DDR Start Bit Detection Control */
     uint32_t response_crc;      /**< Response CRC */
     uint32_t data_crc[8];       /**< Data CRC */
+    uint32_t sample_delay;      /**< Sample delay control */
     uint32_t status_crc;        /**< Status CRC */
 
     /** @} */
 
-} AwSdHostState;
+};
 
 /**
  * Allwinner SD Host Controller class-level struct.
@@ -122,14 +130,17 @@ typedef struct AwSdHostState {
  * such that the generic code can use this struct to support
  * all devices.
  */
-typedef struct AwSdHostClass {
+struct AwSdHostClass {
     /*< private >*/
     SysBusDeviceClass parent_class;
     /*< public >*/
 
     /** Maximum buffer size in bytes per DMA descriptor */
     size_t max_desc_size;
+    bool   is_sun4i;
 
-} AwSdHostClass;
+    /** does the IP block support autocalibration? */
+    bool can_calibrate;
+};
 
 #endif /* HW_SD_ALLWINNER_SDHOST_H */

@@ -22,6 +22,7 @@
  * along with this program; if not, see <http://www.gnu.org/licenses/>.
  */
 
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -41,7 +42,7 @@ do                                                             \
   }                                                            \
 } while (0)
 
-unsigned char *dummybuf;
+unsigned char *dummybuf; /* length is 2*pagesize */
 static unsigned int pagesize;
 static unsigned int pagemask;
 int test_fd;
@@ -49,64 +50,62 @@ size_t test_fsize;
 
 void check_aligned_anonymous_unfixed_mmaps(void)
 {
-	void *p1;
-	void *p2;
-	void *p3;
-	void *p4;
-	void *p5;
-	uintptr_t p;
-	int i;
+    void *p1;
+    void *p2;
+    void *p3;
+    void *p4;
+    void *p5;
+    uintptr_t p;
+    int i;
+    fprintf(stdout, "%s", __func__);
+    for (i = 0; i < 8; i++) {
+        size_t len;
+        len = pagesize + (pagesize * i);
+        p1 = mmap(NULL, len, PROT_READ,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        p2 = mmap(NULL, len, PROT_READ,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        p3 = mmap(NULL, len, PROT_READ,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        p4 = mmap(NULL, len, PROT_READ,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        p5 = mmap(NULL, len, PROT_READ,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 
-	fprintf(stdout, "%s", __func__);
-	for (i = 0; i < 0x1fff; i++)
-	{
-		size_t len;
+        /*
+         * Make sure we get pages aligned with the pagesize. The
+         * target expects this.
+         */
+        fail_unless(p1 != MAP_FAILED);
+        fail_unless(p2 != MAP_FAILED);
+        fail_unless(p3 != MAP_FAILED);
+        fail_unless(p4 != MAP_FAILED);
+        fail_unless(p5 != MAP_FAILED);
+        p = (uintptr_t) p1;
+        D(printf("p=%x\n", p));
+        fail_unless((p & pagemask) == 0);
+        p = (uintptr_t) p2;
+        fail_unless((p & pagemask) == 0);
+        p = (uintptr_t) p3;
+        fail_unless((p & pagemask) == 0);
+        p = (uintptr_t) p4;
+        fail_unless((p & pagemask) == 0);
+        p = (uintptr_t) p5;
+        fail_unless((p & pagemask) == 0);
 
-		len = pagesize + (pagesize * i & 7);
-		p1 = mmap(NULL, len, PROT_READ, 
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		p2 = mmap(NULL, len, PROT_READ, 
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		p3 = mmap(NULL, len, PROT_READ, 
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		p4 = mmap(NULL, len, PROT_READ, 
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		p5 = mmap(NULL, len, PROT_READ, 
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-
-		/* Make sure we get pages aligned with the pagesize. The
-		   target expects this.  */
-		fail_unless (p1 != MAP_FAILED);
-		fail_unless (p2 != MAP_FAILED);
-		fail_unless (p3 != MAP_FAILED);
-		fail_unless (p4 != MAP_FAILED);
-		fail_unless (p5 != MAP_FAILED);
-		p = (uintptr_t) p1;
-		D(printf ("p=%x\n", p));
-		fail_unless ((p & pagemask) == 0);
-		p = (uintptr_t) p2;
-		fail_unless ((p & pagemask) == 0);
-		p = (uintptr_t) p3;
-		fail_unless ((p & pagemask) == 0);
-		p = (uintptr_t) p4;
-		fail_unless ((p & pagemask) == 0);
-		p = (uintptr_t) p5;
-		fail_unless ((p & pagemask) == 0);
-
-		/* Make sure we can read from the entire area.  */
-		memcpy (dummybuf, p1, pagesize);
-		memcpy (dummybuf, p2, pagesize);
-		memcpy (dummybuf, p3, pagesize);
-		memcpy (dummybuf, p4, pagesize);
-		memcpy (dummybuf, p5, pagesize);
-
-		munmap (p1, len);
-		munmap (p2, len);
-		munmap (p3, len);
-		munmap (p4, len);
-		munmap (p5, len);
-	}
-	fprintf(stdout, " passed\n");
+        /* Make sure we can read from the entire area.  */
+        memcpy(dummybuf, p1, pagesize);
+        memcpy(dummybuf, p2, pagesize);
+        memcpy(dummybuf, p3, pagesize);
+        memcpy(dummybuf, p4, pagesize);
+        memcpy(dummybuf, p5, pagesize);
+        munmap(p1, len);
+        munmap(p2, len);
+        munmap(p3, len);
+        munmap(p4, len);
+        munmap(p5, len);
+    }
+    fprintf(stdout, " passed\n");
 }
 
 void check_large_anonymous_unfixed_mmap(void)
@@ -135,52 +134,54 @@ void check_large_anonymous_unfixed_mmap(void)
 
 void check_aligned_anonymous_unfixed_colliding_mmaps(void)
 {
-	char *p1;
-	char *p2;
-	char *p3;
-	uintptr_t p;
-	int i;
+    char *p1;
+    char *p2;
+    char *p3;
+    uintptr_t p;
+    int i;
 
-	fprintf(stdout, "%s", __func__);
-	for (i = 0; i < 0x2fff; i++)
-	{
-		int nlen;
-		p1 = mmap(NULL, pagesize, PROT_READ, 
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		fail_unless (p1 != MAP_FAILED);
-		p = (uintptr_t) p1;
-		fail_unless ((p & pagemask) == 0);
-		memcpy (dummybuf, p1, pagesize);
+    fprintf(stdout, "%s", __func__);
+    for (i = 0; i < 2; i++) {
+        int nlen;
+        p1 = mmap(NULL, pagesize, PROT_READ,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        fail_unless(p1 != MAP_FAILED);
+        p = (uintptr_t) p1;
+        fail_unless((p & pagemask) == 0);
+        memcpy(dummybuf, p1, pagesize);
 
-		p2 = mmap(NULL, pagesize, PROT_READ, 
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		fail_unless (p2 != MAP_FAILED);
-		p = (uintptr_t) p2;
-		fail_unless ((p & pagemask) == 0);
-		memcpy (dummybuf, p2, pagesize);
+        p2 = mmap(NULL, pagesize, PROT_READ,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        fail_unless(p2 != MAP_FAILED);
+        p = (uintptr_t) p2;
+        fail_unless((p & pagemask) == 0);
+        memcpy(dummybuf, p2, pagesize);
 
 
-		munmap (p1, pagesize);
-		nlen = pagesize * 8;
-		p3 = mmap(NULL, nlen, PROT_READ, 
-			  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-		fail_unless (p3 != MAP_FAILED);
+        munmap(p1, pagesize);
+        nlen = pagesize * 8;
+        p3 = mmap(NULL, nlen, PROT_READ,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        fail_unless(p3 != MAP_FAILED);
 
-		/* Check if the mmaped areas collide.  */
-		if (p3 < p2 
-		    && (p3 + nlen) > p2)
-			fail_unless (0);
+        /* Check if the mmaped areas collide.  */
+        if (p3 < p2
+            && (p3 + nlen) > p2) {
+            fail_unless(0);
+        }
 
-		memcpy (dummybuf, p3, pagesize);
+        memcpy(dummybuf, p3, pagesize);
 
-		/* Make sure we get pages aligned with the pagesize. The
-		   target expects this.  */
-		p = (uintptr_t) p3;
-		fail_unless ((p & pagemask) == 0);
-		munmap (p2, pagesize);
-		munmap (p3, nlen);
-	}
-	fprintf(stdout, " passed\n");
+        /*
+         * Make sure we get pages aligned with the pagesize. The
+         * target expects this.
+         */
+        p = (uintptr_t) p3;
+        fail_unless((p & pagemask) == 0);
+        munmap(p2, pagesize);
+        munmap(p3, nlen);
+    }
+    fprintf(stdout, " passed\n");
 }
 
 void check_aligned_anonymous_fixed_mmaps(void)
@@ -441,15 +442,71 @@ void check_invalid_mmaps(void)
 
     /* Attempt to map a zero length page.  */
     addr = mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    fprintf(stdout, "%s addr=%p", __func__, (void *)addr);
+    fprintf(stdout, "%s addr=%p errno=%d\n", __func__, (void *)addr, errno);
     fail_unless(addr == MAP_FAILED);
     fail_unless(errno == EINVAL);
 
     /* Attempt to map a over length page.  */
     addr = mmap(NULL, -4, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    fprintf(stdout, "%s addr=%p", __func__, (void *)addr);
+    fprintf(stdout, "%s addr=%p errno=%d\n", __func__, (void *)addr, errno);
     fail_unless(addr == MAP_FAILED);
     fail_unless(errno == ENOMEM);
+
+    /* Attempt to remap a region which exceeds the bounds of memory. */
+    addr = mremap((void *)((uintptr_t)pagesize * 10), SIZE_MAX & ~(size_t)pagemask, pagesize, 0);
+    fprintf(stdout, "%s mremap addr=%p errno=%d\n", __func__, (void *)addr, errno);
+    fail_unless(addr == MAP_FAILED);
+    fail_unless(errno == EFAULT);
+
+    fprintf(stdout, " passed\n");
+}
+
+void check_shrink_mmaps(void)
+{
+    unsigned char *a, *b, *c;
+    a = mmap(NULL, pagesize * 2, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    fprintf(stdout, "%s addr=%p errno=%d\n", __func__, (void *)a, errno);
+    b = mmap(NULL, pagesize * 2, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    fprintf(stdout, "%s addr=%p errno=%d\n", __func__, (void *)b, errno);
+    c = mmap(NULL, pagesize * 2, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    fprintf(stdout, "%s addr=%p errno=%d\n", __func__, (void *)c, errno);
+
+    fail_unless(a != MAP_FAILED);
+    fail_unless(b != MAP_FAILED);
+    fail_unless(c != MAP_FAILED);
+
+    /* Ensure we can read the full mappings */
+    memcpy(dummybuf, a, 2 * pagesize);
+    memcpy(dummybuf, b, 2 * pagesize);
+    memcpy(dummybuf, c, 2 * pagesize);
+
+    /* Shrink the middle mapping in-place; the others should be unaffected */
+    b = mremap(b, pagesize * 2, pagesize, 0);
+    fprintf(stdout, "%s mremap addr=%p errno=%d\n", __func__, (void *)b, errno);
+    fail_unless(b != MAP_FAILED);
+
+    /* Ensure we can still access all valid mappings */
+    memcpy(dummybuf, a, 2 * pagesize);
+    memcpy(dummybuf, b, pagesize);
+    memcpy(dummybuf, c, 2 * pagesize);
+
+    munmap(a, 2 * pagesize);
+    munmap(b, pagesize);
+    munmap(c, 2 * pagesize);
+
+    fprintf(stdout, " passed\n");
+}
+
+void check_mmaps_beyond_addr_space(void)
+{
+    unsigned char *addr;
+    addr = mmap((void *)(-(unsigned long)pagesize * 10), pagesize * 2,
+                PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    fprintf(stdout, "%s addr=%p errno=%d", __func__, (void *)addr, errno);
+    fail_unless(addr != MAP_FAILED);
+
+    memcpy(dummybuf, addr, 2 * pagesize);
+    munmap(addr, 2 * pagesize);
 
     fprintf(stdout, " passed\n");
 }
@@ -468,7 +525,7 @@ int main(int argc, char **argv)
 
 	/* Assume pagesize is a power of two.  */
 	pagemask = pagesize - 1;
-	dummybuf = malloc (pagesize);
+	dummybuf = malloc (pagesize * 2);
 	printf ("pagesize=%u pagemask=%x\n", pagesize, pagemask);
 
 	test_fd = mkstemp(tempname);
@@ -496,6 +553,8 @@ int main(int argc, char **argv)
 	check_file_fixed_eof_mmaps();
 	check_file_unfixed_eof_mmaps();
 	check_invalid_mmaps();
+    check_shrink_mmaps();
+    check_mmaps_beyond_addr_space();
 
 	/* Fails at the moment.  */
 	/* check_aligned_anonymous_fixed_mmaps_collide_with_host(); */

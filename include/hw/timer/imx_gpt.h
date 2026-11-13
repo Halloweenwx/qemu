@@ -6,6 +6,7 @@
  * Originally written by Hans Jiang
  * Updated by Peter Chubb
  * Updated by Jean-Christophe Dubois <jcd@tribudubois.net>
+ * Updated by Gaurav Sharma <gaurav.sharma_7@nxp.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -29,9 +30,10 @@
 #ifndef IMX_GPT_H
 #define IMX_GPT_H
 
-#include "hw/sysbus.h"
-#include "hw/ptimer.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/ptimer.h"
 #include "hw/misc/imx_ccm.h"
+#include "qom/object.h"
 
 /*
  * GPT : General purpose timer
@@ -77,13 +79,18 @@
 #define TYPE_IMX25_GPT "imx25.gpt"
 #define TYPE_IMX31_GPT "imx31.gpt"
 #define TYPE_IMX6_GPT "imx6.gpt"
+#define TYPE_IMX6UL_GPT "imx6ul.gpt"
 #define TYPE_IMX7_GPT "imx7.gpt"
+#define TYPE_IMX8MP_GPT "imx8mp.gpt"
+#define TYPE_IMX8MM_GPT "imx8mm.gpt"
 
 #define TYPE_IMX_GPT TYPE_IMX25_GPT
 
-#define IMX_GPT(obj) OBJECT_CHECK(IMXGPTState, (obj), TYPE_IMX_GPT)
+typedef struct IMXGPTState IMXGPTState;
+DECLARE_INSTANCE_CHECKER(IMXGPTState, IMX_GPT,
+                         TYPE_IMX_GPT)
 
-typedef struct IMXGPTState{
+struct IMXGPTState {
     /*< private >*/
     SysBusDevice parent_obj;
 
@@ -111,6 +118,6 @@ typedef struct IMXGPTState{
     qemu_irq irq;
 
     const IMXClk *clocks;
-} IMXGPTState;
+};
 
 #endif /* IMX_GPT_H */

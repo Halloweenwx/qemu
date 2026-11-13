@@ -27,6 +27,9 @@
  *    implement the security extensions
  *  + QOM property "has-virtualization-extensions": set true if the GIC should
  *    implement the virtualization extensions
+ *  + QOM property "first-cpu-index": index of the first cpu attached to the
+ *    GIC (default 0). The CPUs connected to the GIC are assumed to be
+ *    first-cpu-index, first-cpu-index + 1, ... first-cpu-index + num-cpu - 1.
  *  + unnamed GPIO inputs: (where P is number of SPIs, i.e. num-irq - 32)
  *    [0..P-1]  SPIs
  *    [P..P+31] PPIs for CPU 0
@@ -65,26 +68,25 @@
 #define HW_ARM_GIC_H
 
 #include "arm_gic_common.h"
+#include "qom/object.h"
 
 /* Number of SGI target-list bits */
 #define GIC_TARGETLIST_BITS 8
-#define GIC_MAX_PRIORITY_BITS 8
-#define GIC_MIN_PRIORITY_BITS 4
 
 #define TYPE_ARM_GIC "arm_gic"
-#define ARM_GIC(obj) \
-     OBJECT_CHECK(GICState, (obj), TYPE_ARM_GIC)
-#define ARM_GIC_CLASS(klass) \
-     OBJECT_CLASS_CHECK(ARMGICClass, (klass), TYPE_ARM_GIC)
-#define ARM_GIC_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(ARMGICClass, (obj), TYPE_ARM_GIC)
+typedef struct ARMGICClass ARMGICClass;
+/* This is reusing the GICState typedef from TYPE_ARM_GIC_COMMON */
+DECLARE_OBJ_CHECKERS(GICState, ARMGICClass,
+                     ARM_GIC, TYPE_ARM_GIC)
 
-typedef struct ARMGICClass {
+struct ARMGICClass {
     /*< private >*/
     ARMGICCommonClass parent_class;
     /*< public >*/
 
     DeviceRealize parent_realize;
-} ARMGICClass;
+};
+
+const char *gic_class_name(void);
 
 #endif

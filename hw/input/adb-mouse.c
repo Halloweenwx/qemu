@@ -29,42 +29,76 @@
 #include "qemu/module.h"
 #include "adb-internal.h"
 #include "trace.h"
+#include "qom/object.h"
 
-#define ADB_MOUSE(obj) OBJECT_CHECK(MouseState, (obj), TYPE_ADB_MOUSE)
+OBJECT_DECLARE_TYPE(MouseState, ADBMouseClass, ADB_MOUSE)
 
-typedef struct MouseState {
+struct MouseState {
     /*< public >*/
     ADBDevice parent_obj;
     /*< private >*/
 
+    QemuInputHandlerState *hs;
     int buttons_state, last_buttons_state;
     int dx, dy, dz;
-} MouseState;
+};
 
-#define ADB_MOUSE_CLASS(class) \
-    OBJECT_CLASS_CHECK(ADBMouseClass, (class), TYPE_ADB_MOUSE)
-#define ADB_MOUSE_GET_CLASS(obj) \
-    OBJECT_GET_CLASS(ADBMouseClass, (obj), TYPE_ADB_MOUSE)
 
-typedef struct ADBMouseClass {
+struct ADBMouseClass {
     /*< public >*/
     ADBDeviceClass parent_class;
     /*< private >*/
 
     DeviceRealize parent_realize;
-} ADBMouseClass;
+};
 
-static void adb_mouse_event(void *opaque,
-                            int dx1, int dy1, int dz1, int buttons_state)
+#define ADB_MOUSE_BUTTON_LEFT   0x01
+#define ADB_MOUSE_BUTTON_RIGHT  0x02
+
+static void adb_mouse_handle_event(DeviceState *dev, QemuConsole *src,
+                                   QemuInputEvent *evt)
 {
-    MouseState *s = opaque;
+    MouseState *s = (MouseState *)dev;
+    static const int bmap[INPUT_BUTTON__MAX] = {
+        [INPUT_BUTTON_LEFT]   = ADB_MOUSE_BUTTON_LEFT,
+        [INPUT_BUTTON_RIGHT]  = ADB_MOUSE_BUTTON_RIGHT,
+    };
 
-    s->dx += dx1;
-    s->dy += dy1;
-    s->dz += dz1;
-    s->buttons_state = buttons_state;
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_REL:
+        if (evt->rel.axis == INPUT_AXIS_X) {
+            s->dx += evt->rel.value;
+        } else if (evt->rel.axis == INPUT_AXIS_Y) {
+            s->dy += evt->rel.value;
+        }
+        break;
+
+    case INPUT_EVENT_KIND_BTN:
+        if (bmap[evt->btn.button]) {
+            if (evt->btn.down) {
+                s->buttons_state |= bmap[evt->btn.button];
+            } else {
+                s->buttons_state &= ~bmap[evt->btn.button];
+            }
+        }
+        break;
+
+    default:
+        /* keep gcc happy */
+        break;
+    }
 }
 
+static const QemuInputHandler adb_mouse_handler = {
+    .name  = "QEMU ADB Mouse",
+    .mask  = INPUT_EVENT_MASK_BTN | INPUT_EVENT_MASK_REL,
+    .event = adb_mouse_handle_event,
+    /*
+     * We do not need the .sync handler because unlike e.g. PS/2 where async
+     * mouse events are sent over the serial port, an ADB mouse is constantly
+     * polled by the host via the adb_mouse_poll() callback.
+     */
+};
 
 static int adb_mouse_poll(ADBDevice *d, uint8_t *obuf)
 {
@@ -97,10 +131,10 @@ static int adb_mouse_poll(ADBDevice *d, uint8_t *obuf)
     dx &= 0x7f;
     dy &= 0x7f;
 
-    if (!(s->buttons_state & MOUSE_EVENT_LBUTTON)) {
+    if (!(s->buttons_state & ADB_MOUSE_BUTTON_LEFT)) {
         dy |= 0x80;
     }
-    if (!(s->buttons_state & MOUSE_EVENT_RBUTTON)) {
+    if (!(s->buttons_state & ADB_MOUSE_BUTTON_RIGHT)) {
         dx |= 0x80;
     }
 
@@ -121,7 +155,7 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
         s->dx = 0;
         s->dy = 0;
         s->dz = 0;
-        trace_adb_mouse_flush();
+        trace_adb_device_mouse_flush();
         return 0;
     }
 
@@ -130,11 +164,21 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
     olen = 0;
     switch (cmd) {
     case ADB_WRITEREG:
-        trace_adb_mouse_writereg(reg, buf[1]);
+        trace_adb_device_mouse_writereg(reg, buf[1]);
         switch (reg) {
         case 2:
             break;
         case 3:
+            /*
+             * MacOS 9 has a bug in its ADB driver whereby after configuring
+             * the ADB bus devices it sends another write of invalid length
+             * to reg 3. Make sure we ignore it to prevent an address clash
+             * with the previous device.
+             */
+            if (len != 3) {
+                return 0;
+            }
+
             switch (buf[2]) {
             case ADB_CMD_SELF_TEST:
                 break;
@@ -142,30 +186,28 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
             case ADB_CMD_CHANGE_ID_AND_ACT:
             case ADB_CMD_CHANGE_ID_AND_ENABLE:
                 d->devaddr = buf[1] & 0xf;
-                trace_adb_mouse_request_change_addr(d->devaddr);
+                trace_adb_device_mouse_request_change_addr(d->devaddr);
                 break;
             default:
-                if (!d->disable_direct_reg3_writes) {
-                    d->devaddr = buf[1] & 0xf;
-
-                    /* we support handlers:
-                     * 0x01: Classic Apple Mouse Protocol / 100 cpi operations
-                     * 0x02: Classic Apple Mouse Protocol / 200 cpi operations
-                     * we don't support handlers (at least):
-                     * 0x03: Mouse systems A3 trackball
-                     * 0x04: Extended Apple Mouse Protocol
-                     * 0x2f: Microspeed mouse
-                     * 0x42: Macally
-                     * 0x5f: Microspeed mouse
-                     * 0x66: Microspeed mouse
-                     */
-                    if (buf[2] == 1 || buf[2] == 2) {
-                        d->handler = buf[2];
-                    }
-
-                    trace_adb_mouse_request_change_addr_and_handler(
-                        d->devaddr, d->handler);
+                d->devaddr = buf[1] & 0xf;
+                /*
+                 * we support handlers:
+                 * 0x01: Classic Apple Mouse Protocol / 100 cpi operations
+                 * 0x02: Classic Apple Mouse Protocol / 200 cpi operations
+                 * we don't support handlers (at least):
+                 * 0x03: Mouse systems A3 trackball
+                 * 0x04: Extended Apple Mouse Protocol
+                 * 0x2f: Microspeed mouse
+                 * 0x42: Macally
+                 * 0x5f: Microspeed mouse
+                 * 0x66: Microspeed mouse
+                 */
+                if (buf[2] == 1 || buf[2] == 2) {
+                    d->handler = buf[2];
                 }
+
+                trace_adb_device_mouse_request_change_addr_and_handler(
+                    d->devaddr, d->handler);
                 break;
             }
         }
@@ -183,10 +225,18 @@ static int adb_mouse_request(ADBDevice *d, uint8_t *obuf,
             olen = 2;
             break;
         }
-        trace_adb_mouse_readreg(reg, obuf[0], obuf[1]);
+        trace_adb_device_mouse_readreg(reg, obuf[0], obuf[1]);
         break;
     }
     return olen;
+}
+
+static bool adb_mouse_has_data(ADBDevice *d)
+{
+    MouseState *s = ADB_MOUSE(d);
+
+    return !(s->last_buttons_state == s->buttons_state &&
+             s->dx == 0 && s->dy == 0);
 }
 
 static void adb_mouse_reset(DeviceState *dev)
@@ -204,7 +254,7 @@ static const VMStateDescription vmstate_adb_mouse = {
     .name = "adb_mouse",
     .version_id = 2,
     .minimum_version_id = 2,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_STRUCT(parent_obj, MouseState, 0, vmstate_adb_device,
                        ADBDevice),
         VMSTATE_INT32(buttons_state, MouseState),
@@ -223,7 +273,7 @@ static void adb_mouse_realizefn(DeviceState *dev, Error **errp)
 
     amc->parent_realize(dev, errp);
 
-    qemu_add_mouse_event_handler(adb_mouse_event, s, 0, "QEMU ADB Mouse");
+    s->hs = qemu_input_handler_register(dev, &adb_mouse_handler);
 }
 
 static void adb_mouse_initfn(Object *obj)
@@ -233,7 +283,7 @@ static void adb_mouse_initfn(Object *obj)
     d->devaddr = ADB_DEVID_MOUSE;
 }
 
-static void adb_mouse_class_init(ObjectClass *oc, void *data)
+static void adb_mouse_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     ADBDeviceClass *adc = ADB_DEVICE_CLASS(oc);
@@ -244,7 +294,8 @@ static void adb_mouse_class_init(ObjectClass *oc, void *data)
     set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
 
     adc->devreq = adb_mouse_request;
-    dc->reset = adb_mouse_reset;
+    adc->devhasdata = adb_mouse_has_data;
+    device_class_set_legacy_reset(dc, adb_mouse_reset);
     dc->vmsd = &vmstate_adb_mouse;
 }
 

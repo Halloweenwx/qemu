@@ -25,12 +25,13 @@
 #ifndef SDHCI_H
 #define SDHCI_H
 
-#include "hw/pci/pci.h"
-#include "hw/sysbus.h"
+#include "hw/pci/pci_device.h"
+#include "hw/core/sysbus.h"
 #include "hw/sd/sd.h"
+#include "qom/object.h"
 
 /* SD/MMC host controller state */
-typedef struct SDHCIState {
+struct SDHCIState {
     /*< private >*/
     union {
         PCIDevice pcidev;
@@ -74,6 +75,7 @@ typedef struct SDHCIState {
     uint16_t acmd12errsts; /* Auto CMD12 error status register */
     uint16_t hostctl2;     /* Host Control 2 */
     uint64_t admasysaddr;  /* ADMA System Address Register */
+    uint16_t vendor_spec;  /* Vendor specific register */
 
     /* Read-only registers */
     uint64_t capareg;      /* Capabilities Register */
@@ -96,7 +98,15 @@ typedef struct SDHCIState {
     uint32_t quirks;
     uint8_t sd_spec_version;
     uint8_t uhs_mode;
-} SDHCIState;
+    /*
+     * Write Protect pin default active low for detecting SD card
+     * to be protected. Set wp_inverted to invert the signal.
+     */
+    bool wp_inverted;
+    /* Indicate that SDMA transfer is paused due to hitting the boundary */
+    bool sdma_boundary_paused;
+};
+typedef struct SDHCIState SDHCIState;
 
 /*
  * Controller does not provide transfer-complete interrupt when not
@@ -108,11 +118,15 @@ typedef struct SDHCIState {
 #define SDHCI_QUIRK_NO_BUSY_IRQ    BIT(14)
 
 #define TYPE_PCI_SDHCI "sdhci-pci"
-#define PCI_SDHCI(obj) OBJECT_CHECK(SDHCIState, (obj), TYPE_PCI_SDHCI)
+DECLARE_INSTANCE_CHECKER(SDHCIState, PCI_SDHCI,
+                         TYPE_PCI_SDHCI)
 
 #define TYPE_SYSBUS_SDHCI "generic-sdhci"
-#define SYSBUS_SDHCI(obj)                               \
-     OBJECT_CHECK(SDHCIState, (obj), TYPE_SYSBUS_SDHCI)
+DECLARE_INSTANCE_CHECKER(SDHCIState, SYSBUS_SDHCI,
+                         TYPE_SYSBUS_SDHCI)
+
+#define TYPE_FSL_ESDHC_BE "fsl-esdhc-be"
+#define TYPE_FSL_ESDHC_LE "fsl-esdhc-le"
 
 #define TYPE_IMX_USDHC "imx-usdhc"
 

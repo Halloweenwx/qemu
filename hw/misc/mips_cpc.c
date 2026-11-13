@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -19,14 +19,15 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "cpu.h"
+#include "target/mips/cpu.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "hw/sysbus.h"
+#include "hw/core/cpu.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 
 #include "hw/misc/mips_cpc.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 
 static inline uint64_t cpc_vp_run_mask(MIPSCPCState *cpc)
 {
@@ -38,12 +39,13 @@ static void mips_cpu_reset_async_work(CPUState *cs, run_on_cpu_data data)
     MIPSCPCState *cpc = (MIPSCPCState *) data.host_ptr;
 
     cpu_reset(cs);
+    cs->halted = 0;
     cpc->vp_running |= 1ULL << cs->cpu_index;
 }
 
 static void cpc_run_vp(MIPSCPCState *cpc, uint64_t vp_run)
 {
-    CPUState *cs = first_cpu;
+    CPUState *cs;
 
     CPU_FOREACH(cs) {
         uint64_t i = 1ULL << cs->cpu_index;
@@ -61,7 +63,7 @@ static void cpc_run_vp(MIPSCPCState *cpc, uint64_t vp_run)
 
 static void cpc_stop_vp(MIPSCPCState *cpc, uint64_t vp_stop)
 {
-    CPUState *cs = first_cpu;
+    CPUState *cs;
 
     CPU_FOREACH(cs) {
         uint64_t i = 1ULL << cs->cpu_index;
@@ -91,8 +93,6 @@ static void cpc_write(void *opaque, hwaddr offset, uint64_t data,
                       "%s: Bad offset 0x%x\n",  __func__, (int)offset);
         break;
     }
-
-    return;
 }
 
 static uint64_t cpc_read(void *opaque, hwaddr offset, unsigned size)
@@ -156,24 +156,23 @@ static const VMStateDescription vmstate_mips_cpc = {
     .name = "mips-cpc",
     .version_id = 0,
     .minimum_version_id = 0,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT64(vp_running, MIPSCPCState),
         VMSTATE_END_OF_LIST()
     },
 };
 
-static Property mips_cpc_properties[] = {
+static const Property mips_cpc_properties[] = {
     DEFINE_PROP_UINT32("num-vp", MIPSCPCState, num_vp, 0x1),
     DEFINE_PROP_UINT64("vp-start-running", MIPSCPCState, vp_start_running, 0x1),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void mips_cpc_class_init(ObjectClass *klass, void *data)
+static void mips_cpc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = mips_cpc_realize;
-    dc->reset = mips_cpc_reset;
+    device_class_set_legacy_reset(dc, mips_cpc_reset);
     dc->vmsd = &vmstate_mips_cpc;
     device_class_set_props(dc, mips_cpc_properties);
 }

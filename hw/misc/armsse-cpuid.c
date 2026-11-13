@@ -12,7 +12,7 @@
 /*
  * This is a model of the "CPU_IDENTITY" register block which is part of the
  * Arm SSE-200 and documented in
- * http://infocenter.arm.com/help/topic/com.arm.doc.101104_0100_00_en/corelink_sse200_subsystem_for_embedded_technical_reference_manual_101104_0100_00_en.pdf
+ * https://developer.arm.com/documentation/101104/latest/
  *
  * It consists of one read-only CPUID register (set by QOM property), plus the
  * usual ID registers.
@@ -23,10 +23,10 @@
 #include "qemu/module.h"
 #include "trace.h"
 #include "qapi/error.h"
-#include "hw/sysbus.h"
-#include "hw/registerfields.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/registerfields.h"
 #include "hw/misc/armsse-cpuid.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 
 REG32(CPUID, 0x0)
 REG32(PID4, 0xfd0)
@@ -92,9 +92,8 @@ static const MemoryRegionOps armsse_cpuid_ops = {
     .valid.max_access_size = 4,
 };
 
-static Property armsse_cpuid_props[] = {
+static const Property armsse_cpuid_props[] = {
     DEFINE_PROP_UINT32("CPUID", ARMSSECPUID, cpuid, 0),
-    DEFINE_PROP_END_OF_LIST()
 };
 
 static void armsse_cpuid_init(Object *obj)
@@ -107,7 +106,7 @@ static void armsse_cpuid_init(Object *obj)
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
-static void armsse_cpuid_class_init(ObjectClass *klass, void *data)
+static void armsse_cpuid_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

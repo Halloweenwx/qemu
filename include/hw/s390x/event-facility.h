@@ -16,14 +16,16 @@
 #define HW_S390_SCLP_EVENT_FACILITY_H
 
 #include "qemu/thread.h"
-#include "hw/qdev-core.h"
+#include "hw/core/qdev.h"
 #include "hw/s390x/sclp.h"
+#include "qom/object.h"
 
 /* SCLP event types */
 #define SCLP_EVENT_OPRTNS_COMMAND               0x01
 #define SCLP_EVENT_MESSAGE                      0x02
 #define SCLP_EVENT_CONFIG_MGT_DATA              0x04
 #define SCLP_EVENT_PMSGCMD                      0x09
+#define SCLP_EVENT_CTRL_PGM_ID                  0x0b
 #define SCLP_EVENT_ASCII_CONSOLE_DATA           0x1a
 #define SCLP_EVENT_SIGNAL_QUIESCE               0x1d
 
@@ -34,6 +36,7 @@
 #define SCLP_EVENT_MASK_MSG             SCLP_EVMASK(SCLP_EVENT_MESSAGE)
 #define SCLP_EVENT_MASK_CONFIG_MGT_DATA SCLP_EVMASK(SCLP_EVENT_CONFIG_MGT_DATA)
 #define SCLP_EVENT_MASK_PMSGCMD         SCLP_EVMASK(SCLP_EVENT_PMSGCMD)
+#define SCLP_EVENT_MASK_CTRL_PGM_ID     SCLP_EVMASK(SCLP_EVENT_CTRL_PGM_ID)
 #define SCLP_EVENT_MASK_MSG_ASCII       SCLP_EVMASK(SCLP_EVENT_ASCII_CONSOLE_DATA)
 #define SCLP_EVENT_MASK_SIGNAL_QUIESCE  SCLP_EVMASK(SCLP_EVENT_SIGNAL_QUIESCE)
 
@@ -41,12 +44,8 @@
 #define SCLP_SELECTIVE_READ                     0x01
 
 #define TYPE_SCLP_EVENT "s390-sclp-event-type"
-#define SCLP_EVENT(obj) \
-     OBJECT_CHECK(SCLPEvent, (obj), TYPE_SCLP_EVENT)
-#define SCLP_EVENT_CLASS(klass) \
-     OBJECT_CLASS_CHECK(SCLPEventClass, (klass), TYPE_SCLP_EVENT)
-#define SCLP_EVENT_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(SCLPEventClass, (obj), TYPE_SCLP_EVENT)
+OBJECT_DECLARE_TYPE(SCLPEvent, SCLPEventClass,
+                    SCLP_EVENT)
 
 #define TYPE_SCLP_CPU_HOTPLUG "sclp-cpu-hotplug"
 #define TYPE_SCLP_QUIESCE "sclpquiesce"
@@ -169,13 +168,13 @@ typedef struct ReadEventData {
     };
 } QEMU_PACKED ReadEventData;
 
-typedef struct SCLPEvent {
+struct SCLPEvent {
     DeviceState qdev;
     bool event_pending;
     char *name;
-} SCLPEvent;
+};
 
-typedef struct SCLPEventClass {
+struct SCLPEventClass {
     DeviceClass parent_class;
     int (*init)(SCLPEvent *event);
 
@@ -192,24 +191,35 @@ typedef struct SCLPEventClass {
 
     /* can we handle this event type? */
     bool (*can_handle_event)(uint8_t type);
-} SCLPEventClass;
+};
+
+#define TYPE_SCLP_EVENT_CPI "sclpcpi"
+typedef struct SCLPEventCPIClass SCLPEventCPIClass;
+typedef struct SCLPEventCPI SCLPEventCPI;
+OBJECT_DECLARE_TYPE(SCLPEventCPI, SCLPEventCPIClass,
+                    SCLP_EVENT_CPI)
+
+struct SCLPEventCPI {
+    SCLPEvent event;
+    uint8_t system_type[8];
+    uint8_t system_name[8];
+    uint64_t system_level;
+    uint8_t sysplex_name[8];
+    uint64_t timestamp;
+};
 
 #define TYPE_SCLP_EVENT_FACILITY "s390-sclp-event-facility"
-#define EVENT_FACILITY(obj) \
-     OBJECT_CHECK(SCLPEventFacility, (obj), TYPE_SCLP_EVENT_FACILITY)
-#define EVENT_FACILITY_CLASS(klass) \
-     OBJECT_CLASS_CHECK(SCLPEventFacilityClass, (klass), \
-                        TYPE_SCLP_EVENT_FACILITY)
-#define EVENT_FACILITY_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(SCLPEventFacilityClass, (obj), \
-                      TYPE_SCLP_EVENT_FACILITY)
+typedef struct SCLPEventFacility SCLPEventFacility;
+typedef struct SCLPEventFacilityClass SCLPEventFacilityClass;
+DECLARE_OBJ_CHECKERS(SCLPEventFacility, SCLPEventFacilityClass,
+                     EVENT_FACILITY, TYPE_SCLP_EVENT_FACILITY)
 
-typedef struct SCLPEventFacilityClass {
+struct SCLPEventFacilityClass {
     SysBusDeviceClass parent_class;
     void (*command_handler)(SCLPEventFacility *ef, SCCB *sccb, uint64_t code);
     bool (*event_pending)(SCLPEventFacility *ef);
-} SCLPEventFacilityClass;
+};
 
-BusState *sclp_get_event_facility_bus(void);
+BusState *sclp_get_event_facility_bus(SCLPEventFacility *ef);
 
 #endif

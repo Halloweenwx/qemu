@@ -15,13 +15,13 @@
 #include "qapi/error.h"
 #include "hw/virtio/virtio-scsi.h"
 #include "qemu/error-report.h"
-#include "sysemu/block-backend.h"
+#include "system/block-backend.h"
 #include "hw/scsi/scsi.h"
 #include "scsi/constants.h"
+#include "hw/virtio/iothread-vq-mapping.h"
 #include "hw/virtio/virtio-bus.h"
-#include "hw/virtio/virtio-access.h"
 
-/* Context: QEMU global mutex held */
+/* Context: BQL held */
 void virtio_scsi_dataplane_setup(VirtIOSCSI *s, Error **errp)
 {
     VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(s);
@@ -29,7 +29,14 @@ void virtio_scsi_dataplane_setup(VirtIOSCSI *s, Error **errp)
     BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
 
-    if (vs->conf.iothread) {
+    if (vs->conf.iothread && vs->conf.iothread_vq_mapping_list) {
+        error_setg(errp,
+                   "iothread and iothread-vq-mapping properties cannot be set "
+                   "at the same time");
+        return;
+    }
+
+    if (vs->conf.iothread || vs->conf.iothread_vq_mapping_list) {
         if (!k->set_guest_notifiers || !k->ioeventfd_assign) {
             error_setg(errp,
                        "device is incompatible with iothread "
@@ -40,56 +47,65 @@ void virtio_scsi_dataplane_setup(VirtIOSCSI *s, Error **errp)
             error_setg(errp, "ioeventfd is required for iothread");
             return;
         }
-        s->ctx = iothread_get_aio_context(vs->conf.iothread);
-    } else {
-        if (!virtio_device_ioeventfd_enabled(vdev)) {
+    }
+
+    s->vq_aio_context = g_new(AioContext *, vs->conf.num_queues +
+                                            VIRTIO_SCSI_VQ_NUM_FIXED);
+
+    /*
+     * Handle the ctrl virtqueue in the main loop thread where device resets
+     * can be performed.
+     */
+    s->vq_aio_context[0] = qemu_get_aio_context();
+
+    /*
+     * Handle the event virtqueue in the main loop thread where its no_poll
+     * behavior won't stop IOThread polling.
+     */
+    s->vq_aio_context[1] = qemu_get_aio_context();
+
+    if (vs->conf.iothread_vq_mapping_list) {
+        if (!iothread_vq_mapping_apply(vs->conf.iothread_vq_mapping_list,
+                    &s->vq_aio_context[VIRTIO_SCSI_VQ_NUM_FIXED],
+                    vs->conf.num_queues, errp)) {
+            g_free(s->vq_aio_context);
+            s->vq_aio_context = NULL;
             return;
         }
-        s->ctx = qemu_get_aio_context();
+    } else if (vs->conf.iothread) {
+        AioContext *ctx = iothread_get_aio_context(vs->conf.iothread);
+        for (uint16_t i = 0; i < vs->conf.num_queues; i++) {
+            s->vq_aio_context[VIRTIO_SCSI_VQ_NUM_FIXED + i] = ctx;
+        }
+
+        /* Released in virtio_scsi_dataplane_cleanup() */
+        object_ref(OBJECT(vs->conf.iothread));
+    } else {
+        AioContext *ctx = qemu_get_aio_context();
+        for (unsigned i = 0; i < vs->conf.num_queues; i++) {
+            s->vq_aio_context[VIRTIO_SCSI_VQ_NUM_FIXED + i] = ctx;
+        }
     }
 }
 
-static bool virtio_scsi_data_plane_handle_cmd(VirtIODevice *vdev,
-                                              VirtQueue *vq)
+/* Context: BQL held */
+void virtio_scsi_dataplane_cleanup(VirtIOSCSI *s)
 {
-    bool progress;
-    VirtIOSCSI *s = VIRTIO_SCSI(vdev);
+    VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(s);
 
-    virtio_scsi_acquire(s);
-    assert(s->ctx && s->dataplane_started);
-    progress = virtio_scsi_handle_cmd_vq(s, vq);
-    virtio_scsi_release(s);
-    return progress;
+    if (vs->conf.iothread_vq_mapping_list) {
+        iothread_vq_mapping_cleanup(vs->conf.iothread_vq_mapping_list);
+    }
+
+    if (vs->conf.iothread) {
+        object_unref(OBJECT(vs->conf.iothread));
+    }
+
+    g_free(s->vq_aio_context);
+    s->vq_aio_context = NULL;
 }
 
-static bool virtio_scsi_data_plane_handle_ctrl(VirtIODevice *vdev,
-                                               VirtQueue *vq)
-{
-    bool progress;
-    VirtIOSCSI *s = VIRTIO_SCSI(vdev);
-
-    virtio_scsi_acquire(s);
-    assert(s->ctx && s->dataplane_started);
-    progress = virtio_scsi_handle_ctrl_vq(s, vq);
-    virtio_scsi_release(s);
-    return progress;
-}
-
-static bool virtio_scsi_data_plane_handle_event(VirtIODevice *vdev,
-                                                VirtQueue *vq)
-{
-    bool progress;
-    VirtIOSCSI *s = VIRTIO_SCSI(vdev);
-
-    virtio_scsi_acquire(s);
-    assert(s->ctx && s->dataplane_started);
-    progress = virtio_scsi_handle_event_vq(s, vq);
-    virtio_scsi_release(s);
-    return progress;
-}
-
-static int virtio_scsi_vring_init(VirtIOSCSI *s, VirtQueue *vq, int n,
-                                  VirtIOHandleAIOOutput fn)
+static int virtio_scsi_set_host_notifier(VirtIOSCSI *s, VirtQueue *vq, int n)
 {
     BusState *qbus = BUS(qdev_get_parent_bus(DEVICE(s)));
     int rc;
@@ -103,29 +119,32 @@ static int virtio_scsi_vring_init(VirtIOSCSI *s, VirtQueue *vq, int n,
         return rc;
     }
 
-    virtio_queue_aio_set_host_notifier_handler(vq, s->ctx, fn);
     return 0;
 }
 
 /* Context: BH in IOThread */
-static void virtio_scsi_dataplane_stop_bh(void *opaque)
+static void virtio_scsi_dataplane_stop_vq_bh(void *opaque)
 {
-    VirtIOSCSI *s = opaque;
-    VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(s);
-    int i;
+    AioContext *ctx = qemu_get_current_aio_context();
+    VirtQueue *vq = opaque;
+    EventNotifier *host_notifier;
 
-    virtio_queue_aio_set_host_notifier_handler(vs->ctrl_vq, s->ctx, NULL);
-    virtio_queue_aio_set_host_notifier_handler(vs->event_vq, s->ctx, NULL);
-    for (i = 0; i < vs->conf.num_queues; i++) {
-        virtio_queue_aio_set_host_notifier_handler(vs->cmd_vqs[i], s->ctx, NULL);
-    }
+    virtio_queue_aio_detach_host_notifier(vq, ctx);
+    host_notifier = virtio_queue_get_host_notifier(vq);
+
+    /*
+     * Test and clear notifier after disabling event, in case poll callback
+     * didn't have time to run.
+     */
+    virtio_queue_host_notifier_read(host_notifier);
 }
 
-/* Context: QEMU global mutex held */
+/* Context: BQL held */
 int virtio_scsi_dataplane_start(VirtIODevice *vdev)
 {
     int i;
     int rc;
+    int vq_init_count = 0;
     BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
     VirtioBusClass *k = VIRTIO_BUS_GET_CLASS(qbus);
     VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(vdev);
@@ -147,46 +166,75 @@ int virtio_scsi_dataplane_start(VirtIODevice *vdev)
         goto fail_guest_notifiers;
     }
 
-    aio_context_acquire(s->ctx);
-    rc = virtio_scsi_vring_init(s, vs->ctrl_vq, 0,
-                                virtio_scsi_data_plane_handle_ctrl);
-    if (rc) {
-        goto fail_vrings;
+    /*
+     * Batch all the host notifiers in a single transaction to avoid
+     * quadratic time complexity in address_space_update_ioeventfds().
+     */
+    memory_region_transaction_begin();
+
+    rc = virtio_scsi_set_host_notifier(s, vs->ctrl_vq, 0);
+    if (rc != 0) {
+        goto fail_host_notifiers;
     }
-    rc = virtio_scsi_vring_init(s, vs->event_vq, 1,
-                                virtio_scsi_data_plane_handle_event);
-    if (rc) {
-        goto fail_vrings;
+
+    vq_init_count++;
+    rc = virtio_scsi_set_host_notifier(s, vs->event_vq, 1);
+    if (rc != 0) {
+        goto fail_host_notifiers;
     }
+
+    vq_init_count++;
+
     for (i = 0; i < vs->conf.num_queues; i++) {
-        rc = virtio_scsi_vring_init(s, vs->cmd_vqs[i], i + 2,
-                                    virtio_scsi_data_plane_handle_cmd);
+        rc = virtio_scsi_set_host_notifier(s, vs->cmd_vqs[i], i + 2);
         if (rc) {
-            goto fail_vrings;
+            goto fail_host_notifiers;
         }
+        vq_init_count++;
     }
+
+    memory_region_transaction_commit();
 
     s->dataplane_starting = false;
     s->dataplane_started = true;
-    aio_context_release(s->ctx);
+    smp_wmb(); /* paired with aio_notify_accept() */
+
+    if (s->bus.drain_count == 0) {
+        virtio_queue_aio_attach_host_notifier(vs->ctrl_vq,
+                                              s->vq_aio_context[0]);
+        virtio_queue_aio_attach_host_notifier_no_poll(vs->event_vq,
+                                                      s->vq_aio_context[1]);
+
+        for (i = 0; i < vs->conf.num_queues; i++) {
+            AioContext *ctx = s->vq_aio_context[VIRTIO_SCSI_VQ_NUM_FIXED + i];
+            virtio_queue_aio_attach_host_notifier(vs->cmd_vqs[i], ctx);
+        }
+    }
     return 0;
 
-fail_vrings:
-    aio_wait_bh_oneshot(s->ctx, virtio_scsi_dataplane_stop_bh, s);
-    aio_context_release(s->ctx);
-    for (i = 0; i < vs->conf.num_queues + 2; i++) {
+fail_host_notifiers:
+    for (i = 0; i < vq_init_count; i++) {
         virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, false);
+    }
+
+    /*
+     * The transaction expects the ioeventfds to be open when it
+     * commits. Do it now, before the cleanup loop.
+     */
+    memory_region_transaction_commit();
+
+    for (i = 0; i < vq_init_count; i++) {
         virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), i);
     }
     k->set_guest_notifiers(qbus->parent, vs->conf.num_queues + 2, false);
 fail_guest_notifiers:
     s->dataplane_fenced = true;
     s->dataplane_starting = false;
-    s->dataplane_started = true;
+    s->dataplane_started = false;
     return -ENOSYS;
 }
 
-/* Context: QEMU global mutex held */
+/* Context: BQL held */
 void virtio_scsi_dataplane_stop(VirtIODevice *vdev)
 {
     BusState *qbus = qdev_get_parent_bus(DEVICE(vdev));
@@ -207,14 +255,33 @@ void virtio_scsi_dataplane_stop(VirtIODevice *vdev)
     }
     s->dataplane_stopping = true;
 
-    aio_context_acquire(s->ctx);
-    aio_wait_bh_oneshot(s->ctx, virtio_scsi_dataplane_stop_bh, s);
-    aio_context_release(s->ctx);
+    if (s->bus.drain_count == 0) {
+        for (i = 0; i < vs->conf.num_queues + VIRTIO_SCSI_VQ_NUM_FIXED; i++) {
+            VirtQueue *vq = virtio_get_queue(&vs->parent_obj, i);
+            AioContext *ctx = s->vq_aio_context[i];
+            aio_wait_bh_oneshot(ctx, virtio_scsi_dataplane_stop_vq_bh, vq);
+        }
+    }
 
     blk_drain_all(); /* ensure there are no in-flight requests */
 
+    /*
+     * Batch all the host notifiers in a single transaction to avoid
+     * quadratic time complexity in address_space_update_ioeventfds().
+     */
+    memory_region_transaction_begin();
+
     for (i = 0; i < vs->conf.num_queues + 2; i++) {
         virtio_bus_set_host_notifier(VIRTIO_BUS(qbus), i, false);
+    }
+
+    /*
+     * The transaction expects the ioeventfds to be open when it
+     * commits. Do it now, before the cleanup loop.
+     */
+    memory_region_transaction_commit();
+
+    for (i = 0; i < vs->conf.num_queues + 2; i++) {
         virtio_bus_cleanup_host_notifier(VIRTIO_BUS(qbus), i);
     }
 

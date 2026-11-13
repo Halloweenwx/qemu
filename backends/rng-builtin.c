@@ -6,16 +6,18 @@
  */
 
 #include "qemu/osdep.h"
-#include "sysemu/rng.h"
+#include "system/rng.h"
 #include "qemu/main-loop.h"
 #include "qemu/guest-random.h"
+#include "qom/object.h"
+#include "system/replay.h"
 
-#define RNG_BUILTIN(obj) OBJECT_CHECK(RngBuiltin, (obj), TYPE_RNG_BUILTIN)
+OBJECT_DECLARE_SIMPLE_TYPE(RngBuiltin, RNG_BUILTIN)
 
-typedef struct RngBuiltin {
+struct RngBuiltin {
     RngBackend parent;
     QEMUBH *bh;
-} RngBuiltin;
+};
 
 static void rng_builtin_receive_entropy_bh(void *opaque)
 {
@@ -36,7 +38,7 @@ static void rng_builtin_request_entropy(RngBackend *b, RngRequest *req)
 {
     RngBuiltin *s = RNG_BUILTIN(b);
 
-    qemu_bh_schedule(s->bh);
+    replay_bh_schedule_event(s->bh);
 }
 
 static void rng_builtin_init(Object *obj)
@@ -53,7 +55,7 @@ static void rng_builtin_finalize(Object *obj)
     qemu_bh_delete(s->bh);
 }
 
-static void rng_builtin_class_init(ObjectClass *klass, void *data)
+static void rng_builtin_class_init(ObjectClass *klass, const void *data)
 {
     RngBackendClass *rbc = RNG_BACKEND_CLASS(klass);
 

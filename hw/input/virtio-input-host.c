@@ -10,7 +10,7 @@
 #include "qemu/sockets.h"
 
 #include "hw/virtio/virtio.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/virtio/virtio-input.h"
 
 #include <sys/ioctl.h>
@@ -114,7 +114,9 @@ static void virtio_input_host_realize(DeviceState *dev, Error **errp)
         error_setg_file_open(errp, errno, vih->evdev);
         return;
     }
-    qemu_set_nonblock(vih->fd);
+    if (!qemu_set_blocking(vih->fd, false, errp)) {
+        goto err_close;
+    }
 
     rc = ioctl(vih->fd, EVIOCGVERSION, &ver);
     if (rc < 0) {
@@ -175,10 +177,9 @@ static void virtio_input_host_realize(DeviceState *dev, Error **errp)
 err_close:
     close(vih->fd);
     vih->fd = -1;
-    return;
 }
 
-static void virtio_input_host_unrealize(DeviceState *dev, Error **errp)
+static void virtio_input_host_unrealize(DeviceState *dev)
 {
     VirtIOInputHost *vih = VIRTIO_INPUT_HOST(dev);
 
@@ -193,13 +194,16 @@ static void virtio_input_host_handle_status(VirtIOInput *vinput,
 {
     VirtIOInputHost *vih = VIRTIO_INPUT_HOST(vinput);
     struct input_event evdev;
+    struct timeval tval;
     int rc;
 
-    if (gettimeofday(&evdev.time, NULL)) {
+    if (gettimeofday(&tval, NULL)) {
         perror("virtio_input_host_handle_status: gettimeofday");
         return;
     }
 
+    evdev.input_event_sec = tval.tv_sec;
+    evdev.input_event_usec = tval.tv_usec;
     evdev.type = le16_to_cpu(event->type);
     evdev.code = le16_to_cpu(event->code);
     evdev.value = le32_to_cpu(event->value);
@@ -215,12 +219,11 @@ static const VMStateDescription vmstate_virtio_input_host = {
     .unmigratable = 1,
 };
 
-static Property virtio_input_host_properties[] = {
+static const Property virtio_input_host_properties[] = {
     DEFINE_PROP_STRING("evdev", VirtIOInputHost, evdev),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void virtio_input_host_class_init(ObjectClass *klass, void *data)
+static void virtio_input_host_class_init(ObjectClass *klass, const void *data)
 {
     VirtIOInputClass *vic = VIRTIO_INPUT_CLASS(klass);
     DeviceClass *dc = DEVICE_CLASS(klass);

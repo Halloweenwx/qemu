@@ -1,33 +1,42 @@
 /*
  * BCM2835 SYS timer emulation
  *
- * Copyright (c) 2019 Philippe Mathieu-Daudé <f4bug@amsat.org>
+ * Copyright (c) 2019 Philippe Mathieu-Daudé
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
-#ifndef BCM2835_SYSTIMER_H
-#define BCM2835_SYSTIMER_H
+#ifndef BCM2835_SYSTMR_H
+#define BCM2835_SYSTMR_H
 
-#include "hw/sysbus.h"
-#include "hw/irq.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
+#include "qemu/timer.h"
+#include "qom/object.h"
 
 #define TYPE_BCM2835_SYSTIMER "bcm2835-sys-timer"
-#define BCM2835_SYSTIMER(obj) \
-    OBJECT_CHECK(BCM2835SystemTimerState, (obj), TYPE_BCM2835_SYSTIMER)
+OBJECT_DECLARE_SIMPLE_TYPE(BCM2835SystemTimerState, BCM2835_SYSTIMER)
+
+#define BCM2835_SYSTIMER_COUNT 4
 
 typedef struct {
+    unsigned id;
+    QEMUTimer timer;
+    qemu_irq irq;
+    BCM2835SystemTimerState *state;
+} BCM2835SystemTimerCompare;
+
+struct BCM2835SystemTimerState {
     /*< private >*/
     SysBusDevice parent_obj;
 
     /*< public >*/
     MemoryRegion iomem;
-    qemu_irq irq;
-
     struct {
-        uint32_t status;
-        uint32_t compare[4];
+        uint32_t ctrl_status;
+        uint32_t compare[BCM2835_SYSTIMER_COUNT];
     } reg;
-} BCM2835SystemTimerState;
+    BCM2835SystemTimerCompare tmr[BCM2835_SYSTIMER_COUNT];
+};
 
 #endif

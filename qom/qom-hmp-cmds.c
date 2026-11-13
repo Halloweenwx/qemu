@@ -6,22 +6,26 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/qdev-core.h"
+#include "hw/core/qdev.h"
 #include "monitor/hmp.h"
+#include "monitor/hmp-completion.h"
 #include "monitor/monitor.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-qom.h"
-#include "qapi/qmp/qdict.h"
+#include "qobject/qdict.h"
+#include "qobject/qjson.h"
+#include "qemu/readline.h"
 #include "qom/object.h"
+#include "qom/object_interfaces.h"
 
-void hmp_qom_list(Monitor *mon, const QDict *qdict)
+void hmp_qom_list(MonitorHMP *hmp, const QDict *qdict)
 {
     const char *path = qdict_get_try_str(qdict, "path");
     ObjectPropertyInfoList *list;
     Error *err = NULL;
 
     if (path == NULL) {
-        monitor_printf(mon, "/\n");
+        monitor_hmp_printf(hmp, "/\n");
         return;
     }
 
@@ -31,35 +35,58 @@ void hmp_qom_list(Monitor *mon, const QDict *qdict)
         while (list != NULL) {
             ObjectPropertyInfo *value = list->value;
 
-            monitor_printf(mon, "%s (%s)\n",
-                           value->name, value->type);
+            monitor_hmp_printf(hmp, "%s (%s)\n",
+                               value->name, value->type);
             list = list->next;
         }
         qapi_free_ObjectPropertyInfoList(start);
     }
-    hmp_handle_error(mon, err);
+    hmp_handle_error(hmp, err);
 }
 
-void hmp_qom_set(Monitor *mon, const QDict *qdict)
+void hmp_qom_set(MonitorHMP *hmp, const QDict *qdict)
 {
+    const bool json = qdict_get_try_bool(qdict, "json", false);
     const char *path = qdict_get_str(qdict, "path");
     const char *property = qdict_get_str(qdict, "property");
     const char *value = qdict_get_str(qdict, "value");
     Error *err = NULL;
-    bool ambiguous = false;
-    Object *obj;
 
-    obj = object_resolve_path(path, &ambiguous);
-    if (obj == NULL) {
-        error_set(&err, ERROR_CLASS_DEVICE_NOT_FOUND,
-                  "Device '%s' not found", path);
-    } else {
-        if (ambiguous) {
-            monitor_printf(mon, "Warning: Path '%s' is ambiguous\n", path);
+    if (!json) {
+        Object *obj = object_resolve_path(path, NULL);
+
+        if (!obj) {
+            error_set(&err, ERROR_CLASS_DEVICE_NOT_FOUND,
+                      "Device '%s' not found", path);
+        } else {
+            object_property_parse(obj, property, value, &err);
         }
-        object_property_parse(obj, value, property, &err);
+    } else {
+        QObject *obj = qobject_from_json(value, &err);
+
+        if (!err) {
+            qmp_qom_set(path, property, obj, &err);
+        }
     }
-    hmp_handle_error(mon, err);
+
+    hmp_handle_error(hmp, err);
+}
+
+void hmp_qom_get(MonitorHMP *hmp, const QDict *qdict)
+{
+    const char *path = qdict_get_str(qdict, "path");
+    const char *property = qdict_get_str(qdict, "property");
+    Error *err = NULL;
+    QObject *obj = qmp_qom_get(path, property, &err);
+
+    if (err == NULL) {
+        GString *str = qobject_to_json_pretty(obj, true);
+        monitor_hmp_printf(hmp, "%s\n", str->str);
+        g_string_free(str, true);
+    }
+
+    qobject_unref(obj);
+    hmp_handle_error(hmp, err);
 }
 
 typedef struct QOMCompositionState {
@@ -67,37 +94,45 @@ typedef struct QOMCompositionState {
     int indent;
 } QOMCompositionState;
 
-static void print_qom_composition(Monitor *mon, Object *obj, int indent);
+static void print_qom_composition(MonitorHMP *hmp, Object *obj, int indent);
 
-static int print_qom_composition_child(Object *obj, void *opaque)
+static int qom_composition_compare(const void *a, const void *b)
 {
-    QOMCompositionState *s = opaque;
+    return g_strcmp0(object_get_canonical_path_component(*(Object **)a),
+                     object_get_canonical_path_component(*(Object **)b));
+}
 
-    print_qom_composition(s->mon, obj, s->indent);
-
+static int insert_qom_composition_child(Object *obj, void *opaque)
+{
+    g_array_append_val(opaque, obj);
     return 0;
 }
 
-static void print_qom_composition(Monitor *mon, Object *obj, int indent)
+static void print_qom_composition(MonitorHMP *hmp, Object *obj, int indent)
 {
-    QOMCompositionState s = {
-        .mon = mon,
-        .indent = indent + 2,
-    };
-    char *name;
+    GArray *children = g_array_new(false, false, sizeof(Object *));
+    const char *name;
+    int i;
 
     if (obj == object_get_root()) {
-        name = g_strdup("");
+        name = "";
     } else {
         name = object_get_canonical_path_component(obj);
     }
-    monitor_printf(mon, "%*s/%s (%s)\n", indent, "", name,
-                   object_get_typename(obj));
-    g_free(name);
-    object_child_foreach(obj, print_qom_composition_child, &s);
+    monitor_hmp_printf(hmp, "%*s/%s (%s)\n", indent, "", name,
+                       object_get_typename(obj));
+
+    object_child_foreach(obj, insert_qom_composition_child, children);
+    g_array_sort(children, qom_composition_compare);
+
+    for (i = 0; i < children->len; i++) {
+        print_qom_composition(hmp, g_array_index(children, Object *, i),
+                              indent + 2);
+    }
+    g_array_free(children, TRUE);
 }
 
-void hmp_info_qom_tree(Monitor *mon, const QDict *dict)
+void hmp_info_qom_tree(MonitorHMP *hmp, const QDict *dict)
 {
     const char *path = qdict_get_try_str(dict, "path");
     Object *obj;
@@ -106,15 +141,80 @@ void hmp_info_qom_tree(Monitor *mon, const QDict *dict)
     if (path) {
         obj = object_resolve_path(path, &ambiguous);
         if (!obj) {
-            monitor_printf(mon, "Path '%s' could not be resolved.\n", path);
+            monitor_hmp_printf(hmp, "Path '%s' could not be resolved.\n", path);
             return;
         }
         if (ambiguous) {
-            monitor_printf(mon, "Warning: Path '%s' is ambiguous.\n", path);
+            monitor_hmp_printf(hmp, "Warning: Path '%s' is ambiguous.\n", path);
             return;
         }
     } else {
         obj = qdev_get_machine();
     }
-    print_qom_composition(mon, obj, 0);
+    print_qom_composition(hmp, obj, 0);
+}
+
+void hmp_object_add(MonitorHMP *hmp, const QDict *qdict)
+{
+    const char *options = qdict_get_str(qdict, "object");
+    Error *err = NULL;
+
+    user_creatable_add_from_str(options, &err);
+    hmp_handle_error(hmp, err);
+}
+
+void hmp_object_del(MonitorHMP *hmp, const QDict *qdict)
+{
+    const char *id = qdict_get_str(qdict, "id");
+    Error *err = NULL;
+
+    user_creatable_del(id, &err);
+    hmp_handle_error(hmp, err);
+}
+
+void object_add_completion(ReadLineState *rs, int nb_args, const char *str)
+{
+    GSList *list, *elt;
+    size_t len;
+
+    if (nb_args != 2) {
+        return;
+    }
+
+    len = strlen(str);
+    readline_set_completion_index(rs, len);
+    list = elt = object_class_get_list(TYPE_USER_CREATABLE, false);
+    while (elt) {
+        const char *name;
+
+        name = object_class_get_name(OBJECT_CLASS(elt->data));
+        if (strcmp(name, TYPE_USER_CREATABLE)) {
+            readline_add_completion_of(rs, str, name);
+        }
+        elt = elt->next;
+    }
+    g_slist_free(list);
+}
+
+void object_del_completion(ReadLineState *rs, int nb_args, const char *str)
+{
+    ObjectPropertyInfoList *list, *start;
+    size_t len;
+
+    if (nb_args != 2) {
+        return;
+    }
+    len = strlen(str);
+    readline_set_completion_index(rs, len);
+
+    start = list = qmp_qom_list("/objects", NULL);
+    while (list) {
+        ObjectPropertyInfo *info = list->value;
+
+        if (!strncmp(info->type, "child<", 5)) {
+            readline_add_completion_of(rs, str, info->name);
+        }
+        list = list->next;
+    }
+    qapi_free_ObjectPropertyInfoList(start);
 }

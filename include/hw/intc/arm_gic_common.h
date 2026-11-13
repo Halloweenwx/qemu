@@ -21,7 +21,8 @@
 #ifndef HW_ARM_GIC_COMMON_H
 #define HW_ARM_GIC_COMMON_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
+#include "qom/object.h"
 
 /* Maximum number of possible interrupts, determined by the GIC architecture */
 #define GIC_MAXIRQ 1020
@@ -36,8 +37,8 @@
 #define MAX_NR_GROUP_PRIO 128
 #define GIC_NR_APRS (MAX_NR_GROUP_PRIO / 32)
 
-#define GIC_MIN_BPR 0
-#define GIC_MIN_ABPR (GIC_MIN_BPR + 1)
+#define GIC_MAX_PRIORITY_BITS 8
+#define GIC_MIN_PRIORITY_BITS 4
 
 /* Architectural maximum number of list registers in the virtual interface */
 #define GIC_MAX_LR 64
@@ -61,7 +62,7 @@ typedef struct gic_irq_state {
     uint8_t group;
 } gic_irq_state;
 
-typedef struct GICState {
+struct GICState {
     /*< private >*/
     SysBusDevice parent_obj;
     /*< public >*/
@@ -70,6 +71,8 @@ typedef struct GICState {
     qemu_irq parent_fiq[GIC_NCPU];
     qemu_irq parent_virq[GIC_NCPU];
     qemu_irq parent_vfiq[GIC_NCPU];
+    qemu_irq parent_nmi[GIC_NCPU];
+    qemu_irq parent_vnmi[GIC_NCPU];
     qemu_irq maintenance_irq[GIC_NCPU];
 
     /* GICD_CTLR; for a GIC with the security extensions the NS banked version
@@ -126,6 +129,8 @@ typedef struct GICState {
     uint32_t num_lrs;
 
     uint32_t num_cpu;
+    /* cpu_index of the first CPU, attached to this GIC.  */
+    uint32_t first_cpu_index;
 
     MemoryRegion iomem; /* Distributor */
     /* This is just so we can have an opaque pointer which identifies
@@ -143,24 +148,36 @@ typedef struct GICState {
     bool irq_reset_nonsecure; /* configure IRQs as group 1 (NS) on reset? */
     int dev_fd; /* kvm device fd if backed by kvm vgic support */
     Error *migration_blocker;
-} GICState;
+};
+typedef struct GICState GICState;
+
+
+static inline uint32_t gic_min_bpr(GICState *s)
+{
+    uint32_t num_preemption_bits = s->n_prio_bits == 8 ? 7 : s->n_prio_bits;
+    assert(!(s->n_prio_bits > GIC_MAX_PRIORITY_BITS
+             || s->n_prio_bits < GIC_MIN_PRIORITY_BITS));
+    return 7 - num_preemption_bits;
+}
+
+static inline uint32_t gic_min_abpr(GICState *s)
+{
+    return gic_min_bpr(s) + 1;
+}
 
 #define TYPE_ARM_GIC_COMMON "arm_gic_common"
-#define ARM_GIC_COMMON(obj) \
-     OBJECT_CHECK(GICState, (obj), TYPE_ARM_GIC_COMMON)
-#define ARM_GIC_COMMON_CLASS(klass) \
-     OBJECT_CLASS_CHECK(ARMGICCommonClass, (klass), TYPE_ARM_GIC_COMMON)
-#define ARM_GIC_COMMON_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(ARMGICCommonClass, (obj), TYPE_ARM_GIC_COMMON)
+typedef struct ARMGICCommonClass ARMGICCommonClass;
+DECLARE_OBJ_CHECKERS(GICState, ARMGICCommonClass,
+                     ARM_GIC_COMMON, TYPE_ARM_GIC_COMMON)
 
-typedef struct ARMGICCommonClass {
+struct ARMGICCommonClass {
     /*< private >*/
     SysBusDeviceClass parent_class;
     /*< public >*/
 
     void (*pre_save)(GICState *s);
     void (*post_load)(GICState *s);
-} ARMGICCommonClass;
+};
 
 void gic_init_irqs_and_mmio(GICState *s, qemu_irq_handler handler,
                             const MemoryRegionOps *ops,

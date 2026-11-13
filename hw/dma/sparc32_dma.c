@@ -26,13 +26,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/irq.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/sparc/sparc32_dma.h"
 #include "hw/sparc/sun4m_iommu.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
-#include "sysemu/dma.h"
+#include "system/dma.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "trace.h"
@@ -81,11 +81,11 @@ void ledma_memory_read(void *opaque, hwaddr addr,
     addr |= s->dmaregs[3];
     trace_ledma_memory_read(addr, len);
     if (do_bswap) {
-        dma_memory_read(&is->iommu_as, addr, buf, len);
+        dma_memory_read(&is->iommu_as, addr, buf, len, MEMTXATTRS_UNSPECIFIED);
     } else {
         addr &= ~1;
         len &= ~1;
-        dma_memory_read(&is->iommu_as, addr, buf, len);
+        dma_memory_read(&is->iommu_as, addr, buf, len, MEMTXATTRS_UNSPECIFIED);
         for(i = 0; i < len; i += 2) {
             bswap16s((uint16_t *)(buf + i));
         }
@@ -103,7 +103,8 @@ void ledma_memory_write(void *opaque, hwaddr addr,
     addr |= s->dmaregs[3];
     trace_ledma_memory_write(addr, len);
     if (do_bswap) {
-        dma_memory_write(&is->iommu_as, addr, buf, len);
+        dma_memory_write(&is->iommu_as, addr, buf, len,
+                         MEMTXATTRS_UNSPECIFIED);
     } else {
         addr &= ~1;
         len &= ~1;
@@ -114,7 +115,8 @@ void ledma_memory_write(void *opaque, hwaddr addr,
             for(i = 0; i < l; i += 2) {
                 tmp_buf[i >> 1] = bswap16(*(uint16_t *)(buf + i));
             }
-            dma_memory_write(&is->iommu_as, addr, tmp_buf, l);
+            dma_memory_write(&is->iommu_as, addr, tmp_buf, l,
+                             MEMTXATTRS_UNSPECIFIED);
             len -= l;
             buf += l;
             addr += l;
@@ -148,7 +150,8 @@ void espdma_memory_read(void *opaque, uint8_t *buf, int len)
     IOMMUState *is = (IOMMUState *)s->iommu;
 
     trace_espdma_memory_read(s->dmaregs[1], len);
-    dma_memory_read(&is->iommu_as, s->dmaregs[1], buf, len);
+    dma_memory_read(&is->iommu_as, s->dmaregs[1], buf, len,
+                    MEMTXATTRS_UNSPECIFIED);
     s->dmaregs[1] += len;
 }
 
@@ -158,7 +161,8 @@ void espdma_memory_write(void *opaque, uint8_t *buf, int len)
     IOMMUState *is = (IOMMUState *)s->iommu;
 
     trace_espdma_memory_write(s->dmaregs[1], len);
-    dma_memory_write(&is->iommu_as, s->dmaregs[1], buf, len);
+    dma_memory_write(&is->iommu_as, s->dmaregs[1], buf, len,
+                     MEMTXATTRS_UNSPECIFIED);
     s->dmaregs[1] += len;
 }
 
@@ -226,7 +230,7 @@ static void dma_mem_write(void *opaque, hwaddr addr,
 static const MemoryRegionOps dma_mem_ops = {
     .read = dma_mem_read,
     .write = dma_mem_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -245,7 +249,7 @@ static const VMStateDescription vmstate_sparc32_dma_device = {
     .name ="sparc32_dma",
     .version_id = 2,
     .minimum_version_id = 2,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(dmaregs, DMADeviceState, DMA_REGS),
         VMSTATE_END_OF_LIST()
     }
@@ -264,17 +268,17 @@ static void sparc32_dma_device_init(Object *obj)
     object_property_add_link(OBJECT(dev), "iommu", TYPE_SUN4M_IOMMU,
                              (Object **) &s->iommu,
                              qdev_prop_allow_set_link_before_realize,
-                             0, NULL);
+                             0);
 
     qdev_init_gpio_in(dev, dma_set_irq, 1);
     qdev_init_gpio_out(dev, s->gpio, 2);
 }
 
-static void sparc32_dma_device_class_init(ObjectClass *klass, void *data)
+static void sparc32_dma_device_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = sparc32_dma_device_reset;
+    device_class_set_legacy_reset(dc, sparc32_dma_device_reset);
     dc->vmsd = &vmstate_sparc32_dma_device;
 }
 
@@ -290,30 +294,30 @@ static const TypeInfo sparc32_dma_device_info = {
 static void sparc32_espdma_device_init(Object *obj)
 {
     DMADeviceState *s = SPARC32_DMA_DEVICE(obj);
+    ESPDMADeviceState *es = SPARC32_ESPDMA_DEVICE(obj);
 
     memory_region_init_io(&s->iomem, OBJECT(s), &dma_mem_ops, s,
                           "espdma-mmio", DMA_SIZE);
+
+    object_initialize_child(obj, "esp", &es->esp, TYPE_SYSBUS_ESP);
 }
 
 static void sparc32_espdma_device_realize(DeviceState *dev, Error **errp)
 {
-    DeviceState *d;
-    SysBusESPState *sysbus;
-    ESPState *esp;
+    ESPDMADeviceState *es = SPARC32_ESPDMA_DEVICE(dev);
+    SysBusESPState *sysbus = SYSBUS_ESP(&es->esp);
+    ESPState *esp = &sysbus->esp;
 
-    d = qdev_create(NULL, TYPE_ESP);
-    object_property_add_child(OBJECT(dev), "esp", OBJECT(d), errp);
-    sysbus = ESP_STATE(d);
-    esp = &sysbus->esp;
     esp->dma_memory_read = espdma_memory_read;
     esp->dma_memory_write = espdma_memory_write;
     esp->dma_opaque = SPARC32_DMA_DEVICE(dev);
     sysbus->it_shift = 2;
     esp->dma_enabled = 1;
-    qdev_init_nofail(d);
+    sysbus_realize(SYS_BUS_DEVICE(sysbus), &error_fatal);
 }
 
-static void sparc32_espdma_device_class_init(ObjectClass *klass, void *data)
+static void sparc32_espdma_device_class_init(ObjectClass *klass,
+                                             const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -331,26 +335,25 @@ static const TypeInfo sparc32_espdma_device_info = {
 static void sparc32_ledma_device_init(Object *obj)
 {
     DMADeviceState *s = SPARC32_DMA_DEVICE(obj);
+    LEDMADeviceState *ls = SPARC32_LEDMA_DEVICE(obj);
 
     memory_region_init_io(&s->iomem, OBJECT(s), &dma_mem_ops, s,
                           "ledma-mmio", DMA_SIZE);
+
+    object_initialize_child(obj, "lance", &ls->lance, TYPE_LANCE);
 }
 
 static void sparc32_ledma_device_realize(DeviceState *dev, Error **errp)
 {
-    DeviceState *d;
-    NICInfo *nd = &nd_table[0];
+    LEDMADeviceState *s = SPARC32_LEDMA_DEVICE(dev);
+    SysBusPCNetState *lance = SYSBUS_PCNET(&s->lance);
 
-    qemu_check_nic_model(nd, TYPE_LANCE);
-
-    d = qdev_create(NULL, TYPE_LANCE);
-    object_property_add_child(OBJECT(dev), "lance", OBJECT(d), errp);
-    qdev_set_nic_properties(d, nd);
-    object_property_set_link(OBJECT(d), OBJECT(dev), "dma", errp);
-    qdev_init_nofail(d);
+    object_property_set_link(OBJECT(lance), "dma", OBJECT(dev), &error_abort);
+    sysbus_realize(SYS_BUS_DEVICE(lance), &error_fatal);
 }
 
-static void sparc32_ledma_device_class_init(ObjectClass *klass, void *data)
+static void sparc32_ledma_device_class_init(ObjectClass *klass,
+                                            const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -378,10 +381,9 @@ static void sparc32_dma_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    espdma = qdev_create(NULL, TYPE_SPARC32_ESPDMA_DEVICE);
-    object_property_set_link(OBJECT(espdma), iommu, "iommu", errp);
-    object_property_add_child(OBJECT(s), "espdma", OBJECT(espdma), errp);
-    qdev_init_nofail(espdma);
+    espdma = DEVICE(&s->espdma);
+    object_property_set_link(OBJECT(espdma), "iommu", iommu, &error_abort);
+    sysbus_realize(SYS_BUS_DEVICE(espdma), &error_fatal);
 
     esp = DEVICE(object_resolve_path_component(OBJECT(espdma), "esp"));
     sbd = SYS_BUS_DEVICE(esp);
@@ -393,10 +395,9 @@ static void sparc32_dma_realize(DeviceState *dev, Error **errp)
     memory_region_add_subregion(&s->dmamem, 0x0,
                                 sysbus_mmio_get_region(sbd, 0));
 
-    ledma = qdev_create(NULL, TYPE_SPARC32_LEDMA_DEVICE);
-    object_property_set_link(OBJECT(ledma), iommu, "iommu", errp);
-    object_property_add_child(OBJECT(s), "ledma", OBJECT(ledma), errp);
-    qdev_init_nofail(ledma);
+    ledma = DEVICE(&s->ledma);
+    object_property_set_link(OBJECT(ledma), "iommu", iommu, &error_abort);
+    sysbus_realize(SYS_BUS_DEVICE(ledma), &error_fatal);
 
     lance = DEVICE(object_resolve_path_component(OBJECT(ledma), "lance"));
     sbd = SYS_BUS_DEVICE(lance);
@@ -420,9 +421,14 @@ static void sparc32_dma_init(Object *obj)
 
     memory_region_init(&s->dmamem, OBJECT(s), "dma", DMA_SIZE + DMA_ETH_SIZE);
     sysbus_init_mmio(sbd, &s->dmamem);
+
+    object_initialize_child(obj, "espdma", &s->espdma,
+                            TYPE_SPARC32_ESPDMA_DEVICE);
+    object_initialize_child(obj, "ledma", &s->ledma,
+                            TYPE_SPARC32_LEDMA_DEVICE);
 }
 
-static void sparc32_dma_class_init(ObjectClass *klass, void *data)
+static void sparc32_dma_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

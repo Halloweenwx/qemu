@@ -16,21 +16,22 @@
  *  GNU General Public License for more details.
  *
  *  You should have received a copy of the GNU General Public License along
- *  with this program; if not, write to the Free Software Foundation, Inc.,
- *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
+ *  with this program; if not, see <https://www.gnu.org/licenses/>.
  */
 #ifndef ASPEED_TIMER_H
 #define ASPEED_TIMER_H
 
 #include "qemu/timer.h"
 #include "hw/misc/aspeed_scu.h"
+#include "qom/object.h"
 
-#define ASPEED_TIMER(obj) \
-    OBJECT_CHECK(AspeedTimerCtrlState, (obj), TYPE_ASPEED_TIMER);
 #define TYPE_ASPEED_TIMER "aspeed.timer"
+OBJECT_DECLARE_TYPE(AspeedTimerCtrlState, AspeedTimerClass, ASPEED_TIMER)
 #define TYPE_ASPEED_2400_TIMER TYPE_ASPEED_TIMER "-ast2400"
 #define TYPE_ASPEED_2500_TIMER TYPE_ASPEED_TIMER "-ast2500"
 #define TYPE_ASPEED_2600_TIMER TYPE_ASPEED_TIMER "-ast2600"
+#define TYPE_ASPEED_1030_TIMER TYPE_ASPEED_TIMER "-ast1030"
+#define TYPE_ASPEED_2700_TIMER TYPE_ASPEED_TIMER "-ast2700"
 
 #define ASPEED_TIMER_NR_TIMERS 8
 
@@ -50,7 +51,7 @@ typedef struct AspeedTimer {
     uint64_t start;
 } AspeedTimer;
 
-typedef struct AspeedTimerCtrlState {
+struct AspeedTimerCtrlState {
     /*< private >*/
     SysBusDevice parent;
 
@@ -64,18 +65,14 @@ typedef struct AspeedTimerCtrlState {
     AspeedTimer timers[ASPEED_TIMER_NR_TIMERS];
 
     AspeedSCUState *scu;
-} AspeedTimerCtrlState;
+};
 
-#define ASPEED_TIMER_CLASS(klass) \
-     OBJECT_CLASS_CHECK(AspeedTimerClass, (klass), TYPE_ASPEED_TIMER)
-#define ASPEED_TIMER_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(AspeedTimerClass, (obj), TYPE_ASPEED_TIMER)
 
-typedef struct AspeedTimerClass {
+struct AspeedTimerClass {
     SysBusDeviceClass parent_class;
 
     uint64_t (*read)(AspeedTimerCtrlState *s, hwaddr offset);
     void (*write)(AspeedTimerCtrlState *s, hwaddr offset, uint64_t value);
-} AspeedTimerClass;
+};
 
 #endif /* ASPEED_TIMER_H */

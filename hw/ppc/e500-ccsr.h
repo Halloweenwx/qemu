@@ -1,17 +1,18 @@
 #ifndef E500_CCSR_H
 #define E500_CCSR_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
+#include "qom/object.h"
 
-typedef struct PPCE500CCSRState {
+struct PPCE500CCSRState {
     /*< private >*/
     SysBusDevice parent;
     /*< public >*/
 
     MemoryRegion ccsr_space;
-} PPCE500CCSRState;
+};
 
 #define TYPE_CCSR "e500-ccsr"
-#define CCSR(obj) OBJECT_CHECK(PPCE500CCSRState, (obj), TYPE_CCSR)
+OBJECT_DECLARE_SIMPLE_TYPE(PPCE500CCSRState, CCSR)
 
 #endif /* E500_CCSR_H */

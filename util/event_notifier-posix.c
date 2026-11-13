@@ -11,7 +11,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
+#include "qapi/error.h"
 #include "qemu/cutils.h"
 #include "qemu/event_notifier.h"
 #include "qemu/main-loop.h"
@@ -27,8 +27,10 @@
  */
 void event_notifier_init_fd(EventNotifier *e, int fd)
 {
+    assert(fd >= 0);
     e->rfd = fd;
     e->wfd = fd;
+    e->initialized = true;
 }
 #endif
 
@@ -36,6 +38,7 @@ int event_notifier_init(EventNotifier *e, int active)
 {
     int fds[2];
     int ret;
+    Error *local_err = NULL;
 
 #ifdef CONFIG_EVENTFD
     ret = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -49,28 +52,28 @@ int event_notifier_init(EventNotifier *e, int active)
         if (errno != ENOSYS) {
             return -errno;
         }
-        if (qemu_pipe(fds) < 0) {
+        if (!g_unix_open_pipe(fds, FD_CLOEXEC, NULL)) {
             return -errno;
         }
-        ret = fcntl_setfl(fds[0], O_NONBLOCK);
-        if (ret < 0) {
+        if (!qemu_set_blocking(fds[0], false, &local_err)) {
             ret = -errno;
             goto fail;
         }
-        ret = fcntl_setfl(fds[1], O_NONBLOCK);
-        if (ret < 0) {
+        if (!qemu_set_blocking(fds[1], false, &local_err)) {
             ret = -errno;
             goto fail;
         }
         e->rfd = fds[0];
         e->wfd = fds[1];
     }
+    e->initialized = true;
     if (active) {
         event_notifier_set(e);
     }
     return 0;
 
 fail:
+    error_report_err(local_err);
     close(fds[0]);
     close(fds[1]);
     return ret;
@@ -78,23 +81,47 @@ fail:
 
 void event_notifier_cleanup(EventNotifier *e)
 {
+    if (!e->initialized) {
+        return;
+    }
+
     if (e->rfd != e->wfd) {
         close(e->rfd);
     }
+
     e->rfd = -1;
     close(e->wfd);
     e->wfd = -1;
+    e->initialized = false;
 }
 
 int event_notifier_get_fd(const EventNotifier *e)
 {
+    assert(e->initialized);
+    assert(e->rfd >= 0);
     return e->rfd;
+}
+
+int event_notifier_get_wfd(const EventNotifier *e)
+{
+    assert(e->initialized);
+    assert(e->wfd >= 0);
+    return e->wfd;
+}
+
+bool event_notifier_initialized(const EventNotifier *e)
+{
+    return e->initialized;
 }
 
 int event_notifier_set(EventNotifier *e)
 {
     static const uint64_t value = 1;
     ssize_t ret;
+
+    if (!e->initialized) {
+        return -1;
+    }
 
     do {
         ret = write(e->wfd, &value, sizeof(value));
@@ -112,6 +139,10 @@ int event_notifier_test_and_clear(EventNotifier *e)
     int value;
     ssize_t len;
     char buffer[512];
+
+    if (!e->initialized) {
+        return 0;
+    }
 
     /* Drain the notify pipe.  For eventfd, only 8 bytes will be read.  */
     value = 0;

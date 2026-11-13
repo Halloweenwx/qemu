@@ -8,6 +8,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/qapi-type-infos-common.h"
 #include "qapi/qmp/qerror.h"
 #include "qemu/error-report.h"
 
@@ -91,8 +92,8 @@ ssize_t qemu_netfilter_pass_to_next(NetClientState *sender,
     next = netfilter_next(nf, direction);
     while (next) {
         /*
-         * if qemu_netfilter_pass_to_next been called, means that
-         * the packet has been hold by filter and has already retured size
+         * if qemu_netfilter_pass_to_next has been called, it means that
+         * the packet was held by  a filter and has already returned size
          * to the sender, so sent_cb shouldn't be called later, just
          * pass NULL to next.
          */
@@ -106,7 +107,7 @@ ssize_t qemu_netfilter_pass_to_next(NetClientState *sender,
 
     /*
      * We have gone through all filters, pass it to receiver.
-     * Do the valid check again incase sender or receiver been
+     * Do the valid check again in case sender or receiver been
      * deleted while we go through filters.
      */
     if (sender && sender->peer) {
@@ -130,6 +131,7 @@ static void netfilter_set_netdev_id(Object *obj, const char *str, Error **errp)
 {
     NetFilterState *nf = NETFILTER(obj);
 
+    g_free(nf->netdev_id);
     nf->netdev_id = g_strdup(str);
 }
 
@@ -182,6 +184,7 @@ static void netfilter_set_position(Object *obj, const char *str, Error **errp)
 {
     NetFilterState *nf = NETFILTER(obj);
 
+    g_free(nf->position);
     nf->position = g_strdup(str);
 }
 
@@ -212,23 +215,6 @@ static void netfilter_init(Object *obj)
     nf->on = true;
     nf->insert_before_flag = false;
     nf->position = g_strdup("tail");
-
-    object_property_add_str(obj, "netdev",
-                            netfilter_get_netdev_id, netfilter_set_netdev_id,
-                            NULL);
-    object_property_add_enum(obj, "queue", "NetFilterDirection",
-                             &NetFilterDirection_lookup,
-                             netfilter_get_direction, netfilter_set_direction,
-                             NULL);
-    object_property_add_str(obj, "status",
-                            netfilter_get_status, netfilter_set_status,
-                            NULL);
-    object_property_add_str(obj, "position",
-                            netfilter_get_position, netfilter_set_position,
-                            NULL);
-    object_property_add_str(obj, "insert",
-                            netfilter_get_insert, netfilter_set_insert,
-                            NULL);
 }
 
 static void netfilter_complete(UserCreatable *uc, Error **errp)
@@ -343,17 +329,30 @@ static void default_handle_event(NetFilterState *nf, int event, Error **errp)
     case COLO_EVENT_CHECKPOINT:
         break;
     case COLO_EVENT_FAILOVER:
-        object_property_set_str(OBJECT(nf), "off", "status", errp);
+        object_property_set_str(OBJECT(nf), "status", "off", errp);
         break;
     default:
         break;
     }
 }
 
-static void netfilter_class_init(ObjectClass *oc, void *data)
+static void netfilter_class_init(ObjectClass *oc, const void *data)
 {
     UserCreatableClass *ucc = USER_CREATABLE_CLASS(oc);
     NetFilterClass *nfc = NETFILTER_CLASS(oc);
+
+    object_class_property_add_str(oc, "netdev",
+                                  netfilter_get_netdev_id, netfilter_set_netdev_id);
+    object_class_property_add_enum(oc, "queue", "NetFilterDirection",
+                                   &NetFilterDirection_type_info,
+                                   netfilter_get_direction,
+                                   netfilter_set_direction);
+    object_class_property_add_str(oc, "status",
+                                  netfilter_get_status, netfilter_set_status);
+    object_class_property_add_str(oc, "position",
+                                  netfilter_get_position, netfilter_set_position);
+    object_class_property_add_str(oc, "insert",
+                                  netfilter_get_insert, netfilter_set_insert);
 
     ucc->complete = netfilter_complete;
     nfc->handle_event = default_handle_event;
@@ -368,7 +367,7 @@ static const TypeInfo netfilter_info = {
     .instance_size = sizeof(NetFilterState),
     .instance_init = netfilter_init,
     .instance_finalize = netfilter_finalize,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_USER_CREATABLE },
         { }
     }

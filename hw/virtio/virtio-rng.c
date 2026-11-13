@@ -15,10 +15,10 @@
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/virtio/virtio.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/virtio/virtio-rng.h"
-#include "sysemu/rng.h"
-#include "sysemu/runstate.h"
+#include "system/rng.h"
+#include "system/runstate.h"
 #include "qom/object_interfaces.h"
 #include "trace.h"
 
@@ -133,7 +133,7 @@ static uint64_t get_features(VirtIODevice *vdev, uint64_t f, Error **errp)
     return f;
 }
 
-static void virtio_rng_vm_state_change(void *opaque, int running,
+static void virtio_rng_vm_state_change(void *opaque, bool running,
                                        RunState state)
 {
     VirtIORNG *vrng = opaque;
@@ -159,24 +159,24 @@ static void check_rate_limit(void *opaque)
     vrng->activate_timer = true;
 }
 
-static void virtio_rng_set_status(VirtIODevice *vdev, uint8_t status)
+static int virtio_rng_set_status(VirtIODevice *vdev, uint8_t status)
 {
     VirtIORNG *vrng = VIRTIO_RNG(vdev);
 
     if (!vdev->vm_running) {
-        return;
+        return 0;
     }
     vdev->status = status;
 
     /* Something changed, try to process buffers */
     virtio_rng_process(vrng);
+    return 0;
 }
 
 static void virtio_rng_device_realize(DeviceState *dev, Error **errp)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIORNG *vrng = VIRTIO_RNG(dev);
-    Error *local_err = NULL;
 
     if (vrng->conf.period_ms <= 0) {
         error_setg(errp, "'period' parameter expects a positive integer");
@@ -185,8 +185,9 @@ static void virtio_rng_device_realize(DeviceState *dev, Error **errp)
 
     /* Workaround: Property parsing does not enforce unsigned integers,
      * So this is a hack to reject such numbers. */
-    if (vrng->conf.max_bytes > INT64_MAX) {
-        error_setg(errp, "'max-bytes' parameter must be non-negative, "
+    if (vrng->conf.max_bytes == 0 ||
+        vrng->conf.max_bytes > INT64_MAX) {
+        error_setg(errp, "'max-bytes' parameter must be positive, "
                    "and less than 2^63");
         return;
     }
@@ -194,22 +195,20 @@ static void virtio_rng_device_realize(DeviceState *dev, Error **errp)
     if (vrng->conf.rng == NULL) {
         Object *default_backend = object_new(TYPE_RNG_BUILTIN);
 
-        user_creatable_complete(USER_CREATABLE(default_backend),
-                                &local_err);
-        if (local_err) {
-            error_propagate(errp, local_err);
+        if (!user_creatable_complete(USER_CREATABLE(default_backend),
+                                     errp)) {
             object_unref(default_backend);
             return;
         }
 
         object_property_add_child(OBJECT(dev), "default-backend",
-                                  default_backend, &error_abort);
+                                  default_backend);
 
         /* The child property took a reference, we can safely drop ours now */
         object_unref(default_backend);
 
-        object_property_set_link(OBJECT(dev), default_backend,
-                                 "rng", &error_abort);
+        object_property_set_link(OBJECT(dev), "rng", default_backend,
+                                 &error_abort);
     }
 
     vrng->rng = vrng->conf.rng;
@@ -218,7 +217,7 @@ static void virtio_rng_device_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    virtio_init(vdev, "virtio-rng", VIRTIO_ID_RNG, 0);
+    virtio_init(vdev, VIRTIO_ID_RNG, 0);
 
     vrng->vq = virtio_add_queue(vdev, 8, handle_input);
     vrng->quota_remaining = vrng->conf.max_bytes;
@@ -230,13 +229,14 @@ static void virtio_rng_device_realize(DeviceState *dev, Error **errp)
                                                      vrng);
 }
 
-static void virtio_rng_device_unrealize(DeviceState *dev, Error **errp)
+static void virtio_rng_device_unrealize(DeviceState *dev)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIORNG *vrng = VIRTIO_RNG(dev);
 
+    rng_backend_cancel_requests(vrng->rng, chr_read, vrng);
+
     qemu_del_vm_change_state_handler(vrng->vmstate);
-    timer_del(vrng->rate_limit_timer);
     timer_free(vrng->rate_limit_timer);
     virtio_del_queue(vdev, 0);
     virtio_cleanup(vdev);
@@ -246,13 +246,13 @@ static const VMStateDescription vmstate_virtio_rng = {
     .name = "virtio-rng",
     .minimum_version_id = 1,
     .version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_VIRTIO_DEVICE,
         VMSTATE_END_OF_LIST()
     },
 };
 
-static Property virtio_rng_properties[] = {
+static const Property virtio_rng_properties[] = {
     /* Set a default rate limit of 2^47 bytes per minute or roughly 2TB/s.  If
      * you have an entropy source capable of generating more entropy than this
      * and you can pass it through via virtio-rng, then hats off to you.  Until
@@ -261,10 +261,9 @@ static Property virtio_rng_properties[] = {
     DEFINE_PROP_UINT64("max-bytes", VirtIORNG, conf.max_bytes, INT64_MAX),
     DEFINE_PROP_UINT32("period", VirtIORNG, conf.period_ms, 1 << 16),
     DEFINE_PROP_LINK("rng", VirtIORNG, conf.rng, TYPE_RNG_BACKEND, RngBackend *),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void virtio_rng_class_init(ObjectClass *klass, void *data)
+static void virtio_rng_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);

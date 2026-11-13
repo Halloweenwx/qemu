@@ -44,14 +44,14 @@
 #define VIRTIO_CONSOLE_BAD_ID		(~(uint32_t)0)
 
 struct virtio_console_config {
-	/* colums of the screens */
-	uint16_t cols;
+	/* columns of the screens */
+	__virtio16 cols;
 	/* rows of the screens */
-	uint16_t rows;
+	__virtio16 rows;
 	/* max. number of ports this device can hold */
-	uint32_t max_nr_ports;
+	__virtio32 max_nr_ports;
 	/* emergency write register */
-	uint32_t emerg_wr;
+	__virtio32 emerg_wr;
 } QEMU_PACKED;
 
 /*

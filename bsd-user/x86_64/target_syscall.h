@@ -1,3 +1,10 @@
+/*
+ * x86_64 system call definitions
+ *
+ * Copyright (c) 2013 Stacey D. Son
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
 #ifndef TARGET_SYSCALL_H
 #define TARGET_SYSCALL_H
 
@@ -111,7 +118,9 @@ struct target_msqid64_ds {
 #define TARGET_FREEBSD_AMD64_SET_GSBASE	131
 
 
-#define UNAME_MACHINE "x86_64"
+#define UNAME_MACHINE           "x86_64"
+#define TARGET_HW_MACHINE       "amd64"
+#define TARGET_HW_MACHINE_ARCH  "amd64"
 
 #define TARGET_ARCH_SET_GS 0x1001
 #define TARGET_ARCH_SET_FS 0x1002

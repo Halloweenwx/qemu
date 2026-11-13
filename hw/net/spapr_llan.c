@@ -26,18 +26,18 @@
  */
 
 #include "qemu/osdep.h"
-#include "cpu.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "net/net.h"
 #include "migration/vmstate.h"
 #include "hw/ppc/spapr.h"
 #include "hw/ppc/spapr_vio.h"
-#include "hw/qdev-properties.h"
-#include "sysemu/sysemu.h"
+#include "hw/core/qdev-properties.h"
+#include "system/system.h"
 #include "trace.h"
 
 #include <libfdt.h>
+#include "qom/object.h"
 
 #define ETH_ALEN        6
 #define MAX_PACKET_SIZE 65536
@@ -84,8 +84,7 @@ typedef uint64_t vlan_bd_t;
 #define VLAN_MAX_BUFS        (VLAN_RX_BDS_LEN / 8)
 
 #define TYPE_VIO_SPAPR_VLAN_DEVICE "spapr-vlan"
-#define VIO_SPAPR_VLAN_DEVICE(obj) \
-     OBJECT_CHECK(SpaprVioVlan, (obj), TYPE_VIO_SPAPR_VLAN_DEVICE)
+OBJECT_DECLARE_SIMPLE_TYPE(SpaprVioVlan, VIO_SPAPR_VLAN_DEVICE)
 
 #define RX_POOL_MAX_BDS 4096
 #define RX_MAX_POOLS 5
@@ -96,7 +95,7 @@ typedef struct {
     vlan_bd_t bds[RX_POOL_MAX_BDS];
 } RxBufPool;
 
-typedef struct SpaprVioVlan {
+struct SpaprVioVlan {
     SpaprVioDevice sdev;
     NICConf nicconf;
     NICState *nic;
@@ -108,13 +107,13 @@ typedef struct SpaprVioVlan {
     QEMUTimer *rxp_timer;
     uint32_t compat_flags;             /* Compatibility flags for migration */
     RxBufPool *rx_pool[RX_MAX_POOLS];  /* Receive buffer descriptor pools */
-} SpaprVioVlan;
+};
 
-static int spapr_vlan_can_receive(NetClientState *nc)
+static bool spapr_vlan_can_receive(NetClientState *nc)
 {
     SpaprVioVlan *dev = qemu_get_nic_opaque(nc);
 
-    return (dev->isopen && dev->rx_bufs > 0);
+    return dev->isopen && dev->rx_bufs > 0;
 }
 
 /**
@@ -326,7 +325,8 @@ static void spapr_vlan_realize(SpaprVioDevice *sdev, Error **errp)
     memcpy(&dev->perm_mac.a, &dev->nicconf.macaddr.a, sizeof(dev->perm_mac.a));
 
     dev->nic = qemu_new_nic(&net_spapr_vlan_info, &dev->nicconf,
-                            object_get_typename(OBJECT(sdev)), sdev->qdev.id, dev);
+                            object_get_typename(OBJECT(sdev)), sdev->qdev.id,
+                            &sdev->qdev.mem_reentrancy_guard, dev);
     qemu_format_nic_info_str(qemu_get_queue(dev->nic), dev->nicconf.macaddr.a);
 
     dev->rxp_timer = timer_new_us(QEMU_CLOCK_VIRTUAL, spapr_vlan_flush_rx_queue,
@@ -340,7 +340,7 @@ static void spapr_vlan_instance_init(Object *obj)
 
     device_add_bootindex_property(obj, &dev->nicconf.bootindex,
                                   "bootindex", "",
-                                  DEVICE(dev), NULL);
+                                  DEVICE(dev));
 
     if (dev->compat_flags & SPAPRVLAN_FLAG_RX_BUF_POOLS) {
         for (i = 0; i < RX_MAX_POOLS; i++) {
@@ -363,7 +363,6 @@ static void spapr_vlan_instance_finalize(Object *obj)
     }
 
     if (dev->rxp_timer) {
-        timer_del(dev->rxp_timer);
         timer_free(dev->rxp_timer);
     }
 }
@@ -372,11 +371,11 @@ void spapr_vlan_create(SpaprVioBus *bus, NICInfo *nd)
 {
     DeviceState *dev;
 
-    dev = qdev_create(&bus->bus, "spapr-vlan");
+    dev = qdev_new("spapr-vlan");
 
     qdev_set_nic_properties(dev, nd);
 
-    qdev_init_nofail(dev);
+    qdev_realize_and_unref(dev, &bus->bus, &error_fatal);
 }
 
 static int spapr_vlan_devnode(SpaprVioDevice *dev, void *fdt, int node_off)
@@ -688,7 +687,8 @@ static target_ulong h_send_logical_lan(PowerPCCPU *cpu,
     SpaprVioDevice *sdev = spapr_vio_find_by_reg(spapr->vio_bus, reg);
     SpaprVioVlan *dev = VIO_SPAPR_VLAN_DEVICE(sdev);
     unsigned total_len;
-    uint8_t *lbuf, *p;
+    uint8_t *p;
+    g_autofree uint8_t *lbuf = NULL;
     int i, nbufs;
     int ret;
 
@@ -729,7 +729,7 @@ static target_ulong h_send_logical_lan(PowerPCCPU *cpu,
         return H_RESOURCE;
     }
 
-    lbuf = alloca(total_len);
+    lbuf = g_malloc(total_len);
     p = lbuf;
     for (i = 0; i < nbufs; i++) {
         ret = spapr_vio_dma_read(sdev, VLAN_BD_ADDR(bufs[i]),
@@ -770,6 +770,12 @@ static target_ulong h_change_logical_lan_mac(PowerPCCPU *cpu,
     SpaprVioVlan *dev = VIO_SPAPR_VLAN_DEVICE(sdev);
     int i;
 
+    if (!dev) {
+        hcall_dprintf("H_CHANGE_LOGICAL_LAN_MAC called when "
+                      "no NIC is present\n");
+        return H_PARAMETER;
+    }
+
     for (i = 0; i < ETH_ALEN; i++) {
         dev->nicconf.macaddr.a[ETH_ALEN - i - 1] = macaddr & 0xff;
         macaddr >>= 8;
@@ -780,12 +786,11 @@ static target_ulong h_change_logical_lan_mac(PowerPCCPU *cpu,
     return H_SUCCESS;
 }
 
-static Property spapr_vlan_properties[] = {
+static const Property spapr_vlan_properties[] = {
     DEFINE_SPAPR_PROPERTIES(SpaprVioVlan, sdev),
     DEFINE_NIC_PROPERTIES(SpaprVioVlan, nicconf),
     DEFINE_PROP_BIT("use-rx-buffer-pools", SpaprVioVlan,
                     compat_flags, SPAPRVLAN_FLAG_RX_BUF_POOLS_BIT, true),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static bool spapr_vlan_rx_buffer_pools_needed(void *opaque)
@@ -795,12 +800,30 @@ static bool spapr_vlan_rx_buffer_pools_needed(void *opaque)
     return (dev->compat_flags & SPAPRVLAN_FLAG_RX_BUF_POOLS) != 0;
 }
 
+static int spapr_vlan_rx_buffer_pool_post_load(void *opaque, int version_id)
+{
+    RxBufPool *rxp = opaque;
+
+    if (rxp->count < 0 || rxp->count > RX_POOL_MAX_BDS) {
+        return -EINVAL;
+    }
+    /*
+     * bufsize is compared against a size_t in spapr_vlan_get_rx_bd_from_pool(),
+     * so a negative value would compare as huge.
+     */
+    if (rxp->bufsize < 0) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
 static const VMStateDescription vmstate_rx_buffer_pool = {
     .name = "spapr_llan/rx_buffer_pool",
     .version_id = 1,
     .minimum_version_id = 1,
     .needed = spapr_vlan_rx_buffer_pools_needed,
-    .fields = (VMStateField[]) {
+    .post_load = spapr_vlan_rx_buffer_pool_post_load,
+    .fields = (const VMStateField[]) {
         VMSTATE_INT32(bufsize, RxBufPool),
         VMSTATE_INT32(count, RxBufPool),
         VMSTATE_UINT64_ARRAY(bds, RxBufPool, RX_POOL_MAX_BDS),
@@ -813,7 +836,7 @@ static const VMStateDescription vmstate_rx_pools = {
     .version_id = 1,
     .minimum_version_id = 1,
     .needed = spapr_vlan_rx_buffer_pools_needed,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_ARRAY_OF_POINTER_TO_STRUCT(rx_pool, SpaprVioVlan,
                                            RX_MAX_POOLS, 1,
                                            vmstate_rx_buffer_pool, RxBufPool),
@@ -825,7 +848,7 @@ static const VMStateDescription vmstate_spapr_llan = {
     .name = "spapr_llan",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_SPAPR_VIO(sdev, SpaprVioVlan),
         /* LLAN state */
         VMSTATE_BOOL(isopen, SpaprVioVlan),
@@ -837,13 +860,13 @@ static const VMStateDescription vmstate_spapr_llan = {
 
         VMSTATE_END_OF_LIST()
     },
-    .subsections = (const VMStateDescription * []) {
+    .subsections = (const VMStateDescription * const []) {
         &vmstate_rx_pools,
         NULL
     }
 };
 
-static void spapr_vlan_class_init(ObjectClass *klass, void *data)
+static void spapr_vlan_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SpaprVioDeviceClass *k = VIO_SPAPR_DEVICE_CLASS(klass);

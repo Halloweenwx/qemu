@@ -29,24 +29,24 @@ typedef struct QCryptoBlock QCryptoBlock;
 /* See also QCryptoBlockFormat, QCryptoBlockCreateOptions
  * and QCryptoBlockOpenOptions in qapi/crypto.json */
 
-typedef ssize_t (*QCryptoBlockReadFunc)(QCryptoBlock *block,
-                                        size_t offset,
-                                        uint8_t *buf,
-                                        size_t buflen,
-                                        void *opaque,
-                                        Error **errp);
+typedef int (*QCryptoBlockReadFunc)(QCryptoBlock *block,
+                                    size_t offset,
+                                    uint8_t *buf,
+                                    size_t buflen,
+                                    void *opaque,
+                                    Error **errp);
 
-typedef ssize_t (*QCryptoBlockInitFunc)(QCryptoBlock *block,
-                                        size_t headerlen,
-                                        void *opaque,
-                                        Error **errp);
+typedef int (*QCryptoBlockInitFunc)(QCryptoBlock *block,
+                                    size_t headerlen,
+                                    void *opaque,
+                                    Error **errp);
 
-typedef ssize_t (*QCryptoBlockWriteFunc)(QCryptoBlock *block,
-                                         size_t offset,
-                                         const uint8_t *buf,
-                                         size_t buflen,
-                                         void *opaque,
-                                         Error **errp);
+typedef int (*QCryptoBlockWriteFunc)(QCryptoBlock *block,
+                                     size_t offset,
+                                     const uint8_t *buf,
+                                     size_t buflen,
+                                     void *opaque,
+                                     Error **errp);
 
 /**
  * qcrypto_block_has_format:
@@ -66,6 +66,7 @@ bool qcrypto_block_has_format(QCryptoBlockFormat format,
 
 typedef enum {
     QCRYPTO_BLOCK_OPEN_NO_IO = (1 << 0),
+    QCRYPTO_BLOCK_OPEN_DETACHED = (1 << 1),
 } QCryptoBlockOpenFlags;
 
 /**
@@ -75,7 +76,6 @@ typedef enum {
  * @readfunc: callback for reading data from the volume
  * @opaque: data to pass to @readfunc
  * @flags: bitmask of QCryptoBlockOpenFlags values
- * @n_threads: allow concurrent I/O from up to @n_threads threads
  * @errp: pointer to a NULL-initialized error object
  *
  * Create a new block encryption object for an existing
@@ -95,6 +95,10 @@ typedef enum {
  * metadata such as the payload offset. There will be
  * no cipher or ivgen objects available.
  *
+ * If @flags contains QCRYPTO_BLOCK_OPEN_DETACHED then
+ * the open process will be optimized to skip the LUKS
+ * payload overlap check.
+ *
  * If any part of initializing the encryption context
  * fails an error will be returned. This could be due
  * to the volume being in the wrong format, a cipher
@@ -108,8 +112,11 @@ QCryptoBlock *qcrypto_block_open(QCryptoBlockOpenOptions *options,
                                  QCryptoBlockReadFunc readfunc,
                                  void *opaque,
                                  unsigned int flags,
-                                 size_t n_threads,
                                  Error **errp);
+
+typedef enum {
+    QCRYPTO_BLOCK_CREATE_DETACHED = (1 << 0),
+} QCryptoBlockCreateFlags;
 
 /**
  * qcrypto_block_create:
@@ -118,6 +125,7 @@ QCryptoBlock *qcrypto_block_open(QCryptoBlockOpenOptions *options,
  * @initfunc: callback for initializing volume header
  * @writefunc: callback for writing data to the volume header
  * @opaque: data to pass to @initfunc and @writefunc
+ * @flags: bitmask of QCryptoBlockCreateFlags values
  * @errp: pointer to a NULL-initialized error object
  *
  * Create a new block encryption object for initializing
@@ -128,6 +136,11 @@ QCryptoBlock *qcrypto_block_open(QCryptoBlockOpenOptions *options,
  * using @initfunc and then write header data using @writefunc,
  * generating new master keys, etc as required. Any existing
  * data present on the volume will be irrevocably destroyed.
+ *
+ * If @flags contains QCRYPTO_BLOCK_CREATE_DETACHED then
+ * the open process will set the payload_offset_sector to 0
+ * to specify the starting point for the read/write of a
+ * detached LUKS header image.
  *
  * If any part of initializing the encryption context
  * fails an error will be returned. This could be due
@@ -142,7 +155,30 @@ QCryptoBlock *qcrypto_block_create(QCryptoBlockCreateOptions *options,
                                    QCryptoBlockInitFunc initfunc,
                                    QCryptoBlockWriteFunc writefunc,
                                    void *opaque,
+                                   unsigned int flags,
                                    Error **errp);
+
+/**
+ * qcrypto_block_amend_options:
+ * @block: the block encryption object
+ *
+ * @readfunc: callback for reading data from the volume header
+ * @writefunc: callback for writing data to the volume header
+ * @opaque: data to pass to @readfunc and @writefunc
+ * @options: the new/amended encryption options
+ * @force: hint for the driver to allow unsafe operation
+ * @errp: error pointer
+ *
+ * Changes the crypto options of the encryption format
+ *
+ */
+int qcrypto_block_amend_options(QCryptoBlock *block,
+                                QCryptoBlockReadFunc readfunc,
+                                QCryptoBlockWriteFunc writefunc,
+                                void *opaque,
+                                QCryptoBlockAmendOptions *options,
+                                bool force,
+                                Error **errp);
 
 
 /**
@@ -251,7 +287,7 @@ QCryptoIVGen *qcrypto_block_get_ivgen(QCryptoBlock *block);
  *
  * Returns: the hash algorithm
  */
-QCryptoHashAlgorithm qcrypto_block_get_kdf_hash(QCryptoBlock *block);
+QCryptoHashAlgo qcrypto_block_get_kdf_hash(QCryptoBlock *block);
 
 /**
  * qcrypto_block_get_payload_offset:
@@ -289,7 +325,5 @@ uint64_t qcrypto_block_get_sector_size(QCryptoBlock *block);
 void qcrypto_block_free(QCryptoBlock *block);
 
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(QCryptoBlock, qcrypto_block_free)
-G_DEFINE_AUTOPTR_CLEANUP_FUNC(QCryptoBlockCreateOptions,
-                              qapi_free_QCryptoBlockCreateOptions)
 
 #endif /* QCRYPTO_BLOCK_H */

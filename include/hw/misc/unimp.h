@@ -8,20 +8,43 @@
 #ifndef HW_MISC_UNIMP_H
 #define HW_MISC_UNIMP_H
 
-#include "hw/qdev-properties.h"
-#include "hw/sysbus.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/sysbus.h"
+#include "qapi/error.h"
+#include "qom/object.h"
 
 #define TYPE_UNIMPLEMENTED_DEVICE "unimplemented-device"
 
-#define UNIMPLEMENTED_DEVICE(obj) \
-    OBJECT_CHECK(UnimplementedDeviceState, (obj), TYPE_UNIMPLEMENTED_DEVICE)
+OBJECT_DECLARE_SIMPLE_TYPE(UnimplementedDeviceState, UNIMPLEMENTED_DEVICE)
 
-typedef struct {
+struct UnimplementedDeviceState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
+    unsigned offset_fmt_width;
     char *name;
     uint64_t size;
-} UnimplementedDeviceState;
+};
+
+typedef struct UnimplementedDeviceConfig {
+    const char *qom_name;
+    const char *region_name;
+    uint64_t offset;
+    uint64_t size;
+    int priority;
+} UnimplementedDeviceConfig;
+
+/**
+ * create_unimplemented_devices:
+ * @parentobj: the parent object
+ * @container: a #MemoryRegion within which @addr is a relative address
+ * @devconfigs: NULL terminated array of #UnimplementedDeviceConfig
+ *
+ * For each entries in @devconfigs, create a TYPE_UNIMPLEMENTED_DEVICE
+ * and mmap it in @container at UnimplementedDeviceConfig::offset.
+ * @container is expected to be a QOM child of @parentobj.
+ */
+void create_unimplemented_devices(Object *parentobj, MemoryRegion *container,
+                                  const UnimplementedDeviceConfig *devconfigs);
 
 /**
  * create_unimplemented_device: create and map a dummy device
@@ -40,11 +63,11 @@ static inline void create_unimplemented_device(const char *name,
                                                hwaddr base,
                                                hwaddr size)
 {
-    DeviceState *dev = qdev_create(NULL, TYPE_UNIMPLEMENTED_DEVICE);
+    DeviceState *dev = qdev_new(TYPE_UNIMPLEMENTED_DEVICE);
 
     qdev_prop_set_string(dev, "name", name);
     qdev_prop_set_uint64(dev, "size", size);
-    qdev_init_nofail(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 
     sysbus_mmio_map_overlap(SYS_BUS_DEVICE(dev), 0, base, -1000);
 }

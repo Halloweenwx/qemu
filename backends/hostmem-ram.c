@@ -11,29 +11,33 @@
  */
 
 #include "qemu/osdep.h"
-#include "sysemu/hostmem.h"
+#include "system/hostmem.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "qom/object_interfaces.h"
 
-static void
+static bool
 ram_backend_memory_alloc(HostMemoryBackend *backend, Error **errp)
 {
-    char *name;
+    g_autofree char *name = NULL;
+    uint32_t ram_flags;
 
     if (!backend->size) {
         error_setg(errp, "can't create backend with size 0");
-        return;
+        return false;
     }
 
     name = host_memory_backend_get_name(backend);
-    memory_region_init_ram_shared_nomigrate(&backend->mr, OBJECT(backend), name,
-                           backend->size, backend->share, errp);
-    g_free(name);
+    ram_flags = backend->share ? RAM_SHARED : RAM_PRIVATE;
+    ram_flags |= backend->reserve ? 0 : RAM_NORESERVE;
+    ram_flags |= backend->guest_memfd_private ? RAM_GUEST_MEMFD_PRIVATE : 0;
+    return memory_region_init_ram_flags_nomigrate(&backend->mr, OBJECT(backend),
+                                                  name, backend->size,
+                                                  ram_flags, errp);
 }
 
 static void
-ram_backend_class_init(ObjectClass *oc, void *data)
+ram_backend_class_init(ObjectClass *oc, const void *data)
 {
     HostMemoryBackendClass *bc = MEMORY_BACKEND_CLASS(oc);
 

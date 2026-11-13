@@ -33,6 +33,42 @@
 #include "net/can_emu.h"
 #include "qom/object_interfaces.h"
 
+/* CAN DLC to real data length conversion helpers */
+
+static const uint8_t dlc2len[] = {
+    0, 1, 2, 3, 4, 5, 6, 7,
+    8, 12, 16, 20, 24, 32, 48, 64
+};
+
+/* get data length from can_dlc with sanitized can_dlc */
+uint8_t can_dlc2len(uint8_t can_dlc)
+{
+    return dlc2len[can_dlc & 0x0F];
+}
+
+static const uint8_t len2dlc[] = {
+    0, 1, 2, 3, 4, 5, 6, 7, 8,                              /* 0 - 8 */
+    9, 9, 9, 9,                                             /* 9 - 12 */
+    10, 10, 10, 10,                                         /* 13 - 16 */
+    11, 11, 11, 11,                                         /* 17 - 20 */
+    12, 12, 12, 12,                                         /* 21 - 24 */
+    13, 13, 13, 13, 13, 13, 13, 13,                         /* 25 - 32 */
+    14, 14, 14, 14, 14, 14, 14, 14,                         /* 33 - 40 */
+    14, 14, 14, 14, 14, 14, 14, 14,                         /* 41 - 48 */
+    15, 15, 15, 15, 15, 15, 15, 15,                         /* 49 - 56 */
+    15, 15, 15, 15, 15, 15, 15, 15                          /* 57 - 64 */
+};
+
+/* map the sanitized data length to an appropriate data length code */
+uint8_t can_len2dlc(uint8_t len)
+{
+    if (unlikely(len > 64)) {
+        return 0xF;
+    }
+
+    return len2dlc[len];
+}
+
 struct CanBusState {
     Object object;
 
@@ -107,17 +143,19 @@ int can_bus_client_set_filters(CanBusClientState *client,
 }
 
 
-static bool can_bus_can_be_deleted(UserCreatable *uc)
+static bool can_bus_prepare_delete(UserCreatable *uc, Error **errp)
 {
+    error_setg(errp, "Deleting CAN bus device '%s' is not supported",
+               object_get_canonical_path_component(OBJECT(uc)));
     return false;
 }
 
 static void can_bus_class_init(ObjectClass *klass,
-                                void *class_data G_GNUC_UNUSED)
+                               const void *class_data G_GNUC_UNUSED)
 {
     UserCreatableClass *uc_klass = USER_CREATABLE_CLASS(klass);
 
-    uc_klass->can_be_deleted = can_bus_can_be_deleted;
+    uc_klass->prepare_delete = can_bus_prepare_delete;
 }
 
 static const TypeInfo can_bus_info = {
@@ -126,7 +164,7 @@ static const TypeInfo can_bus_info = {
     .instance_size = sizeof(CanBusState),
     .instance_init = can_bus_instance_init,
     .class_init = can_bus_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_USER_CREATABLE },
         { }
     }

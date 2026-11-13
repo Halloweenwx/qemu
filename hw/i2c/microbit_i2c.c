@@ -41,8 +41,13 @@ static uint64_t microbit_i2c_read(void *opaque, hwaddr addr, unsigned int size)
         data = 0x01;
         break;
     case NRF51_TWI_REG_RXD:
+        /*
+         * Return the next byte from our fake data sequence. If
+         * the guest keeps reading the register after that, keep
+         * returning the same last byte value.
+         */
         data = twi_read_sequence[s->read_idx];
-        if (s->read_idx < G_N_ELEMENTS(twi_read_sequence)) {
+        if (s->read_idx + 1 < G_N_ELEMENTS(twi_read_sequence)) {
             s->read_idx++;
         }
         break;
@@ -80,9 +85,10 @@ static const VMStateDescription microbit_i2c_vmstate = {
     .name = TYPE_MICROBIT_I2C,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, MicrobitI2CState, MICROBIT_I2C_NREGS),
         VMSTATE_UINT32(read_idx, MicrobitI2CState),
+        VMSTATE_END_OF_LIST()
     },
 };
 
@@ -100,16 +106,16 @@ static void microbit_i2c_realize(DeviceState *dev, Error **errp)
     MicrobitI2CState *s = MICROBIT_I2C(dev);
 
     memory_region_init_io(&s->iomem, OBJECT(s), &microbit_i2c_ops, s,
-                          "microbit.twi", NRF51_TWI_SIZE);
+                          "microbit.twi", NRF51_PERIPHERAL_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
-static void microbit_i2c_class_init(ObjectClass *klass, void *data)
+static void microbit_i2c_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->vmsd = &microbit_i2c_vmstate;
-    dc->reset = microbit_i2c_reset;
+    device_class_set_legacy_reset(dc, microbit_i2c_reset);
     dc->realize = microbit_i2c_realize;
     dc->desc = "Microbit I2C controller";
 }

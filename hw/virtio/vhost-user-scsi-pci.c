@@ -22,48 +22,52 @@
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-scsi.h"
 #include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "hw/pci/msi.h"
 #include "hw/pci/msix.h"
-#include "hw/loader.h"
-#include "sysemu/kvm.h"
-#include "virtio-pci.h"
+#include "hw/core/loader.h"
+#include "system/kvm.h"
+#include "hw/virtio/virtio-pci.h"
+#include "qom/object.h"
 
 typedef struct VHostUserSCSIPCI VHostUserSCSIPCI;
 
 #define TYPE_VHOST_USER_SCSI_PCI "vhost-user-scsi-pci-base"
-#define VHOST_USER_SCSI_PCI(obj) \
-        OBJECT_CHECK(VHostUserSCSIPCI, (obj), TYPE_VHOST_USER_SCSI_PCI)
+DECLARE_INSTANCE_CHECKER(VHostUserSCSIPCI, VHOST_USER_SCSI_PCI,
+                         TYPE_VHOST_USER_SCSI_PCI)
 
 struct VHostUserSCSIPCI {
     VirtIOPCIProxy parent_obj;
     VHostUserSCSI vdev;
 };
 
-static Property vhost_user_scsi_pci_properties[] = {
+static const Property vhost_user_scsi_pci_properties[] = {
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
                        DEV_NVECTORS_UNSPECIFIED),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void vhost_user_scsi_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
 {
     VHostUserSCSIPCI *dev = VHOST_USER_SCSI_PCI(vpci_dev);
     DeviceState *vdev = DEVICE(&dev->vdev);
-    VirtIOSCSICommon *vs = VIRTIO_SCSI_COMMON(vdev);
+    VirtIOSCSIConf *conf = &dev->vdev.parent_obj.parent_obj.conf;
 
-    if (vpci_dev->nvectors == DEV_NVECTORS_UNSPECIFIED) {
-        vpci_dev->nvectors = vs->conf.num_queues + 3;
+    if (conf->num_queues == VIRTIO_SCSI_AUTO_NUM_QUEUES) {
+        conf->num_queues =
+            virtio_pci_optimal_num_queues(VIRTIO_SCSI_VQ_NUM_FIXED);
     }
 
-    qdev_set_parent_bus(vdev, BUS(&vpci_dev->bus));
-    object_property_set_bool(OBJECT(vdev), true, "realized", errp);
+    if (vpci_dev->nvectors == DEV_NVECTORS_UNSPECIFIED) {
+        vpci_dev->nvectors = conf->num_queues + VIRTIO_SCSI_VQ_NUM_FIXED + 1;
+    }
+
+    qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
 }
 
-static void vhost_user_scsi_pci_class_init(ObjectClass *klass, void *data)
+static void vhost_user_scsi_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);
@@ -84,7 +88,7 @@ static void vhost_user_scsi_pci_instance_init(Object *obj)
     virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
                                 TYPE_VHOST_USER_SCSI);
     object_property_add_alias(obj, "bootindex", OBJECT(&dev->vdev),
-                              "bootindex", &error_abort);
+                              "bootindex");
 }
 
 static const VirtioPCIDeviceTypeInfo vhost_user_scsi_pci_info = {

@@ -9,11 +9,17 @@
 
 #ifndef FTGMAC100_H
 #define FTGMAC100_H
+#include "qom/object.h"
 
 #define TYPE_FTGMAC100 "ftgmac100"
-#define FTGMAC100(obj) OBJECT_CHECK(FTGMAC100State, (obj), TYPE_FTGMAC100)
+OBJECT_DECLARE_SIMPLE_TYPE(FTGMAC100State, FTGMAC100)
 
-#include "hw/sysbus.h"
+#define FTGMAC100_MEM_SIZE 0x1000
+#define FTGMAC100_REG_MEM_SIZE 0x100
+#define FTGMAC100_REG_HIGH_MEM_SIZE 0x100
+#define FTGMAC100_REG_HIGH_OFFSET 0x100
+
+#include "hw/core/sysbus.h"
 #include "net/net.h"
 
 /*
@@ -21,7 +27,7 @@
  */
 #define FTGMAC100_MAX_FRAME_SIZE    9220
 
-typedef struct FTGMAC100State {
+struct FTGMAC100State {
     /*< private >*/
     SysBusDevice parent_obj;
 
@@ -29,7 +35,9 @@ typedef struct FTGMAC100State {
     NICState *nic;
     NICConf conf;
     qemu_irq irq;
+    MemoryRegion iomem_container;
     MemoryRegion iomem;
+    MemoryRegion iomem_high;
 
     uint8_t frame[FTGMAC100_MAX_FRAME_SIZE];
 
@@ -37,10 +45,6 @@ typedef struct FTGMAC100State {
     uint32_t isr;
     uint32_t ier;
     uint32_t rx_enabled;
-    uint32_t rx_ring;
-    uint32_t rx_descriptor;
-    uint32_t tx_ring;
-    uint32_t tx_descriptor;
     uint32_t math[2];
     uint32_t rbsr;
     uint32_t itc;
@@ -53,7 +57,10 @@ typedef struct FTGMAC100State {
     uint32_t phycr;
     uint32_t phydata;
     uint32_t fcr;
-
+    uint64_t rx_ring;
+    uint64_t rx_descriptor;
+    uint64_t tx_ring;
+    uint64_t tx_descriptor;
 
     uint32_t phy_status;
     uint32_t phy_control;
@@ -64,15 +71,16 @@ typedef struct FTGMAC100State {
     bool aspeed;
     uint32_t txdes0_edotr;
     uint32_t rxdes0_edorr;
-} FTGMAC100State;
+    bool dma64;
+};
 
 #define TYPE_ASPEED_MII "aspeed-mmi"
-#define ASPEED_MII(obj) OBJECT_CHECK(AspeedMiiState, (obj), TYPE_ASPEED_MII)
+OBJECT_DECLARE_SIMPLE_TYPE(AspeedMiiState, ASPEED_MII)
 
 /*
  * AST2600 MII controller
  */
-typedef struct AspeedMiiState {
+struct AspeedMiiState {
     /*< private >*/
     SysBusDevice parent_obj;
 
@@ -81,6 +89,6 @@ typedef struct AspeedMiiState {
     MemoryRegion iomem;
     uint32_t phycr;
     uint32_t phydata;
-} AspeedMiiState;
+};
 
 #endif

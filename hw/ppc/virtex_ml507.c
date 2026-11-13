@@ -23,28 +23,31 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
+#include "qemu/datadir.h"
 #include "qemu/units.h"
-#include "cpu.h"
-#include "hw/sysbus.h"
-#include "hw/char/serial.h"
+#include "exec/page-protection.h"
+#include "target/ppc/cpu.h"
+#include "hw/core/sysbus.h"
+#include "hw/char/serial-mm.h"
 #include "hw/block/flash.h"
-#include "sysemu/sysemu.h"
-#include "sysemu/qtest.h"
-#include "sysemu/reset.h"
-#include "hw/boards.h"
-#include "sysemu/device_tree.h"
-#include "hw/loader.h"
+#include "system/physmem.h"
+#include "system/system.h"
+#include "system/reset.h"
+#include "hw/core/boards.h"
+#include "system/device_tree.h"
+#include "hw/core/loader.h"
 #include "elf.h"
+#include "qapi/error.h"
 #include "qemu/error-report.h"
-#include "qemu/log.h"
 #include "qemu/option.h"
-#include "exec/address-spaces.h"
 
+#include "hw/intc/ppc-uic.h"
 #include "hw/ppc/ppc.h"
 #include "hw/ppc/ppc4xx.h"
-#include "hw/qdev-properties.h"
-#include "ppc405.h"
+#include "hw/core/qdev-properties.h"
+#include "exec/cpu-common.h"
+
+#include <libfdt.h>
 
 #define EPAPR_MAGIC    (0x45504150)
 #define FLASH_SIZE     (16 * MiB)
@@ -66,34 +69,12 @@ static struct boot_info
     void *vfdt;
 } boot_info;
 
-/* Create reset TLB entries for BookE, spanning the 32bit addr space.  */
-static void mmubooke_create_initial_mapping(CPUPPCState *env,
-                                     target_ulong va,
-                                     hwaddr pa)
-{
-    ppcemb_tlb_t *tlb = &env->tlb.tlbe[0];
-
-    tlb->attr = 0;
-    tlb->prot = PAGE_VALID | ((PAGE_READ | PAGE_WRITE | PAGE_EXEC) << 4);
-    tlb->size = 1U << 31; /* up to 0x80000000  */
-    tlb->EPN = va & TARGET_PAGE_MASK;
-    tlb->RPN = pa & TARGET_PAGE_MASK;
-    tlb->PID = 0;
-
-    tlb = &env->tlb.tlbe[1];
-    tlb->attr = 0;
-    tlb->prot = PAGE_VALID | ((PAGE_READ | PAGE_WRITE | PAGE_EXEC) << 4);
-    tlb->size = 1U << 31; /* up to 0xffffffff  */
-    tlb->EPN = 0x80000000 & TARGET_PAGE_MASK;
-    tlb->RPN = 0x80000000 & TARGET_PAGE_MASK;
-    tlb->PID = 0;
-}
-
 static PowerPCCPU *ppc440_init_xilinx(const char *cpu_type, uint32_t sysclk)
 {
     PowerPCCPU *cpu;
     CPUPPCState *env;
-    qemu_irq *irqs;
+    DeviceState *uicdev;
+    SysBusDevice *uicsbd;
 
     cpu = POWERPC_CPU(cpu_create(cpu_type));
     env = &cpu->env;
@@ -103,10 +84,16 @@ static PowerPCCPU *ppc440_init_xilinx(const char *cpu_type, uint32_t sysclk)
     ppc_dcr_init(env, NULL, NULL);
 
     /* interrupt controller */
-    irqs = g_new0(qemu_irq, PPCUIC_OUTPUT_NB);
-    irqs[PPCUIC_OUTPUT_INT] = ((qemu_irq *)env->irq_inputs)[PPC40x_INPUT_INT];
-    irqs[PPCUIC_OUTPUT_CINT] = ((qemu_irq *)env->irq_inputs)[PPC40x_INPUT_CINT];
-    ppcuic_init(env, irqs, 0x0C0, 0, 1);
+    uicdev = qdev_new(TYPE_PPC_UIC);
+    ppc4xx_dcr_realize(PPC4xx_DCR_DEVICE(uicdev), cpu, &error_fatal);
+    object_unref(OBJECT(uicdev));
+    uicsbd = SYS_BUS_DEVICE(uicdev);
+    sysbus_connect_irq(uicsbd, PPCUIC_OUTPUT_INT,
+                       qdev_get_gpio_in(DEVICE(cpu), PPC40x_INPUT_INT));
+    sysbus_connect_irq(uicsbd, PPCUIC_OUTPUT_CINT,
+                       qdev_get_gpio_in(DEVICE(cpu), PPC40x_INPUT_CINT));
+
+    /* This board doesn't wire anything up to the inputs of the UIC. */
     return cpu;
 }
 
@@ -131,18 +118,18 @@ static void main_cpu_reset(void *opaque)
     env->gpr[3] = bi->fdt;
     env->nip = bi->bootstrap_pc;
 
-    /* Create a mapping for the kernel.  */
-    mmubooke_create_initial_mapping(env, 0, 0);
-    env->gpr[6] = tswap32(EPAPR_MAGIC);
+    /* Create a mapping spanning the 32bit addr space. */
+    booke_set_tlb(&env->tlb.tlbe[0], 0, 0, 1U << 31);
+    booke_set_tlb(&env->tlb.tlbe[1], 0x80000000, 0x80000000, 1U << 31);
+    env->gpr[6] = EPAPR_MAGIC;
     env->gpr[7] = bi->ima_size;
 }
 
 #define BINARY_DEVICE_TREE_FILE "virtex-ml507.dtb"
-static int xilinx_load_device_tree(hwaddr addr,
-                                      uint32_t ramsize,
-                                      hwaddr initrd_base,
-                                      hwaddr initrd_size,
-                                      const char *kernel_cmdline)
+static int xilinx_load_device_tree(MachineState *machine,
+                                   hwaddr addr,
+                                   hwaddr initrd_base,
+                                   hwaddr initrd_size)
 {
     char *path;
     int fdt_size;
@@ -150,7 +137,7 @@ static int xilinx_load_device_tree(hwaddr addr,
     int r;
     const char *dtb_filename;
 
-    dtb_filename = qemu_opt_get(qemu_get_machine_opts(), "dtb");
+    dtb_filename = machine->dtb;
     if (dtb_filename) {
         fdt = load_device_tree(dtb_filename, &fdt_size);
         if (!fdt) {
@@ -161,7 +148,7 @@ static int xilinx_load_device_tree(hwaddr addr,
         /* Try the local "ppc.dtb" override.  */
         fdt = load_device_tree("ppc.dtb", &fdt_size);
         if (!fdt) {
-            path = qemu_find_file(QEMU_FILE_TYPE_BIOS, BINARY_DEVICE_TREE_FILE);
+            path = qemu_find_file(QEMU_FILE_TYPE_DTB, BINARY_DEVICE_TREE_FILE);
             if (path) {
                 fdt = load_device_tree(path, &fdt_size);
                 g_free(path);
@@ -184,18 +171,21 @@ static int xilinx_load_device_tree(hwaddr addr,
         error_report("couldn't set /chosen/linux,initrd-end");
     }
 
-    r = qemu_fdt_setprop_string(fdt, "/chosen", "bootargs", kernel_cmdline);
+    r = qemu_fdt_setprop_string(fdt, "/chosen", "bootargs",
+                                machine->kernel_cmdline);
     if (r < 0)
         fprintf(stderr, "couldn't set /chosen/bootargs\n");
-    cpu_physical_memory_write(addr, fdt, fdt_size);
-    g_free(fdt);
+    physical_memory_write(addr, fdt, fdt_size);
+
+    /* Set machine->fdt for 'dumpdtb' QMP/HMP command */
+    machine->fdt = fdt;
+
     return fdt_size;
 }
 
 static void virtex_init(MachineState *machine)
 {
     const char *kernel_filename = machine->kernel_filename;
-    const char *kernel_cmdline = machine->kernel_cmdline;
     hwaddr initrd_base = 0;
     int initrd_size = 0;
     MemoryRegion *address_space_mem = get_system_memory();
@@ -204,7 +194,7 @@ static void virtex_init(MachineState *machine)
     CPUPPCState *env;
     hwaddr ram_base = 0;
     DriveInfo *dinfo;
-    qemu_irq irq[32], *cpu_irq;
+    qemu_irq irq[32], cpu_irq;
     int kernel_size;
     int i;
 
@@ -227,12 +217,13 @@ static void virtex_init(MachineState *machine)
                           dinfo ? blk_by_legacy_dinfo(dinfo) : NULL,
                           64 * KiB, 1, 0x89, 0x18, 0x0000, 0x0, 1);
 
-    cpu_irq = (qemu_irq *) &env->irq_inputs[PPC40x_INPUT_INT];
-    dev = qdev_create(NULL, "xlnx.xps-intc");
+    cpu_irq = qdev_get_gpio_in(DEVICE(cpu), PPC40x_INPUT_INT);
+    dev = qdev_new("xlnx.xps-intc");
+    qdev_prop_set_enum(dev, "endianness", ENDIAN_MODE_BIG);
     qdev_prop_set_uint32(dev, "kind-of-intr", 0);
-    qdev_init_nofail(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, INTC_BASEADDR);
-    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irq[0]);
+    sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, cpu_irq);
     for (i = 0; i < 32; i++) {
         irq[i] = qdev_get_gpio_in(dev, i);
     }
@@ -241,21 +232,22 @@ static void virtex_init(MachineState *machine)
                    115200, serial_hd(0), DEVICE_LITTLE_ENDIAN);
 
     /* 2 timers at irq 2 @ 62 Mhz.  */
-    dev = qdev_create(NULL, "xlnx.xps-timer");
+    dev = qdev_new("xlnx.xps-timer");
+    qdev_prop_set_enum(dev, "endianness", ENDIAN_MODE_BIG);
     qdev_prop_set_uint32(dev, "one-timer-only", 0);
     qdev_prop_set_uint32(dev, "clock-frequency", 62 * 1000000);
-    qdev_init_nofail(dev);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, TIMER_BASEADDR);
     sysbus_connect_irq(SYS_BUS_DEVICE(dev), 0, irq[TIMER_IRQ]);
 
     if (kernel_filename) {
-        uint64_t entry, low, high;
+        uint64_t entry, high;
         hwaddr boot_offset;
 
         /* Boots a kernel elf binary.  */
         kernel_size = load_elf(kernel_filename, NULL, NULL, NULL,
-                               &entry, &low, &high, NULL, 1, PPC_ELF_MACHINE,
-                               0, 0);
+                               &entry, NULL, &high, NULL,
+                               ELFDATA2MSB, PPC_ELF_MACHINE, 0, 0);
         boot_info.bootstrap_pc = entry & 0x00ffffff;
 
         if (kernel_size < 0) {
@@ -263,7 +255,7 @@ static void virtex_init(MachineState *machine)
             /* If we failed loading ELF's try a raw image.  */
             kernel_size = load_image_targphys(kernel_filename,
                                               boot_offset,
-                                              machine->ram_size);
+                                              machine->ram_size, &error_fatal);
             boot_info.bootstrap_pc = boot_offset;
             high = boot_info.bootstrap_pc + kernel_size + 8192;
         }
@@ -274,13 +266,8 @@ static void virtex_init(MachineState *machine)
         if (machine->initrd_filename) {
             initrd_base = high = ROUND_UP(high, 4);
             initrd_size = load_image_targphys(machine->initrd_filename,
-                                              high, machine->ram_size - high);
-
-            if (initrd_size < 0) {
-                error_report("couldn't load ram disk '%s'",
-                             machine->initrd_filename);
-                exit(1);
-            }
+                                              high, machine->ram_size - high,
+                                              &error_fatal);
             high = ROUND_UP(high + initrd_size, 4);
         }
 
@@ -288,9 +275,8 @@ static void virtex_init(MachineState *machine)
         boot_info.fdt = high + (8192 * 2);
         boot_info.fdt &= ~8191;
 
-        xilinx_load_device_tree(boot_info.fdt, machine->ram_size,
-                                initrd_base, initrd_size,
-                                kernel_cmdline);
+        xilinx_load_device_tree(machine, boot_info.fdt,
+                                initrd_base, initrd_size);
     }
     env->load_info = &boot_info;
 }

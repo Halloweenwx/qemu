@@ -28,18 +28,35 @@
 #include "qemu/module.h"
 #include "chardev/char-win.h"
 #include "chardev/char-win-stdio.h"
+#include "qom/object.h"
 
-typedef struct {
+struct WinStdioChardev {
     Chardev parent;
     HANDLE  hStdIn;
+    DWORD   dwOldMode;
     HANDLE  hInputReadyEvent;
     HANDLE  hInputDoneEvent;
     HANDLE  hInputThread;
     uint8_t win_stdio_buf;
-} WinStdioChardev;
+};
+typedef struct WinStdioChardev WinStdioChardev;
 
-#define WIN_STDIO_CHARDEV(obj)                                          \
-    OBJECT_CHECK(WinStdioChardev, (obj), TYPE_CHARDEV_WIN_STDIO)
+DECLARE_INSTANCE_CHECKER(WinStdioChardev, WIN_STDIO_CHARDEV,
+                         TYPE_CHARDEV_WIN_STDIO)
+
+static void win_stdio_chr_resize(Chardev *chr)
+{
+    HANDLE hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO ScreenBufferInfo;
+
+    if (GetConsoleScreenBufferInfo(hStdOut, &ScreenBufferInfo)) {
+        uint16_t cols = ScreenBufferInfo.srWindow.Right + 1
+                        - ScreenBufferInfo.srWindow.Left;
+        uint16_t rows = ScreenBufferInfo.srWindow.Bottom + 1
+                        - ScreenBufferInfo.srWindow.Top;
+        qemu_chr_resize(chr, cols, rows);
+    }
+}
 
 static void win_stdio_wait_func(void *opaque)
 {
@@ -71,6 +88,9 @@ static void win_stdio_wait_func(void *opaque)
                     }
                 }
             }
+        }
+        if (buf[i].EventType == WINDOW_BUFFER_SIZE_EVENT) {
+            win_stdio_chr_resize(chr);
         }
     }
 }
@@ -125,7 +145,7 @@ static void win_stdio_thread_wait_func(void *opaque)
     SetEvent(stdio->hInputDoneEvent);
 }
 
-static void qemu_chr_set_echo_win_stdio(Chardev *chr, bool echo)
+static void win_stdio_chr_set_echo(Chardev *chr, bool echo)
 {
     WinStdioChardev *stdio = WIN_STDIO_CHARDEV(chr);
     DWORD              dwMode = 0;
@@ -139,11 +159,12 @@ static void qemu_chr_set_echo_win_stdio(Chardev *chr, bool echo)
     }
 }
 
-static void qemu_chr_open_stdio(Chardev *chr,
-                                ChardevBackend *backend,
-                                bool *be_opened,
-                                Error **errp)
+static bool win_stdio_chr_open(Chardev *chr,
+                               ChardevBackend *backend,
+                               Error **errp)
 {
+    ChardevStdio *opts = backend->u.stdio.data;
+    bool stdio_allow_signal = !opts->has_signal || opts->signal;
     WinStdioChardev *stdio = WIN_STDIO_CHARDEV(chr);
     DWORD              dwMode;
     int                is_console = 0;
@@ -151,10 +172,11 @@ static void qemu_chr_open_stdio(Chardev *chr,
     stdio->hStdIn = GetStdHandle(STD_INPUT_HANDLE);
     if (stdio->hStdIn == INVALID_HANDLE_VALUE) {
         error_setg(errp, "cannot open stdio: invalid handle");
-        return;
+        return false;
     }
 
     is_console = GetConsoleMode(stdio->hStdIn, &dwMode) != 0;
+    stdio->dwOldMode = dwMode;
 
     if (is_console) {
         if (qemu_add_wait_object(stdio->hStdIn,
@@ -186,19 +208,26 @@ static void qemu_chr_open_stdio(Chardev *chr,
         }
     }
 
-    dwMode |= ENABLE_LINE_INPUT;
+    dwMode |= ENABLE_LINE_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT;
 
     if (is_console) {
         /* set the terminal in raw mode */
         /* ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS */
-        dwMode |= ENABLE_PROCESSED_INPUT;
+        if (stdio_allow_signal) {
+            dwMode |= ENABLE_PROCESSED_INPUT;
+        } else {
+            dwMode &= ~ENABLE_PROCESSED_INPUT;
+        }
+        dwMode |= ENABLE_WINDOW_INPUT;
+        win_stdio_chr_resize(chr);
     }
 
     SetConsoleMode(stdio->hStdIn, dwMode);
 
-    qemu_chr_set_echo_win_stdio(chr, false);
+    win_stdio_chr_set_echo(chr, false);
 
-    return;
+    qemu_chr_be_event(chr, CHR_EVENT_OPENED);
+    return true;
 
 err3:
     qemu_del_wait_object(stdio->hInputReadyEvent, NULL, NULL);
@@ -207,12 +236,16 @@ err2:
     CloseHandle(stdio->hInputDoneEvent);
 err1:
     qemu_del_wait_object(stdio->hStdIn, NULL, NULL);
+    return false;
 }
 
 static void char_win_stdio_finalize(Object *obj)
 {
     WinStdioChardev *stdio = WIN_STDIO_CHARDEV(obj);
 
+    if (stdio->hStdIn != INVALID_HANDLE_VALUE) {
+        SetConsoleMode(stdio->hStdIn, stdio->dwOldMode);
+    }
     if (stdio->hInputReadyEvent != INVALID_HANDLE_VALUE) {
         CloseHandle(stdio->hInputReadyEvent);
     }
@@ -224,7 +257,7 @@ static void char_win_stdio_finalize(Object *obj)
     }
 }
 
-static int win_stdio_write(Chardev *chr, const uint8_t *buf, int len)
+static int win_stdio_chr_write(Chardev *chr, const uint8_t *buf, int len)
 {
     HANDLE  hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD   dwSize;
@@ -243,13 +276,13 @@ static int win_stdio_write(Chardev *chr, const uint8_t *buf, int len)
     return len - len1;
 }
 
-static void char_win_stdio_class_init(ObjectClass *oc, void *data)
+static void char_win_stdio_class_init(ObjectClass *oc, const void *data)
 {
     ChardevClass *cc = CHARDEV_CLASS(oc);
 
-    cc->open = qemu_chr_open_stdio;
-    cc->chr_write = win_stdio_write;
-    cc->chr_set_echo = qemu_chr_set_echo_win_stdio;
+    cc->chr_open = win_stdio_chr_open;
+    cc->chr_write = win_stdio_chr_write;
+    cc->chr_set_echo = win_stdio_chr_set_echo;
 }
 
 static const TypeInfo char_win_stdio_type_info = {

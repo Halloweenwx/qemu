@@ -24,9 +24,8 @@
    for more details.
 
    You should have received a copy of the GNU General Public License
-   along with GCC; see the file COPYING.  If not, write to the Free
-   Software Foundation, 51 Franklin Street, Fifth Floor, Boston, MA
-   02110-1301, USA.  */
+   along with GCC; see the file COPYING.  If not, see
+   <https://www.gnu.org/licenses/>.  */
 
 /* ------------------------------------------------------------------ */
 /* decNumber package local type, tuning, and macro definitions	      */
@@ -98,7 +97,7 @@
 
   /* Shared lookup tables					      */
   extern const uByte  DECSTICKYTAB[10]; /* re-round digits if sticky  */
-  extern const uLong  DECPOWERS[19];    /* powers of ten table        */
+  extern const uLong  DECPOWERS[20];    /* powers of ten table        */
   /* The following are included from decDPD.h			      */
   extern const uShort DPD2BIN[1024];	/* DPD -> 0-999		      */
   extern const uShort BIN2DPD[1000];	/* 0-999 -> DPD		      */

@@ -11,8 +11,8 @@
  */
 
 #include "qemu/osdep.h"
-#include "sysemu/rng-random.h"
-#include "sysemu/rng.h"
+#include "system/rng-random.h"
+#include "system/rng.h"
 #include "qapi/error.h"
 #include "qapi/qmp/qerror.h"
 #include "qemu/main-loop.h"
@@ -75,10 +75,7 @@ static void rng_random_opened(RngBackend *b, Error **errp)
         error_setg(errp, QERR_INVALID_PARAMETER_VALUE,
                    "filename", "a valid filename");
     } else {
-        s->fd = qemu_open(s->filename, O_RDONLY | O_NONBLOCK);
-        if (s->fd == -1) {
-            error_setg_file_open(errp, errno, s->filename);
-        }
+        s->fd = qemu_open(s->filename, O_RDONLY | O_NONBLOCK, errp);
     }
 }
 
@@ -96,7 +93,7 @@ static void rng_random_set_filename(Object *obj, const char *filename,
     RngRandom *s = RNG_RANDOM(obj);
 
     if (b->opened) {
-        error_setg(errp, QERR_PERMISSION_DENIED);
+        error_setg(errp, "Property 'filename' can no longer be set");
         return;
     }
 
@@ -107,11 +104,6 @@ static void rng_random_set_filename(Object *obj, const char *filename,
 static void rng_random_init(Object *obj)
 {
     RngRandom *s = RNG_RANDOM(obj);
-
-    object_property_add_str(obj, "filename",
-                            rng_random_get_filename,
-                            rng_random_set_filename,
-                            NULL);
 
     s->filename = g_strdup("/dev/urandom");
     s->fd = -1;
@@ -129,12 +121,16 @@ static void rng_random_finalize(Object *obj)
     g_free(s->filename);
 }
 
-static void rng_random_class_init(ObjectClass *klass, void *data)
+static void rng_random_class_init(ObjectClass *klass, const void *data)
 {
     RngBackendClass *rbc = RNG_BACKEND_CLASS(klass);
 
     rbc->request_entropy = rng_random_request_entropy;
     rbc->opened = rng_random_opened;
+    object_class_property_add_str(klass, "filename",
+                                  rng_random_get_filename,
+                                  rng_random_set_filename);
+
 }
 
 static const TypeInfo rng_random_info = {

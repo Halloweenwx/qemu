@@ -27,10 +27,8 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "qemu-common.h"
-#include "cpu.h"
 #include "trace.h"
-#include "sysemu/kvm.h"
+#include "system/kvm.h"
 #include "hw/ppc/spapr.h"
 #include "hw/ppc/spapr_cpu_core.h"
 #include "hw/ppc/xics.h"
@@ -167,8 +165,9 @@ void icp_kvm_realize(DeviceState *dev, Error **errp)
     if (ret < 0) {
         Error *local_err = NULL;
 
-        error_setg(&local_err, "Unable to connect CPU%ld to kernel XICS: %s",
-                   vcpu_id, strerror(errno));
+        error_setg_errno(&local_err, errno,
+                         "Unable to connect CPU%ld to kernel XICS",
+                         vcpu_id);
         if (errno == ENOSPC) {
             error_append_hint(&local_err, "Try -smp maxcpus=N with N < %u\n",
                               MACHINE(qdev_get_machine())->smp.max_cpus);
@@ -309,16 +308,14 @@ int ics_set_kvm_state(ICSState *ics, Error **errp)
     }
 
     for (i = 0; i < ics->nr_irqs; i++) {
-        Error *local_err = NULL;
         int ret;
 
         if (ics_irq_free(ics, i)) {
             continue;
         }
 
-        ret = ics_set_kvm_state_one(ics, i, &local_err);
+        ret = ics_set_kvm_state_one(ics, i, errp);
         if (ret < 0) {
-            error_propagate(errp, local_err);
             return ret;
         }
     }
@@ -486,7 +483,7 @@ void xics_kvm_disconnect(SpaprInterruptController *intc)
  * support destruction of a KVM XICS device while the VM is running.
  * Required to start a spapr machine with ic-mode=dual,kernel-irqchip=on.
  */
-bool xics_kvm_has_broken_disconnect(SpaprMachineState *spapr)
+bool xics_kvm_has_broken_disconnect(void)
 {
     int rc;
 

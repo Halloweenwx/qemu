@@ -11,13 +11,69 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 #include "migration/vmstate.h"
 #include "hw/misc/imx6ul_ccm.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 
 #include "trace.h"
+
+static const uint32_t ccm_mask[CCM_MAX] = {
+    [CCM_CCR] = 0xf01fef80,
+    [CCM_CCDR] = 0xfffeffff,
+    [CCM_CSR] = 0xffffffff,
+    [CCM_CCSR] = 0xfffffef2,
+    [CCM_CACRR] = 0xfffffff8,
+    [CCM_CBCDR] = 0xc1f8e000,
+    [CCM_CBCMR] = 0xfc03cfff,
+    [CCM_CSCMR1] = 0x80700000,
+    [CCM_CSCMR2] = 0xe01ff003,
+    [CCM_CSCDR1] = 0xfe00c780,
+    [CCM_CS1CDR] = 0xfe00fe00,
+    [CCM_CS2CDR] = 0xf8007000,
+    [CCM_CDCDR] = 0xf00fffff,
+    [CCM_CHSCCDR] = 0xfffc01ff,
+    [CCM_CSCDR2] = 0xfe0001ff,
+    [CCM_CSCDR3] = 0xffffc1ff,
+    [CCM_CDHIPR] = 0xffffffff,
+    [CCM_CTOR] = 0x00000000,
+    [CCM_CLPCR] = 0xf39ff01c,
+    [CCM_CISR] = 0xfb85ffbe,
+    [CCM_CIMR] = 0xfb85ffbf,
+    [CCM_CCOSR] = 0xfe00fe00,
+    [CCM_CGPR] = 0xfffc3fea,
+    [CCM_CCGR0] = 0x00000000,
+    [CCM_CCGR1] = 0x00000000,
+    [CCM_CCGR2] = 0x00000000,
+    [CCM_CCGR3] = 0x00000000,
+    [CCM_CCGR4] = 0x00000000,
+    [CCM_CCGR5] = 0x00000000,
+    [CCM_CCGR6] = 0x00000000,
+    [CCM_CMEOR] = 0xafffff1f,
+};
+
+static const uint32_t analog_mask[CCM_ANALOG_MAX] = {
+    [CCM_ANALOG_PLL_ARM] = 0xfff60f80,
+    [CCM_ANALOG_PLL_USB1] = 0xfffe0fbc,
+    [CCM_ANALOG_PLL_USB2] = 0xfffe0fbc,
+    [CCM_ANALOG_PLL_SYS] = 0xfffa0ffe,
+    [CCM_ANALOG_PLL_SYS_SS] = 0x00000000,
+    [CCM_ANALOG_PLL_SYS_NUM] = 0xc0000000,
+    [CCM_ANALOG_PLL_SYS_DENOM] = 0xc0000000,
+    [CCM_ANALOG_PLL_AUDIO] = 0xffe20f80,
+    [CCM_ANALOG_PLL_AUDIO_NUM] = 0xc0000000,
+    [CCM_ANALOG_PLL_AUDIO_DENOM] = 0xc0000000,
+    [CCM_ANALOG_PLL_VIDEO] = 0xffe20f80,
+    [CCM_ANALOG_PLL_VIDEO_NUM] = 0xc0000000,
+    [CCM_ANALOG_PLL_VIDEO_DENOM] = 0xc0000000,
+    [CCM_ANALOG_PLL_ENET] = 0xffc20ff0,
+    [CCM_ANALOG_PFD_480] = 0x40404040,
+    [CCM_ANALOG_PFD_528] = 0x40404040,
+    [PMU_MISC0] = 0x01fe8306,
+    [PMU_MISC1] = 0x07fcede0,
+    [PMU_MISC2] = 0x005f5f5f,
+};
 
 static const char *imx6ul_ccm_reg_name(uint32_t reg)
 {
@@ -87,7 +143,7 @@ static const char *imx6ul_ccm_reg_name(uint32_t reg)
     case CCM_CMEOR:
         return "CMEOR";
     default:
-        sprintf(unknown, "%d ?", reg);
+        snprintf(unknown, sizeof(unknown), "%u ?", reg);
         return unknown;
     }
 }
@@ -218,7 +274,7 @@ static const char *imx6ul_analog_reg_name(uint32_t reg)
     case USB_ANALOG_DIGPROG:
         return "USB_ANALOG_DIGPROG";
     default:
-        sprintf(unknown, "%d ?", reg);
+        snprintf(unknown, sizeof(unknown), "%u ?", reg);
         return unknown;
     }
 }
@@ -229,7 +285,7 @@ static const VMStateDescription vmstate_imx6ul_ccm = {
     .name = TYPE_IMX6UL_CCM,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(ccm, IMX6ULCCMState, CCM_MAX),
         VMSTATE_UINT32_ARRAY(analog, IMX6ULCCMState, CCM_ANALOG_MAX),
         VMSTATE_END_OF_LIST()
@@ -466,12 +522,6 @@ static uint32_t imx6ul_ccm_get_clock_frequency(IMXCCMState *dev, IMXClk clock)
     case CLK_32k:
         freq = CKIL_FREQ;
         break;
-    case CLK_HIGH:
-        freq = CKIH_FREQ;
-        break;
-    case CLK_HIGH_DIV:
-        freq = CKIH_FREQ / 8;
-        break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "[%s]%s: unsupported clock %d\n",
                       TYPE_IMX6UL_CCM, __func__, clock);
@@ -575,7 +625,7 @@ static uint64_t imx6ul_ccm_read(void *opaque, hwaddr offset, unsigned size)
 {
     uint32_t value = 0;
     uint32_t index = offset >> 2;
-    IMX6ULCCMState *s = (IMX6ULCCMState *)opaque;
+    IMX6ULCCMState *s = opaque;
 
     assert(index < CCM_MAX);
 
@@ -590,24 +640,21 @@ static void imx6ul_ccm_write(void *opaque, hwaddr offset, uint64_t value,
                            unsigned size)
 {
     uint32_t index = offset >> 2;
-    IMX6ULCCMState *s = (IMX6ULCCMState *)opaque;
+    IMX6ULCCMState *s = opaque;
 
     assert(index < CCM_MAX);
 
     trace_ccm_write_reg(imx6ul_ccm_reg_name(index), (uint32_t)value);
 
-    /*
-     * We will do a better implementation later. In particular some bits
-     * cannot be written to.
-     */
-    s->ccm[index] = (uint32_t)value;
+    s->ccm[index] = (s->ccm[index] & ccm_mask[index]) |
+                           ((uint32_t)value & ~ccm_mask[index]);
 }
 
 static uint64_t imx6ul_analog_read(void *opaque, hwaddr offset, unsigned size)
 {
     uint32_t value;
     uint32_t index = offset >> 2;
-    IMX6ULCCMState *s = (IMX6ULCCMState *)opaque;
+    IMX6ULCCMState *s = opaque;
 
     assert(index < CCM_ANALOG_MAX);
 
@@ -707,7 +754,7 @@ static void imx6ul_analog_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
     uint32_t index = offset >> 2;
-    IMX6ULCCMState *s = (IMX6ULCCMState *)opaque;
+    IMX6ULCCMState *s = opaque;
 
     assert(index < CCM_ANALOG_MAX);
 
@@ -737,7 +784,7 @@ static void imx6ul_analog_write(void *opaque, hwaddr offset, uint64_t value,
          * the REG_NAME register. So we change the value of the
          * REG_NAME register, setting bits passed in the value.
          */
-        s->analog[index - 1] |= value;
+        s->analog[index - 1] |= (value & ~analog_mask[index - 1]);
         break;
     case CCM_ANALOG_PLL_ARM_CLR:
     case CCM_ANALOG_PLL_USB1_CLR:
@@ -762,7 +809,7 @@ static void imx6ul_analog_write(void *opaque, hwaddr offset, uint64_t value,
          * the REG_NAME register. So we change the value of the
          * REG_NAME register, unsetting bits passed in the value.
          */
-        s->analog[index - 2] &= ~value;
+        s->analog[index - 2] &= ~(value & ~analog_mask[index - 2]);
         break;
     case CCM_ANALOG_PLL_ARM_TOG:
     case CCM_ANALOG_PLL_USB1_TOG:
@@ -787,14 +834,11 @@ static void imx6ul_analog_write(void *opaque, hwaddr offset, uint64_t value,
          * the REG_NAME register. So we change the value of the
          * REG_NAME register, toggling bits passed in the value.
          */
-        s->analog[index - 3] ^= value;
+        s->analog[index - 3] ^= (value & ~analog_mask[index - 3]);
         break;
     default:
-        /*
-         * We will do a better implementation later. In particular some bits
-         * cannot be written to.
-         */
-        s->analog[index] = value;
+        s->analog[index] = (s->analog[index] & analog_mask[index]) |
+                           (value & ~analog_mask[index]);
         break;
     }
 }
@@ -860,12 +904,12 @@ static void imx6ul_ccm_init(Object *obj)
     sysbus_init_mmio(sd, &s->container);
 }
 
-static void imx6ul_ccm_class_init(ObjectClass *klass, void *data)
+static void imx6ul_ccm_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     IMXCCMClass *ccm = IMX_CCM_CLASS(klass);
 
-    dc->reset = imx6ul_ccm_reset;
+    device_class_set_legacy_reset(dc, imx6ul_ccm_reset);
     dc->vmsd = &vmstate_imx6ul_ccm;
     dc->desc = "i.MX6UL Clock Control Module";
 

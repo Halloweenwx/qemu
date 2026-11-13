@@ -31,7 +31,6 @@
 
 
 #include "libqtest-single.h"
-#include "qemu-common.h"
 
 #define IPMI_IRQ        5
 
@@ -98,7 +97,8 @@ static void bt_wait_b_busy(void)
 {
     unsigned int count = 1000;
     while (IPMI_BT_CTLREG_GET_B_BUSY() != 0) {
-        g_assert(--count != 0);
+        --count;
+        g_assert(count != 0);
         usleep(100);
     }
 }
@@ -107,7 +107,8 @@ static void bt_wait_b2h_atn(void)
 {
     unsigned int count = 1000;
     while (IPMI_BT_CTLREG_GET_B2H_ATN() == 0) {
-        g_assert(--count != 0);
+        --count;
+        g_assert(count != 0);
         usleep(100);
     }
 }
@@ -250,7 +251,7 @@ static void emu_msg_handler(void)
         msg[msg_len++] = 0xa0;
         write_emu_msg(msg, msg_len);
     } else {
-        g_assert(0);
+        g_assert_not_reached();
     }
 }
 
@@ -376,7 +377,7 @@ static void test_enable_irq(void)
  */
 static void open_socket(void)
 {
-    struct sockaddr_in myaddr;
+    struct sockaddr_in myaddr = {};
     socklen_t addrlen;
 
     myaddr.sin_family = AF_INET;
@@ -410,7 +411,7 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
 
     global_qtest = qtest_initf(
-        " -chardev socket,id=ipmi0,host=localhost,port=%d,reconnect=10"
+        " -chardev socket,id=ipmi0,host=127.0.0.1,port=%d,reconnect-ms=10000"
         " -device ipmi-bmc-extern,chardev=ipmi0,id=bmc0"
         " -device isa-ipmi-bt,bmc=bmc0", emu_port);
     qtest_irq_intercept_in(global_qtest, "ioapic");

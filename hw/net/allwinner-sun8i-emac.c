@@ -19,16 +19,18 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
-#include "hw/sysbus.h"
+#include "qapi/error.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
-#include "hw/irq.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/log.h"
 #include "trace.h"
 #include "net/checksum.h"
 #include "qemu/module.h"
 #include "exec/cpu-common.h"
+#include "system/dma.h"
 #include "hw/net/allwinner-sun8i-emac.h"
 
 /* EMAC register offsets */
@@ -337,33 +339,46 @@ static void allwinner_sun8i_emac_update_irq(AwSun8iEmacState *s)
     qemu_set_irq(s->irq, (s->int_sta & s->int_en) != 0);
 }
 
-static uint32_t allwinner_sun8i_emac_next_desc(FrameDescriptor *desc,
-                                               size_t min_size)
+static bool allwinner_sun8i_emac_desc_owned(FrameDescriptor *desc,
+                                            size_t min_buf_size)
 {
-    uint32_t paddr = desc->next;
-
-    cpu_physical_memory_read(paddr, desc, sizeof(*desc));
-
-    if ((desc->status & DESC_STATUS_CTL) &&
-        (desc->status2 & DESC_STATUS2_BUF_SIZE_MASK) >= min_size) {
-        return paddr;
-    } else {
-        return 0;
-    }
+    return (desc->status & DESC_STATUS_CTL) && (min_buf_size == 0 ||
+           (desc->status2 & DESC_STATUS2_BUF_SIZE_MASK) >= min_buf_size);
 }
 
-static uint32_t allwinner_sun8i_emac_get_desc(FrameDescriptor *desc,
-                                              uint32_t start_addr,
-                                              size_t min_size)
+static void allwinner_sun8i_emac_get_desc(AwSun8iEmacState *s,
+                                          FrameDescriptor *desc,
+                                          uint32_t phys_addr)
+{
+    uint32_t desc_words[4];
+    dma_memory_read(&s->dma_as, phys_addr, &desc_words, sizeof(desc_words),
+                    MEMTXATTRS_UNSPECIFIED);
+    desc->status = le32_to_cpu(desc_words[0]);
+    desc->status2 = le32_to_cpu(desc_words[1]);
+    desc->addr = le32_to_cpu(desc_words[2]);
+    desc->next = le32_to_cpu(desc_words[3]);
+}
+
+static uint32_t allwinner_sun8i_emac_next_desc(AwSun8iEmacState *s,
+                                               FrameDescriptor *desc)
+{
+    const uint32_t nxt = desc->next;
+    allwinner_sun8i_emac_get_desc(s, desc, nxt);
+    return nxt;
+}
+
+static uint32_t allwinner_sun8i_emac_find_desc(AwSun8iEmacState *s,
+                                               FrameDescriptor *desc,
+                                               uint32_t start_addr,
+                                               size_t min_size)
 {
     uint32_t desc_addr = start_addr;
 
     /* Note that the list is a cycle. Last entry points back to the head. */
     while (desc_addr != 0) {
-        cpu_physical_memory_read(desc_addr, desc, sizeof(*desc));
+        allwinner_sun8i_emac_get_desc(s, desc, desc_addr);
 
-        if ((desc->status & DESC_STATUS_CTL) &&
-            (desc->status2 & DESC_STATUS2_BUF_SIZE_MASK) >= min_size) {
+        if (allwinner_sun8i_emac_desc_owned(desc, min_size)) {
             return desc_addr;
         } else if (desc->next == start_addr) {
             break;
@@ -379,23 +394,30 @@ static uint32_t allwinner_sun8i_emac_rx_desc(AwSun8iEmacState *s,
                                              FrameDescriptor *desc,
                                              size_t min_size)
 {
-    return allwinner_sun8i_emac_get_desc(desc, s->rx_desc_curr, min_size);
+    return allwinner_sun8i_emac_find_desc(s, desc, s->rx_desc_curr, min_size);
 }
 
 static uint32_t allwinner_sun8i_emac_tx_desc(AwSun8iEmacState *s,
-                                             FrameDescriptor *desc,
-                                             size_t min_size)
+                                             FrameDescriptor *desc)
 {
-    return allwinner_sun8i_emac_get_desc(desc, s->tx_desc_head, min_size);
+    allwinner_sun8i_emac_get_desc(s, desc, s->tx_desc_curr);
+    return s->tx_desc_curr;
 }
 
-static void allwinner_sun8i_emac_flush_desc(FrameDescriptor *desc,
+static void allwinner_sun8i_emac_flush_desc(AwSun8iEmacState *s,
+                                            const FrameDescriptor *desc,
                                             uint32_t phys_addr)
 {
-    cpu_physical_memory_write(phys_addr, desc, sizeof(*desc));
+    uint32_t desc_words[4];
+    desc_words[0] = cpu_to_le32(desc->status);
+    desc_words[1] = cpu_to_le32(desc->status2);
+    desc_words[2] = cpu_to_le32(desc->addr);
+    desc_words[3] = cpu_to_le32(desc->next);
+    dma_memory_write(&s->dma_as, phys_addr, &desc_words, sizeof(desc_words),
+                     MEMTXATTRS_UNSPECIFIED);
 }
 
-static int allwinner_sun8i_emac_can_receive(NetClientState *nc)
+static bool allwinner_sun8i_emac_can_receive(NetClientState *nc)
 {
     AwSun8iEmacState *s = qemu_get_nic_opaque(nc);
     FrameDescriptor desc;
@@ -450,8 +472,9 @@ static ssize_t allwinner_sun8i_emac_receive(NetClientState *nc,
                             << RX_DESC_STATUS_FRM_LEN_SHIFT;
         }
 
-        cpu_physical_memory_write(desc.addr, buf, desc_bytes);
-        allwinner_sun8i_emac_flush_desc(&desc, s->rx_desc_curr);
+        dma_memory_write(&s->dma_as, desc.addr, buf, desc_bytes,
+                         MEMTXATTRS_UNSPECIFIED);
+        allwinner_sun8i_emac_flush_desc(s, &desc, s->rx_desc_curr);
         trace_allwinner_sun8i_emac_receive(s->rx_desc_curr, desc.addr,
                                            desc_bytes);
 
@@ -465,7 +488,8 @@ static ssize_t allwinner_sun8i_emac_receive(NetClientState *nc,
         bytes_left -= desc_bytes;
 
         /* Move to the next descriptor */
-        s->rx_desc_curr = allwinner_sun8i_emac_next_desc(&desc, 64);
+        s->rx_desc_curr = allwinner_sun8i_emac_find_desc(s, &desc, desc.next,
+                                                         AW_SUN8I_EMAC_MIN_PKT_SZ);
         if (!s->rx_desc_curr) {
             /* Not enough buffer space available */
             s->int_sta |= INT_STA_RX_BUF_UA;
@@ -490,10 +514,10 @@ static void allwinner_sun8i_emac_transmit(AwSun8iEmacState *s)
     size_t transmitted = 0;
     static uint8_t packet_buf[2048];
 
-    s->tx_desc_curr = allwinner_sun8i_emac_tx_desc(s, &desc, 0);
+    s->tx_desc_curr = allwinner_sun8i_emac_tx_desc(s, &desc);
 
     /* Read all transmit descriptors */
-    while (s->tx_desc_curr != 0) {
+    while (allwinner_sun8i_emac_desc_owned(&desc, 0)) {
 
         /* Read from physical memory into packet buffer */
         bytes = desc.status2 & DESC_STATUS2_BUF_SIZE_MASK;
@@ -501,15 +525,16 @@ static void allwinner_sun8i_emac_transmit(AwSun8iEmacState *s)
             desc.status |= TX_DESC_STATUS_LENGTH_ERR;
             break;
         }
-        cpu_physical_memory_read(desc.addr, packet_buf + packet_bytes, bytes);
+        dma_memory_read(&s->dma_as, desc.addr, packet_buf + packet_bytes,
+                        bytes, MEMTXATTRS_UNSPECIFIED);
         packet_bytes += bytes;
         desc.status &= ~DESC_STATUS_CTL;
-        allwinner_sun8i_emac_flush_desc(&desc, s->tx_desc_curr);
+        allwinner_sun8i_emac_flush_desc(s, &desc, s->tx_desc_curr);
 
         /* After the last descriptor, send the packet */
         if (desc.status2 & TX_DESC_STATUS2_LAST_DESC) {
             if (desc.status2 & TX_DESC_STATUS2_CHECKSUM_MASK) {
-                net_checksum_calculate(packet_buf, packet_bytes);
+                net_checksum_calculate(packet_buf, packet_bytes, CSUM_ALL);
             }
 
             qemu_send_packet(nc, packet_buf, packet_bytes);
@@ -519,7 +544,7 @@ static void allwinner_sun8i_emac_transmit(AwSun8iEmacState *s)
             packet_bytes = 0;
             transmitted++;
         }
-        s->tx_desc_curr = allwinner_sun8i_emac_next_desc(&desc, 0);
+        s->tx_desc_curr = allwinner_sun8i_emac_next_desc(s, &desc);
     }
 
     /* Raise transmit completed interrupt */
@@ -574,7 +599,7 @@ static uint64_t allwinner_sun8i_emac_read(void *opaque, hwaddr offset,
     case REG_INT_STA:           /* Interrupt Status */
         value = s->int_sta;
         break;
-    case REG_INT_EN:            /* Interupt Enable */
+    case REG_INT_EN:            /* Interrupt Enable */
         value = s->int_en;
         break;
     case REG_TX_CTL_0:          /* Transmit Control 0 */
@@ -611,10 +636,10 @@ static uint64_t allwinner_sun8i_emac_read(void *opaque, hwaddr offset,
         value = s->mii_data;
         break;
     case REG_ADDR_HIGH:         /* MAC Address High */
-        value = *(((uint32_t *) (s->conf.macaddr.a)) + 1);
+        value = lduw_le_p(s->conf.macaddr.a + 4);
         break;
     case REG_ADDR_LOW:          /* MAC Address Low */
-        value = *(uint32_t *) (s->conf.macaddr.a);
+        value = ldl_le_p(s->conf.macaddr.a);
         break;
     case REG_TX_DMA_STA:        /* Transmit DMA Status */
         break;
@@ -623,7 +648,7 @@ static uint64_t allwinner_sun8i_emac_read(void *opaque, hwaddr offset,
         break;
     case REG_TX_CUR_BUF:        /* Transmit Current Buffer */
         if (s->tx_desc_curr != 0) {
-            cpu_physical_memory_read(s->tx_desc_curr, &desc, sizeof(desc));
+            allwinner_sun8i_emac_get_desc(s, &desc, s->tx_desc_curr);
             value = desc.addr;
         } else {
             value = 0;
@@ -636,7 +661,7 @@ static uint64_t allwinner_sun8i_emac_read(void *opaque, hwaddr offset,
         break;
     case REG_RX_CUR_BUF:        /* Receive Current Buffer */
         if (s->rx_desc_curr != 0) {
-            cpu_physical_memory_read(s->rx_desc_curr, &desc, sizeof(desc));
+            allwinner_sun8i_emac_get_desc(s, &desc, s->rx_desc_curr);
             value = desc.addr;
         } else {
             value = 0;
@@ -646,7 +671,7 @@ static uint64_t allwinner_sun8i_emac_read(void *opaque, hwaddr offset,
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "allwinner-h3-emac: read access to unknown "
-                                 "EMAC register 0x" TARGET_FMT_plx "\n",
+                                 "EMAC register 0x" HWADDR_FMT_plx "\n",
                                   offset);
     }
 
@@ -702,6 +727,9 @@ static void allwinner_sun8i_emac_write(void *opaque, hwaddr offset,
         break;
     case REG_RX_CTL_0:          /* Receive Control 0 */
         s->rx_ctl0 = value;
+        if (allwinner_sun8i_emac_can_receive(nc)) {
+            qemu_flush_queued_packets(nc);
+        }
         break;
     case REG_RX_CTL_1:          /* Receive Control 1 */
         s->rx_ctl1 = value | RX_CTL1_RX_MD;
@@ -728,14 +756,10 @@ static void allwinner_sun8i_emac_write(void *opaque, hwaddr offset,
         s->mii_data = value;
         break;
     case REG_ADDR_HIGH:         /* MAC Address High */
-        s->conf.macaddr.a[4] = (value & 0xff);
-        s->conf.macaddr.a[5] = (value & 0xff00) >> 8;
+        stw_le_p(s->conf.macaddr.a + 4, value);
         break;
     case REG_ADDR_LOW:          /* MAC Address Low */
-        s->conf.macaddr.a[0] = (value & 0xff);
-        s->conf.macaddr.a[1] = (value & 0xff00) >> 8;
-        s->conf.macaddr.a[2] = (value & 0xff0000) >> 16;
-        s->conf.macaddr.a[3] = (value & 0xff000000) >> 24;
+        stl_le_p(s->conf.macaddr.a, value);
         break;
     case REG_TX_DMA_STA:        /* Transmit DMA Status */
     case REG_TX_CUR_DESC:       /* Transmit Current Descriptor */
@@ -747,7 +771,7 @@ static void allwinner_sun8i_emac_write(void *opaque, hwaddr offset,
         break;
     default:
         qemu_log_mask(LOG_UNIMP, "allwinner-h3-emac: write access to unknown "
-                                 "EMAC register 0x" TARGET_FMT_plx "\n",
+                                 "EMAC register 0x" HWADDR_FMT_plx "\n",
                                   offset);
     }
 }
@@ -763,7 +787,7 @@ static void allwinner_sun8i_emac_set_link(NetClientState *nc)
 static const MemoryRegionOps allwinner_sun8i_emac_mem_ops = {
     .read = allwinner_sun8i_emac_read,
     .write = allwinner_sun8i_emac_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_LITTLE_ENDIAN,
     .valid = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -794,16 +818,25 @@ static void allwinner_sun8i_emac_realize(DeviceState *dev, Error **errp)
 {
     AwSun8iEmacState *s = AW_SUN8I_EMAC(dev);
 
+    if (!s->dma_mr) {
+        error_setg(errp, TYPE_AW_SUN8I_EMAC " 'dma-memory' link not set");
+        return;
+    }
+
+    address_space_init(&s->dma_as, s->dma_mr, "emac-dma");
+
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&net_allwinner_sun8i_emac_info, &s->conf,
-                           object_get_typename(OBJECT(dev)), dev->id, s);
+                          object_get_typename(OBJECT(dev)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
 }
 
-static Property allwinner_sun8i_emac_properties[] = {
+static const Property allwinner_sun8i_emac_properties[] = {
     DEFINE_NIC_PROPERTIES(AwSun8iEmacState, conf),
     DEFINE_PROP_UINT8("phy-addr", AwSun8iEmacState, mii_phy_addr, 0),
-    DEFINE_PROP_END_OF_LIST(),
+    DEFINE_PROP_LINK("dma-memory", AwSun8iEmacState, dma_mr,
+                     TYPE_MEMORY_REGION, MemoryRegion *),
 };
 
 static int allwinner_sun8i_emac_post_load(void *opaque, int version_id)
@@ -820,7 +853,7 @@ static const VMStateDescription vmstate_aw_emac = {
     .version_id = 1,
     .minimum_version_id = 1,
     .post_load = allwinner_sun8i_emac_post_load,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT8(mii_phy_addr, AwSun8iEmacState),
         VMSTATE_UINT32(mii_cmd, AwSun8iEmacState),
         VMSTATE_UINT32(mii_data, AwSun8iEmacState),
@@ -845,12 +878,13 @@ static const VMStateDescription vmstate_aw_emac = {
     }
 };
 
-static void allwinner_sun8i_emac_class_init(ObjectClass *klass, void *data)
+static void allwinner_sun8i_emac_class_init(ObjectClass *klass,
+                                            const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = allwinner_sun8i_emac_realize;
-    dc->reset = allwinner_sun8i_emac_reset;
+    device_class_set_legacy_reset(dc, allwinner_sun8i_emac_reset);
     dc->vmsd = &vmstate_aw_emac;
     device_class_set_props(dc, allwinner_sun8i_emac_properties);
 }

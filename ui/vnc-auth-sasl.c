@@ -28,9 +28,29 @@
 #include "vnc.h"
 #include "trace.h"
 
+/*
+ * Apple has deprecated sasl.h functions in OS X 10.11.  Therefore,
+ * files that use SASL API need to disable -Wdeprecated-declarations.
+ */
+#ifdef CONFIG_DARWIN
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+
 /* Max amount of data we send/recv for SASL steps to prevent DOS */
 #define SASL_DATA_MAX_LEN (1024 * 1024)
 
+
+bool vnc_sasl_server_init(Error **errp)
+{
+    int saslErr = sasl_server_init(NULL, "qemu");
+
+    if (saslErr != SASL_OK) {
+        error_setg(errp, "Failed to initialize SASL auth: %s",
+                   sasl_errstring(saslErr, NULL, NULL));
+        return false;
+    }
+    return true;
+}
 
 void vnc_sasl_client_cleanup(VncState *vs)
 {
@@ -53,10 +73,10 @@ size_t vnc_client_write_sasl(VncState *vs)
 {
     size_t ret;
 
-    VNC_DEBUG("Write SASL: Pending output %p size %zd offset %zd "
-              "Encoded: %p size %d offset %d\n",
-              vs->output.buffer, vs->output.capacity, vs->output.offset,
-              vs->sasl.encoded, vs->sasl.encodedLength, vs->sasl.encodedOffset);
+    trace_vnc_sasl_write_pending(vs, vs->output.buffer, vs->output.capacity,
+                                 vs->output.offset, vs->sasl.encoded,
+                                 vs->sasl.encodedLength,
+                                 vs->sasl.encodedOffset);
 
     if (!vs->sasl.encoded) {
         int err;
@@ -111,7 +131,8 @@ size_t vnc_client_write_sasl(VncState *vs)
             g_source_remove(vs->ioc_tag);
         }
         vs->ioc_tag = qio_channel_add_watch(
-            vs->ioc, G_IO_IN, vnc_client_io, vs, NULL);
+            vs->ioc, G_IO_IN | G_IO_HUP | G_IO_ERR,
+            vnc_client_io, vs, NULL);
     }
 
     return ret;
@@ -136,8 +157,7 @@ size_t vnc_client_read_sasl(VncState *vs)
 
     if (err != SASL_OK)
         return vnc_client_io_error(vs, -1, NULL);
-    VNC_DEBUG("Read SASL Encoded %p size %ld Decoded %p size %d\n",
-              encoded, ret, decoded, decodedLen);
+    trace_vnc_sasl_read_decoded(vs, encoded, ret, decoded, decodedLen);
     buffer_reserve(&vs->input, decodedLen);
     buffer_append(&vs->input, decoded, decodedLen);
     return decodedLen;
@@ -242,8 +262,14 @@ static int protocol_client_auth_sasl_step(VncState *vs, uint8_t *data, size_t le
     /* NB, distinction of NULL vs "" is *critical* in SASL */
     if (datalen) {
         clientdata = (char*)data;
-        clientdata[datalen-1] = '\0'; /* Wire includes '\0', but make sure */
-        datalen--; /* Don't count NULL byte when passing to _start() */
+        if (clientdata[datalen - 1] != '\0') {
+            trace_vnc_auth_fail(vs, vs->auth, "Malformed SASL client data",
+                                "Missing SASL NUL padding byte");
+            sasl_dispose(&vs->sasl.conn);
+            vs->sasl.conn = NULL;
+            goto authabort;
+        }
+        datalen--; /* Discard the extra NUL padding byte */
     }
 
     err = sasl_server_step(vs->sasl.conn,
@@ -268,9 +294,10 @@ static int protocol_client_auth_sasl_step(VncState *vs, uint8_t *data, size_t le
         goto authabort;
     }
 
-    if (serveroutlen) {
+    if (serverout) {
         vnc_write_u32(vs, serveroutlen + 1);
-        vnc_write(vs, serverout, serveroutlen + 1);
+        vnc_write(vs, serverout, serveroutlen);
+        vnc_write_u8(vs, '\0');
     } else {
         vnc_write_u32(vs, 0);
     }
@@ -287,7 +314,7 @@ static int protocol_client_auth_sasl_step(VncState *vs, uint8_t *data, size_t le
             goto authreject;
         }
 
-        /* Check username whitelist ACL */
+        /* Check the username access control list */
         if (vnc_auth_sasl_check_access(vs) < 0) {
             goto authreject;
         }
@@ -363,8 +390,14 @@ static int protocol_client_auth_sasl_start(VncState *vs, uint8_t *data, size_t l
     /* NB, distinction of NULL vs "" is *critical* in SASL */
     if (datalen) {
         clientdata = (char*)data;
-        clientdata[datalen-1] = '\0'; /* Should be on wire, but make sure */
-        datalen--; /* Don't count NULL byte when passing to _start() */
+        if (clientdata[datalen - 1] != '\0') {
+            trace_vnc_auth_fail(vs, vs->auth,  "Malformed SASL client data",
+                                "Missing SASL NUL padding byte");
+            sasl_dispose(&vs->sasl.conn);
+            vs->sasl.conn = NULL;
+            goto authabort;
+        }
+        datalen--; /* Discard the extra NUL padding byte */
     }
 
     err = sasl_server_start(vs->sasl.conn,
@@ -389,9 +422,10 @@ static int protocol_client_auth_sasl_start(VncState *vs, uint8_t *data, size_t l
         goto authabort;
     }
 
-    if (serveroutlen) {
+    if (serverout) {
         vnc_write_u32(vs, serveroutlen + 1);
-        vnc_write(vs, serverout, serveroutlen + 1);
+        vnc_write(vs, serverout, serveroutlen);
+        vnc_write_u8(vs, '\0');
     } else {
         vnc_write_u32(vs, 0);
     }
@@ -408,7 +442,7 @@ static int protocol_client_auth_sasl_start(VncState *vs, uint8_t *data, size_t l
             goto authreject;
         }
 
-        /* Check username whitelist ACL */
+        /* Check the username access control list */
         if (vnc_auth_sasl_check_access(vs) < 0) {
             goto authreject;
         }
@@ -455,6 +489,8 @@ static int protocol_client_auth_sasl_mechname(VncState *vs, uint8_t *data, size_
     char *mechname = g_strndup((const char *) data, len);
     trace_vnc_auth_sasl_mech_choose(vs, mechname);
 
+    /* If 'data' had embedded NUL the dup'd string might now be shorter */
+    len = strlen(mechname);
     if (strncmp(vs->sasl.mechlist, mechname, len) == 0) {
         if (vs->sasl.mechlist[len] != '\0' &&
             vs->sasl.mechlist[len] != ',') {
@@ -503,13 +539,13 @@ static int protocol_client_auth_sasl_mechname_len(VncState *vs, uint8_t *data, s
     return 0;
 }
 
-static char *
+static int
 vnc_socket_ip_addr_string(QIOChannelSocket *ioc,
                           bool local,
+                          char **addrstr,
                           Error **errp)
 {
     SocketAddress *addr;
-    char *ret;
 
     if (local) {
         addr = qio_channel_socket_get_local_address(ioc, errp);
@@ -517,16 +553,24 @@ vnc_socket_ip_addr_string(QIOChannelSocket *ioc,
         addr = qio_channel_socket_get_remote_address(ioc, errp);
     }
     if (!addr) {
-        return NULL;
+        return -1;
     }
 
     if (addr->type != SOCKET_ADDRESS_TYPE_INET) {
-        error_setg(errp, "Not an inet socket type");
-        return NULL;
+        *addrstr = NULL;
+        qapi_free_SocketAddress(addr);
+        return 0;
     }
-    ret = g_strdup_printf("%s;%s", addr->u.inet.host, addr->u.inet.port);
+    *addrstr = g_strdup_printf("%s;%s", addr->u.inet.host, addr->u.inet.port);
     qapi_free_SocketAddress(addr);
-    return ret;
+    return 0;
+}
+
+static bool
+vnc_socket_is_unix(QIOChannelSocket *ioc)
+{
+    SocketAddress *addr = qio_channel_socket_get_local_address(ioc, NULL);
+    return addr && addr->type == SOCKET_ADDRESS_TYPE_UNIX;
 }
 
 void start_auth_sasl(VncState *vs)
@@ -539,15 +583,15 @@ void start_auth_sasl(VncState *vs)
     int mechlistlen;
 
     /* Get local & remote client addresses in form  IPADDR;PORT */
-    localAddr = vnc_socket_ip_addr_string(vs->sioc, true, &local_err);
-    if (!localAddr) {
+    if (vnc_socket_ip_addr_string(vs->sioc, true,
+                                  &localAddr, &local_err) < 0) {
         trace_vnc_auth_fail(vs, vs->auth, "Cannot format local IP",
                             error_get_pretty(local_err));
         goto authabort;
     }
 
-    remoteAddr = vnc_socket_ip_addr_string(vs->sioc, false, &local_err);
-    if (!remoteAddr) {
+    if (vnc_socket_ip_addr_string(vs->sioc, false,
+                                  &remoteAddr, &local_err) < 0) {
         trace_vnc_auth_fail(vs, vs->auth, "Cannot format remote IP",
                             error_get_pretty(local_err));
         g_free(localAddr);
@@ -599,16 +643,17 @@ void start_auth_sasl(VncState *vs)
             goto authabort;
         }
     } else {
-        vs->sasl.wantSSF = 1;
+        vs->sasl.wantSSF = !vnc_socket_is_unix(vs->sioc);
     }
 
     memset (&secprops, 0, sizeof secprops);
     /* Inform SASL that we've got an external SSF layer from TLS.
      *
-     * Disable SSF, if using TLS+x509+SASL only. TLS without x509
-     * is not sufficiently strong
+     * Disable SSF, if using TLS+x509+SASL only, or UNIX sockets.
+     * TLS without x509 is not sufficiently strong, nor is plain
+     * TCP
      */
-    if (vs->vd->is_unix ||
+    if (vnc_socket_is_unix(vs->sioc) ||
         (vs->auth == VNC_AUTH_VENCRYPT &&
          vs->subauth == VNC_AUTH_VENCRYPT_X509SASL)) {
         /* If we've got TLS or UNIX domain sock, we don't care about SSF */
@@ -652,6 +697,13 @@ void start_auth_sasl(VncState *vs)
     }
     trace_vnc_auth_sasl_mech_list(vs, mechlist);
 
+    if (g_str_equal(mechlist, "")) {
+        trace_vnc_auth_fail(vs, vs->auth, "no available SASL mechanisms", "");
+        sasl_dispose(&vs->sasl.conn);
+        vs->sasl.conn = NULL;
+        goto authabort;
+    }
+
     vs->sasl.mechlist = g_strdup(mechlist);
     mechlistlen = strlen(mechlist);
     vnc_write_u32(vs, mechlistlen);
@@ -666,5 +718,3 @@ void start_auth_sasl(VncState *vs)
     error_free(local_err);
     vnc_client_error(vs);
 }
-
-

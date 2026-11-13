@@ -20,7 +20,9 @@
 #define HW_ARM_SMMUV3_H
 
 #include "hw/arm/smmu-common.h"
-#include "hw/registerfields.h"
+#include "qom/object.h"
+#include "qapi/qapi-types-misc-arm.h"
+#include "qemu/notify.h"
 
 #define TYPE_SMMUV3_IOMMU_MEMORY_REGION "smmuv3-iommu-memory-region"
 
@@ -32,7 +34,7 @@ typedef struct SMMUQueue {
      uint8_t log2size;
 } SMMUQueue;
 
-typedef struct SMMUv3State {
+struct SMMUv3State {
     SMMUState     smmu_state;
 
     uint32_t features;
@@ -41,9 +43,11 @@ typedef struct SMMUv3State {
 
     uint32_t idr[6];
     uint32_t iidr;
+    uint32_t aidr;
     uint32_t cr[3];
     uint32_t cr0ack;
     uint32_t statusr;
+    uint32_t gbpa;
     uint32_t irq_ctrl;
     uint32_t gerror;
     uint32_t gerrorn;
@@ -60,7 +64,23 @@ typedef struct SMMUv3State {
 
     qemu_irq     irq[4];
     QemuMutex mutex;
-} SMMUv3State;
+    char *stage;
+    uint8_t identifier;
+
+    /* SMMU has HW accelerator support for nested S1 + s2 */
+    bool accel;
+    struct SMMUv3AccelState *s_accel;
+    uint64_t msi_gpa;
+    Error *migration_blocker;
+    OnOffAuto ril;
+    OnOffAuto ats;
+    OasMode oas;
+    SsidSizeMode ssidsize;
+    /* SMMU CMDQV extension */
+    OnOffAuto cmdqv;
+
+    Notifier machine_done;
+};
 
 typedef enum {
     SMMU_IRQ_EVTQ,
@@ -69,20 +89,21 @@ typedef enum {
     SMMU_IRQ_GERROR,
 } SMMUIrq;
 
-typedef struct {
+struct SMMUv3Class {
     /*< private >*/
     SMMUBaseClass smmu_base_class;
     /*< public >*/
 
     DeviceRealize parent_realize;
-    DeviceReset   parent_reset;
-} SMMUv3Class;
+    ResettablePhases parent_phases;
+};
+
+bool smmuv3_ats_enabled(struct SMMUv3State *s);
 
 #define TYPE_ARM_SMMUV3   "arm-smmuv3"
-#define ARM_SMMUV3(obj) OBJECT_CHECK(SMMUv3State, (obj), TYPE_ARM_SMMUV3)
-#define ARM_SMMUV3_CLASS(klass)                              \
-    OBJECT_CLASS_CHECK(SMMUv3Class, (klass), TYPE_ARM_SMMUV3)
-#define ARM_SMMUV3_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(SMMUv3Class, (obj), TYPE_ARM_SMMUV3)
+OBJECT_DECLARE_TYPE(SMMUv3State, SMMUv3Class, ARM_SMMUV3)
+
+#define STAGE1_SUPPORTED(s)      FIELD_EX32(s->idr[0], IDR0, S1P)
+#define STAGE2_SUPPORTED(s)      FIELD_EX32(s->idr[0], IDR0, S2P)
 
 #endif

@@ -1,3 +1,10 @@
+/*
+ * i386 system call definitions
+ *
+ * Copyright (c) 2013 Stacey D. Son
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
 #ifndef TARGET_SYSCALL_H
 #define TARGET_SYSCALL_H
 
@@ -161,5 +168,7 @@ struct target_vm86plus_struct {
 
 
 #define UNAME_MACHINE "i386"
+#define TARGET_HW_MACHINE UNAME_MACHINE
+#define TARGET_HW_MACHINE_ARCH UNAME_MACHINE
 
 #endif /* TARGET_SYSCALL_H */

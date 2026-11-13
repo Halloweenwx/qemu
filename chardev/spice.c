@@ -14,9 +14,6 @@ typedef struct SpiceCharSource {
     SpiceChardev       *scd;
 } SpiceCharSource;
 
-static QLIST_HEAD(, SpiceChardev) spice_chars =
-    QLIST_HEAD_INITIALIZER(spice_chars);
-
 static int vmc_write(SpiceCharDeviceInstance *sin, const uint8_t *buf, int len)
 {
     SpiceChardev *scd = container_of(sin, SpiceChardev, sin);
@@ -101,9 +98,7 @@ static SpiceCharDeviceInterface vmc_interface = {
     .write              = vmc_write,
     .read               = vmc_read,
     .event              = vmc_event,
-#if SPICE_SERVER_VERSION >= 0x000c06
     .flags              = SPICE_CHAR_DEVICE_NOTIFY_WRITABLE,
-#endif
 };
 
 
@@ -113,7 +108,7 @@ static void vmc_register_interface(SpiceChardev *scd)
         return;
     }
     scd->sin.base.sif = &vmc_interface.base;
-    qemu_spice_add_interface(&scd->sin.base);
+    qemu_spice.add_interface(&scd->sin.base);
     scd->active = true;
     trace_spice_vmc_register_interface(scd);
 }
@@ -216,13 +211,11 @@ static void char_spice_finalize(Object *obj)
 
     vmc_unregister_interface(s);
 
-    QLIST_SAFE_REMOVE(s, next);
-
     g_free((char *)s->sin.subtype);
     g_free((char *)s->sin.portname);
 }
 
-static void spice_vmc_set_fe_open(struct Chardev *chr, int fe_open)
+static void spice_vmc_chr_set_fe_open(struct Chardev *chr, int fe_open)
 {
     SpiceChardev *s = SPICE_CHARDEV(chr);
     if (fe_open) {
@@ -232,7 +225,7 @@ static void spice_vmc_set_fe_open(struct Chardev *chr, int fe_open)
     }
 }
 
-static void spice_port_set_fe_open(struct Chardev *chr, int fe_open)
+static void spice_port_chr_set_fe_open(struct Chardev *chr, int fe_open)
 {
     SpiceChardev *s = SPICE_CHARDEV(chr);
 
@@ -256,14 +249,10 @@ static void chr_open(Chardev *chr, const char *subtype)
 
     s->active = false;
     s->sin.subtype = g_strdup(subtype);
-
-    QLIST_INSERT_HEAD(&spice_chars, s, next);
 }
 
-static void qemu_chr_open_spice_vmc(Chardev *chr,
-                                    ChardevBackend *backend,
-                                    bool *be_opened,
-                                    Error **errp)
+static bool spice_vmc_chr_open(Chardev *chr, ChardevBackend *backend,
+                               Error **errp)
 {
     ChardevSpiceChannel *spicevmc = backend->u.spicevmc.data;
     const char *type = spicevmc->type;
@@ -283,23 +272,15 @@ static void qemu_chr_open_spice_vmc(Chardev *chr,
                           subtypes);
 
         g_free(subtypes);
-        return;
+        return false;
     }
 
-    *be_opened = false;
-#if SPICE_SERVER_VERSION < 0x000e02
-    /* Spice < 0.14.2 doesn't explicitly open smartcard chardev */
-    if (strcmp(type, "smartcard") == 0) {
-        *be_opened = true;
-    }
-#endif
     chr_open(chr, type);
+    return true;
 }
 
-void qemu_chr_open_spice_port(Chardev *chr,
-                              ChardevBackend *backend,
-                              bool *be_opened,
-                              Error **errp)
+static bool spice_port_chr_open(Chardev *chr, ChardevBackend *backend,
+                                Error **errp)
 {
     ChardevSpicePort *spiceport = backend->u.spiceport.data;
     const char *name = spiceport->fqdn;
@@ -307,35 +288,25 @@ void qemu_chr_open_spice_port(Chardev *chr,
 
     if (name == NULL) {
         error_setg(errp, "missing name parameter");
-        return;
+        return false;
+    }
+
+    if (!using_spice) {
+        error_setg(errp, "spice not enabled");
+        return false;
     }
 
     chr_open(chr, "port");
 
-    *be_opened = false;
     s = SPICE_CHARDEV(chr);
     s->sin.portname = g_strdup(name);
 
-    if (using_spice) {
-        /* spice server already created */
-        vmc_register_interface(s);
-    }
+    vmc_register_interface(s);
+    return true;
 }
 
-void qemu_spice_register_ports(void)
-{
-    SpiceChardev *s;
-
-    QLIST_FOREACH(s, &spice_chars, next) {
-        if (s->sin.portname == NULL) {
-            continue;
-        }
-        vmc_register_interface(s);
-    }
-}
-
-static void qemu_chr_parse_spice_vmc(QemuOpts *opts, ChardevBackend *backend,
-                                     Error **errp)
+static void spice_vmc_chr_parse(QemuOpts *opts, ChardevBackend *backend,
+                                Error **errp)
 {
     const char *name = qemu_opt_get(opts, "name");
     ChardevSpiceChannel *spicevmc;
@@ -350,8 +321,8 @@ static void qemu_chr_parse_spice_vmc(QemuOpts *opts, ChardevBackend *backend,
     spicevmc->type = g_strdup(name);
 }
 
-static void qemu_chr_parse_spice_port(QemuOpts *opts, ChardevBackend *backend,
-                                      Error **errp)
+static void spice_port_chr_parse(QemuOpts *opts, ChardevBackend *backend,
+                                 Error **errp)
 {
     const char *name = qemu_opt_get(opts, "name");
     ChardevSpicePort *spiceport;
@@ -366,7 +337,7 @@ static void qemu_chr_parse_spice_port(QemuOpts *opts, ChardevBackend *backend,
     spiceport->fqdn = g_strdup(name);
 }
 
-static void char_spice_class_init(ObjectClass *oc, void *data)
+static void char_spice_class_init(ObjectClass *oc, const void *data)
 {
     ChardevClass *cc = CHARDEV_CLASS(oc);
 
@@ -383,14 +354,15 @@ static const TypeInfo char_spice_type_info = {
     .class_init = char_spice_class_init,
     .abstract = true,
 };
+module_obj(TYPE_CHARDEV_SPICE);
 
-static void char_spicevmc_class_init(ObjectClass *oc, void *data)
+static void char_spicevmc_class_init(ObjectClass *oc, const void *data)
 {
     ChardevClass *cc = CHARDEV_CLASS(oc);
 
-    cc->parse = qemu_chr_parse_spice_vmc;
-    cc->open = qemu_chr_open_spice_vmc;
-    cc->chr_set_fe_open = spice_vmc_set_fe_open;
+    cc->chr_parse = spice_vmc_chr_parse;
+    cc->chr_open = spice_vmc_chr_open;
+    cc->chr_set_fe_open = spice_vmc_chr_set_fe_open;
 }
 
 static const TypeInfo char_spicevmc_type_info = {
@@ -398,14 +370,15 @@ static const TypeInfo char_spicevmc_type_info = {
     .parent = TYPE_CHARDEV_SPICE,
     .class_init = char_spicevmc_class_init,
 };
+module_obj(TYPE_CHARDEV_SPICEVMC);
 
-static void char_spiceport_class_init(ObjectClass *oc, void *data)
+static void char_spiceport_class_init(ObjectClass *oc, const void *data)
 {
     ChardevClass *cc = CHARDEV_CLASS(oc);
 
-    cc->parse = qemu_chr_parse_spice_port;
-    cc->open = qemu_chr_open_spice_port;
-    cc->chr_set_fe_open = spice_port_set_fe_open;
+    cc->chr_parse = spice_port_chr_parse;
+    cc->chr_open = spice_port_chr_open;
+    cc->chr_set_fe_open = spice_port_chr_set_fe_open;
 }
 
 static const TypeInfo char_spiceport_type_info = {
@@ -413,6 +386,7 @@ static const TypeInfo char_spiceport_type_info = {
     .parent = TYPE_CHARDEV_SPICE,
     .class_init = char_spiceport_class_init,
 };
+module_obj(TYPE_CHARDEV_SPICEPORT);
 
 static void register_types(void)
 {
@@ -422,3 +396,5 @@ static void register_types(void)
 }
 
 type_init(register_types);
+
+module_dep("ui-spice-core");

@@ -30,24 +30,22 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/event_notifier.h"
 #include "qemu/module.h"
-#include "qemu/thread.h"
-#include "qemu/sockets.h"
 #include "qapi/error.h"
-#include "chardev/char.h"
-#include "hw/irq.h"
-#include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/pci/pci_device.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "net/can_emu.h"
 
 #include "can_sja1000.h"
+#include "qom/object.h"
 
 #define TYPE_CAN_PCI_DEV "kvaser_pci"
 
-#define KVASER_PCI_DEV(obj) \
-    OBJECT_CHECK(KvaserPCIState, (obj), TYPE_CAN_PCI_DEV)
+typedef struct KvaserPCIState KvaserPCIState;
+DECLARE_INSTANCE_CHECKER(KvaserPCIState, KVASER_PCI_DEV,
+                         TYPE_CAN_PCI_DEV)
 
 #ifndef KVASER_PCI_VENDOR_ID1
 #define KVASER_PCI_VENDOR_ID1     0x10e8    /* the PCI device and vendor IDs */
@@ -78,7 +76,7 @@
 
 #define KVASER_PCI_XILINX_VERSION_NUMBER 13
 
-typedef struct KvaserPCIState {
+struct KvaserPCIState {
     /*< private >*/
     PCIDevice       dev;
     /*< public >*/
@@ -93,7 +91,7 @@ typedef struct KvaserPCIState {
     uint32_t        s5920_irqstate;
 
     CanBusState     *canbus;
-} KvaserPCIState;
+};
 
 static void kvaser_pci_irq_handler(void *opaque, int irq_num, int level)
 {
@@ -264,8 +262,7 @@ static const VMStateDescription vmstate_kvaser_pci = {
     .name = "kvaser_pci",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, KvaserPCIState),
         /* Load this before sja_state.  */
         VMSTATE_UINT32(s5920_intcsr, KvaserPCIState),
@@ -282,10 +279,10 @@ static void kvaser_pci_instance_init(Object *obj)
     object_property_add_link(obj, "canbus", TYPE_CAN_BUS,
                              (Object **)&d->canbus,
                              qdev_prop_allow_set_link_before_realize,
-                             0, &error_abort);
+                             0);
 }
 
-static void kvaser_pci_class_init(ObjectClass *klass, void *data)
+static void kvaser_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -298,7 +295,7 @@ static void kvaser_pci_class_init(ObjectClass *klass, void *data)
     k->class_id = 0x00ff00;
     dc->desc = "Kvaser PCICANx";
     dc->vmsd = &vmstate_kvaser_pci;
-    dc->reset = kvaser_pci_reset;
+    device_class_set_legacy_reset(dc, kvaser_pci_reset);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }
 
@@ -308,7 +305,7 @@ static const TypeInfo kvaser_pci_info = {
     .instance_size = sizeof(KvaserPCIState),
     .class_init    = kvaser_pci_class_init,
     .instance_init = kvaser_pci_instance_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },

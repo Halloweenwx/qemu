@@ -4,34 +4,6 @@
 #define __USER_CS	(0x33)
 #define __USER_DS	(0x2B)
 
-struct target_pt_regs {
-	abi_ulong r15;
-	abi_ulong r14;
-	abi_ulong r13;
-	abi_ulong r12;
-	abi_ulong rbp;
-	abi_ulong rbx;
-/* arguments: non interrupts/non tracing syscalls only save up to here */
-	abi_ulong r11;
-	abi_ulong r10;
-	abi_ulong r9;
-	abi_ulong r8;
-	abi_ulong rax;
-	abi_ulong rcx;
-	abi_ulong rdx;
-	abi_ulong rsi;
-	abi_ulong rdi;
-	abi_ulong orig_rax;
-/* end of arguments */
-/* cpu exception frame or undefined */
-	abi_ulong rip;
-	abi_ulong cs;
-	abi_ulong eflags;
-	abi_ulong rsp;
-	abi_ulong ss;
-/* top of stack page */
-};
-
 /* Maximum number of LDT entries supported. */
 #define TARGET_LDT_ENTRIES	8192
 /* The size of each LDT entry. */
@@ -100,8 +72,8 @@ struct target_msqid64_ds {
 #define TARGET_ARCH_SET_FS 0x1002
 #define TARGET_ARCH_GET_FS 0x1003
 #define TARGET_ARCH_GET_GS 0x1004
-#define TARGET_MINSIGSTKSZ 2048
-#define TARGET_MLOCKALL_MCL_CURRENT 1
-#define TARGET_MLOCKALL_MCL_FUTURE  2
+#define TARGET_MCL_CURRENT 1
+#define TARGET_MCL_FUTURE  2
+#define TARGET_MCL_ONFAULT 4
 
 #endif /* X86_64_TARGET_SYSCALL_H */

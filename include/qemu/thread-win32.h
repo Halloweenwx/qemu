@@ -18,12 +18,6 @@ struct QemuRecMutex {
     bool initialized;
 };
 
-void qemu_rec_mutex_destroy(QemuRecMutex *mutex);
-void qemu_rec_mutex_lock_impl(QemuRecMutex *mutex, const char *file, int line);
-int qemu_rec_mutex_trylock_impl(QemuRecMutex *mutex, const char *file,
-                                int line);
-void qemu_rec_mutex_unlock(QemuRecMutex *mutex);
-
 struct QemuCond {
     CONDITION_VARIABLE var;
     bool initialized;
@@ -31,12 +25,6 @@ struct QemuCond {
 
 struct QemuSemaphore {
     HANDLE sema;
-    bool initialized;
-};
-
-struct QemuEvent {
-    int value;
-    HANDLE event;
     bool initialized;
 };
 

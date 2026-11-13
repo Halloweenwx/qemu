@@ -15,15 +15,25 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/arm/fsl-imx7.h"
-#include "hw/boards.h"
-#include "hw/qdev-properties.h"
-#include "sysemu/sysemu.h"
+#include "hw/arm/boot.h"
+#include "hw/core/boards.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/error-report.h"
-#include "sysemu/qtest.h"
+#include "system/qtest.h"
+
+#define TYPE_MCIMX7D_SABRE_MACHINE MACHINE_TYPE_NAME("mcimx7d-sabre")
+OBJECT_DECLARE_SIMPLE_TYPE(Mcimx7dSabreMachineState,
+                           MCIMX7D_SABRE_MACHINE)
+
+struct Mcimx7dSabreMachineState {
+    MachineState parent;
+
+    struct arm_boot_info bootinfo;
+};
 
 static void mcimx7d_sabre_init(MachineState *machine)
 {
-    static struct arm_boot_info boot_info;
+    Mcimx7dSabreMachineState *msms = MCIMX7D_SABRE_MACHINE(machine);
     FslIMX7State *s;
     int i;
 
@@ -33,16 +43,16 @@ static void mcimx7d_sabre_init(MachineState *machine)
         exit(1);
     }
 
-    boot_info = (struct arm_boot_info) {
-        .loader_start = FSL_IMX7_MMDC_ADDR,
-        .board_id = -1,
-        .ram_size = machine->ram_size,
-        .nb_cpus = machine->smp.cpus,
-    };
+    msms->bootinfo.loader_start = FSL_IMX7_MMDC_ADDR;
+    msms->bootinfo.board_id = -1;
+    msms->bootinfo.ram_size = machine->ram_size;
+    msms->bootinfo.psci_conduit = QEMU_PSCI_CONDUIT_SMC;
 
     s = FSL_IMX7(object_new(TYPE_FSL_IMX7));
-    object_property_add_child(OBJECT(machine), "soc", OBJECT(s), &error_fatal);
-    object_property_set_bool(OBJECT(s), true, "realized", &error_fatal);
+    object_property_add_child(OBJECT(machine), "soc", OBJECT(s));
+    object_property_set_bool(OBJECT(s), "fec2-phy-connected", false,
+                             &error_fatal);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(s), &error_fatal);
 
     memory_region_add_subregion(get_system_memory(), FSL_IMX7_MMDC_ADDR,
                                 machine->ram);
@@ -53,25 +63,30 @@ static void mcimx7d_sabre_init(MachineState *machine)
         DriveInfo *di;
         BlockBackend *blk;
 
-        di = drive_get_next(IF_SD);
+        di = drive_get(IF_SD, 0, i);
         blk = di ? blk_by_legacy_dinfo(di) : NULL;
         bus = qdev_get_child_bus(DEVICE(&s->usdhc[i]), "sd-bus");
-        carddev = qdev_create(bus, TYPE_SD_CARD);
-        qdev_prop_set_drive(carddev, "drive", blk, &error_fatal);
-        object_property_set_bool(OBJECT(carddev), true,
-                                 "realized", &error_fatal);
+        carddev = qdev_new(TYPE_SD_CARD);
+        qdev_prop_set_drive_err(carddev, "drive", blk, &error_fatal);
+        qdev_realize_and_unref(carddev, bus, &error_fatal);
     }
 
     if (!qtest_enabled()) {
-        arm_load_kernel(&s->cpu[0], machine, &boot_info);
+        arm_load_kernel(&s->cpu[0], machine, &msms->bootinfo);
     }
 }
 
 static void mcimx7d_sabre_machine_init(MachineClass *mc)
 {
-    mc->desc = "Freescale i.MX7 DUAL SABRE (Cortex A7)";
+    mc->desc = "Freescale i.MX7 DUAL SABRE (Cortex-A7)";
     mc->init = mcimx7d_sabre_init;
     mc->max_cpus = FSL_IMX7_NUM_CPUS;
+    mc->default_cpus = FSL_IMX7_NUM_CPUS;
+    mc->default_ram_size = 2 * GiB;
     mc->default_ram_id = "mcimx7d-sabre.ram";
+    mc->auto_create_sdcard = true;
 }
-DEFINE_MACHINE("mcimx7d-sabre", mcimx7d_sabre_machine_init)
+
+DEFINE_MACHINE_EXTENDED("mcimx7d-sabre", MACHINE, Mcimx7dSabreMachineState,
+                        mcimx7d_sabre_machine_init, false, false,
+                        NULL)

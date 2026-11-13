@@ -1,12 +1,12 @@
 /*
  * QEMU PowerPC PowerNV LPC controller
  *
- * Copyright (c) 2016, IBM Corporation.
+ * Copyright (c) 2016-2022, IBM Corporation.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -20,21 +20,29 @@
 #ifndef PPC_PNV_LPC_H
 #define PPC_PNV_LPC_H
 
-#include "hw/ppc/pnv_psi.h"
+#include "system/memory.h"
+#include "hw/ppc/pnv.h"
+#include "hw/core/qdev.h"
+#include "hw/isa/isa.h" /* For ISA_NUM_IRQS */
 
 #define TYPE_PNV_LPC "pnv-lpc"
-#define PNV_LPC(obj) \
-     OBJECT_CHECK(PnvLpcController, (obj), TYPE_PNV_LPC)
+typedef struct PnvLpcClass PnvLpcClass;
+typedef struct PnvLpcController PnvLpcController;
+DECLARE_OBJ_CHECKERS(PnvLpcController, PnvLpcClass,
+                     PNV_LPC, TYPE_PNV_LPC)
 #define TYPE_PNV8_LPC TYPE_PNV_LPC "-POWER8"
-#define PNV8_LPC(obj) OBJECT_CHECK(PnvLpcController, (obj), TYPE_PNV8_LPC)
+DECLARE_INSTANCE_CHECKER(PnvLpcController, PNV8_LPC,
+                         TYPE_PNV8_LPC)
 
 #define TYPE_PNV9_LPC TYPE_PNV_LPC "-POWER9"
-#define PNV9_LPC(obj) OBJECT_CHECK(PnvLpcController, (obj), TYPE_PNV9_LPC)
+DECLARE_INSTANCE_CHECKER(PnvLpcController, PNV9_LPC,
+                         TYPE_PNV9_LPC)
 
 #define TYPE_PNV10_LPC TYPE_PNV_LPC "-POWER10"
-#define PNV10_LPC(obj) OBJECT_CHECK(PnvLpcController, (obj), TYPE_PNV10_LPC)
+DECLARE_INSTANCE_CHECKER(PnvLpcController, PNV10_LPC,
+                         TYPE_PNV10_LPC)
 
-typedef struct PnvLpcController {
+struct PnvLpcController {
     DeviceState parent;
 
     uint64_t eccb_stat_reg;
@@ -66,6 +74,9 @@ typedef struct PnvLpcController {
     uint32_t opb_irq_pol;
     uint32_t opb_irq_input;
 
+    /* LPC device IRQ state */
+    uint32_t lpc_hc_irq_inputs;
+
     /* LPC HC registers */
     uint32_t lpc_hc_fw_seg_idsel;
     uint32_t lpc_hc_fw_rd_acc_size;
@@ -77,30 +88,34 @@ typedef struct PnvLpcController {
     /* XSCOM registers */
     MemoryRegion xscom_regs;
 
+    /*
+     * In P8, ISA irqs are combined with internal sources to drive the
+     * LPCHC interrupt output. P9 ISA irqs raise one of 4 lines that
+     * drive PSI SERIRQ irqs, routing according to OPB routing registers.
+     */
+    bool psi_has_serirq;
+
     /* PSI to generate interrupts */
-    PnvPsi *psi;
-} PnvLpcController;
+    qemu_irq psi_irq_lpchc;
 
-#define PNV_LPC_CLASS(klass) \
-     OBJECT_CLASS_CHECK(PnvLpcClass, (klass), TYPE_PNV_LPC)
-#define PNV_LPC_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(PnvLpcClass, (obj), TYPE_PNV_LPC)
+    /* P9 serirq lines and irq routing table */
+    qemu_irq psi_irq_serirq[4];
+    int irq_to_serirq_route[ISA_NUM_IRQS];
+};
 
-typedef struct PnvLpcClass {
+struct PnvLpcClass {
     DeviceClass parent_class;
 
-    int psi_irq;
-
     DeviceRealize parent_realize;
-} PnvLpcClass;
+};
 
-/*
- * Old compilers error on typdef forward declarations. Keep them happy.
- */
-struct PnvChip;
+bool pnv_lpc_opb_read(PnvLpcController *lpc, uint32_t addr,
+                      uint8_t *data, int sz);
+bool pnv_lpc_opb_write(PnvLpcController *lpc, uint32_t addr,
+                       uint8_t *data, int sz);
 
 ISABus *pnv_lpc_isa_create(PnvLpcController *lpc, bool use_cpld, Error **errp);
-int pnv_dt_lpc(struct PnvChip *chip, void *fdt, int root_offset,
+int pnv_dt_lpc(PnvChip *chip, void *fdt, int root_offset,
                uint64_t lpcm_addr, uint64_t lpcm_size);
 
 #endif /* PPC_PNV_LPC_H */

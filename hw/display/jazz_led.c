@@ -27,24 +27,25 @@
 #include "ui/console.h"
 #include "ui/pixel_ops.h"
 #include "trace.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
+#include "qom/object.h"
 
 typedef enum {
     REDRAW_NONE = 0, REDRAW_SEGMENTS = 1, REDRAW_BACKGROUND = 2,
 } screen_state_t;
 
 #define TYPE_JAZZ_LED "jazz-led"
-#define JAZZ_LED(obj) OBJECT_CHECK(LedState, (obj), TYPE_JAZZ_LED)
+OBJECT_DECLARE_SIMPLE_TYPE(LedState, JAZZ_LED)
 
-typedef struct LedState {
+struct LedState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     uint8_t segments;
     QemuConsole *con;
     screen_state_t state;
-} LedState;
+};
 
 static uint64_t jazz_led_read(void *opaque, hwaddr addr,
                               unsigned int size)
@@ -143,7 +144,7 @@ static void draw_vertical_line(DisplaySurface *ds,
     }
 }
 
-static void jazz_led_update_display(void *opaque)
+static bool jazz_led_update_display(void *opaque)
 {
     LedState *s = opaque;
     DisplaySurface *surface = qemu_console_surface(s->con);
@@ -185,7 +186,7 @@ static void jazz_led_update_display(void *opaque)
             color_led = rgb_to_pixel32(0x00, 0xff, 0x00);
             break;
         default:
-            return;
+            return true;
         }
 
         /* display segments */
@@ -216,7 +217,9 @@ static void jazz_led_update_display(void *opaque)
     }
 
     s->state = REDRAW_NONE;
-    dpy_gfx_update_full(s->con);
+    qemu_console_update_full(s->con);
+
+    return true;
 }
 
 static void jazz_led_invalidate_display(void *opaque)
@@ -225,22 +228,22 @@ static void jazz_led_invalidate_display(void *opaque)
     s->state |= REDRAW_SEGMENTS | REDRAW_BACKGROUND;
 }
 
-static void jazz_led_text_update(void *opaque, console_ch_t *chardata)
+static void jazz_led_text_update(void *opaque, uint32_t *chardata)
 {
     LedState *s = opaque;
     char buf[3];
 
-    dpy_text_cursor(s->con, -1, -1);
+    qemu_console_text_set_cursor(s->con, -1, -1);
     qemu_console_resize(s->con, 2, 1);
 
     /* TODO: draw the segments */
     snprintf(buf, 3, "%02hhx", s->segments);
-    console_write_ch(chardata++, ATTR2CHTYPE(buf[0], QEMU_COLOR_BLUE,
-                                             QEMU_COLOR_BLACK, 1));
-    console_write_ch(chardata++, ATTR2CHTYPE(buf[1], QEMU_COLOR_BLUE,
-                                             QEMU_COLOR_BLACK, 1));
+    *chardata++ = ATTR2CHTYPE(buf[0], QEMU_COLOR_BLUE,
+                              QEMU_COLOR_BLACK, 1);
+    *chardata++ = ATTR2CHTYPE(buf[1], QEMU_COLOR_BLUE,
+                              QEMU_COLOR_BLACK, 1);
 
-    dpy_text_update(s->con, 0, 0, 2, 1);
+    qemu_console_text_update(s->con, 0, 0, 2, 1);
 }
 
 static int jazz_led_post_load(void *opaque, int version_id)
@@ -256,7 +259,7 @@ static const VMStateDescription vmstate_jazz_led = {
     .version_id = 0,
     .minimum_version_id = 0,
     .post_load = jazz_led_post_load,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT8(segments, LedState),
         VMSTATE_END_OF_LIST()
     }
@@ -281,7 +284,7 @@ static void jazz_led_realize(DeviceState *dev, Error **errp)
 {
     LedState *s = JAZZ_LED(dev);
 
-    s->con = graphic_console_init(dev, 0, &jazz_led_ops, s);
+    s->con = qemu_graphic_console_create(dev, 0, &jazz_led_ops, s);
 }
 
 static void jazz_led_reset(DeviceState *d)
@@ -293,13 +296,13 @@ static void jazz_led_reset(DeviceState *d)
     qemu_console_resize(s->con, 60, 80);
 }
 
-static void jazz_led_class_init(ObjectClass *klass, void *data)
+static void jazz_led_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->desc = "Jazz LED display",
     dc->vmsd = &vmstate_jazz_led;
-    dc->reset = jazz_led_reset;
+    device_class_set_legacy_reset(dc, jazz_led_reset);
     dc->realize = jazz_led_realize;
 }
 

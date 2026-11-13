@@ -1,8 +1,8 @@
 /*
  * QEMU curses/ncurses display driver
- * 
+ *
  * Copyright (c) 2005 Andrzej Zaborowski  <balrog@zabor.org>
- * 
+ *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
@@ -30,14 +30,18 @@
 #endif
 #include <locale.h>
 #include <wchar.h>
-#include <langinfo.h>
 #include <iconv.h>
 
 #include "qapi/error.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "ui/console.h"
 #include "ui/input.h"
-#include "sysemu/sysemu.h"
+#include "system/system.h"
+
+#ifdef __APPLE__
+#define _XOPEN_SOURCE_EXTENDED 1
+#endif
 
 /* KEY_EVENT is defined in wincon.h and in curses.h. Avoid redefinition. */
 #undef KEY_EVENT
@@ -54,7 +58,7 @@ enum maybe_keycode {
 };
 
 static DisplayChangeListener *dcl;
-static console_ch_t *screen;
+static uint32_t *screen;
 static WINDOW *screenpad = NULL;
 static int width, height, gwidth, gheight, invalidate;
 static int px, py, sminx, sminy, smaxx, smaxy;
@@ -65,8 +69,8 @@ static cchar_t *vga_to_curses;
 static void curses_update(DisplayChangeListener *dcl,
                           int x, int y, int w, int h)
 {
-    console_ch_t *line;
-    cchar_t curses_line[width];
+    uint32_t *line;
+    g_autofree cchar_t *curses_line = g_new(cchar_t, width);
     wchar_t wch[CCHARW_MAX];
     attr_t attrs;
     short colors;
@@ -95,7 +99,7 @@ static void curses_update(DisplayChangeListener *dcl,
 
 static void curses_calc_pad(void)
 {
-    if (qemu_console_is_fixedsize(NULL)) {
+    if (qemu_console_is_fixedsize(dcl->con)) {
         width = gwidth;
         height = gheight;
     } else {
@@ -146,7 +150,7 @@ static void curses_resize(DisplayChangeListener *dcl,
 }
 
 #if !defined(_WIN32) && defined(SIGWINCH) && defined(KEY_RESIZE)
-static volatile sig_atomic_t got_sigwinch;
+static bool got_sigwinch;
 static void curses_winch_check(void)
 {
     struct winsize {
@@ -169,21 +173,28 @@ static void curses_winch_check(void)
     invalidate = 1;
 }
 
-static void curses_winch_handler(int signum)
+static void curses_winch_handler(Notifier *n, void *data)
 {
     got_sigwinch = true;
 }
 
+static Notifier winch_notifier = {
+    .notify = curses_winch_handler
+};
+
 static void curses_winch_init(void)
 {
-    struct sigaction old, winch = {
-        .sa_handler  = curses_winch_handler,
-    };
-    sigaction(SIGWINCH, &winch, &old);
+    sigwinch_add_notifier(&winch_notifier);
+}
+
+static void curses_winch_cleanup(void)
+{
+    sigwinch_remove_notifier(&winch_notifier);
 }
 #else
 static void curses_winch_check(void) {}
 static void curses_winch_init(void) {}
+static void curses_winch_cleanup(void) {}
 #endif
 
 static void curses_cursor_position(DisplayChangeListener *dcl,
@@ -198,7 +209,7 @@ static void curses_cursor_position(DisplayChangeListener *dcl,
             curs_set(1);
             /* it seems that curs_set(1) must always be called before
              * curs_set(2) for the latter to have effect */
-            if (!qemu_console_is_graphic(NULL)) {
+            if (!qemu_console_is_graphic(dcl->con)) {
                 curs_set(2);
             }
             return;
@@ -262,8 +273,9 @@ static int curses2foo(const int _curses2foo[], const int _curseskey2foo[],
 
 static void curses_refresh(DisplayChangeListener *dcl)
 {
-    int chr, keysym, keycode, keycode_alt;
-    enum maybe_keycode maybe_keycode;
+    wint_t chr = 0;
+    int keysym, keycode, keycode_alt;
+    enum maybe_keycode maybe_keycode = CURSES_KEYCODE;
 
     curses_winch_check();
 
@@ -271,18 +283,19 @@ static void curses_refresh(DisplayChangeListener *dcl)
         clear();
         refresh();
         curses_calc_pad();
-        graphic_hw_invalidate(NULL);
+        qemu_console_hw_invalidate(dcl->con);
         invalidate = 0;
     }
 
-    graphic_hw_text_update(NULL, screen);
+    qemu_console_hw_text_update(dcl->con, screen);
 
     while (1) {
         /* while there are any pending key strokes to process */
         chr = console_getch(&maybe_keycode);
 
-        if (chr == -1)
+        if (chr == WEOF) {
             break;
+        }
 
 #ifdef KEY_RESIZE
         /* this shouldn't occur when we use a custom SIGWINCH handler */
@@ -300,10 +313,10 @@ static void curses_refresh(DisplayChangeListener *dcl)
 
         /* alt or esc key */
         if (keycode == 1) {
-            enum maybe_keycode next_maybe_keycode;
-            int nextchr = console_getch(&next_maybe_keycode);
+            enum maybe_keycode next_maybe_keycode = CURSES_KEYCODE;
+            wint_t nextchr = console_getch(&next_maybe_keycode);
 
-            if (nextchr != -1) {
+            if (nextchr != WEOF) {
                 chr = nextchr;
                 maybe_keycode = next_maybe_keycode;
                 keycode_alt = ALT;
@@ -315,11 +328,15 @@ static void curses_refresh(DisplayChangeListener *dcl)
                     /* process keys reserved for qemu */
                     if (keycode >= QEMU_KEY_CONSOLE0 &&
                             keycode < QEMU_KEY_CONSOLE0 + 9) {
-                        erase();
-                        wnoutrefresh(stdscr);
-                        console_select(keycode - QEMU_KEY_CONSOLE0);
+                        QemuConsole *con = qemu_console_lookup_by_index(keycode - QEMU_KEY_CONSOLE0);
+                        if (con) {
+                            erase();
+                            wnoutrefresh(stdscr);
+                            qemu_console_unregister_listener(dcl);
+                            qemu_console_register_listener(con, dcl, dcl->ops);
 
-                        invalidate = 1;
+                            invalidate = 1;
+                        }
                         continue;
                     }
                 }
@@ -351,45 +368,45 @@ static void curses_refresh(DisplayChangeListener *dcl)
         if (keycode == -1)
             continue;
 
-        if (qemu_console_is_graphic(NULL)) {
+        if (qemu_console_is_graphic(dcl->con)) {
             /* since terminals don't know about key press and release
              * events, we need to emit both for each key received */
             if (keycode & SHIFT) {
-                qemu_input_event_send_key_number(NULL, SHIFT_CODE, true);
+                qemu_input_event_send_key_number(dcl->con, SHIFT_CODE, true);
                 qemu_input_event_send_key_delay(0);
             }
             if (keycode & CNTRL) {
-                qemu_input_event_send_key_number(NULL, CNTRL_CODE, true);
+                qemu_input_event_send_key_number(dcl->con, CNTRL_CODE, true);
                 qemu_input_event_send_key_delay(0);
             }
             if (keycode & ALT) {
-                qemu_input_event_send_key_number(NULL, ALT_CODE, true);
+                qemu_input_event_send_key_number(dcl->con, ALT_CODE, true);
                 qemu_input_event_send_key_delay(0);
             }
             if (keycode & ALTGR) {
-                qemu_input_event_send_key_number(NULL, GREY | ALT_CODE, true);
+                qemu_input_event_send_key_number(dcl->con, GREY | ALT_CODE, true);
                 qemu_input_event_send_key_delay(0);
             }
 
-            qemu_input_event_send_key_number(NULL, keycode & KEY_MASK, true);
+            qemu_input_event_send_key_number(dcl->con, keycode & KEY_MASK, true);
             qemu_input_event_send_key_delay(0);
-            qemu_input_event_send_key_number(NULL, keycode & KEY_MASK, false);
+            qemu_input_event_send_key_number(dcl->con, keycode & KEY_MASK, false);
             qemu_input_event_send_key_delay(0);
 
             if (keycode & ALTGR) {
-                qemu_input_event_send_key_number(NULL, GREY | ALT_CODE, false);
+                qemu_input_event_send_key_number(dcl->con, GREY | ALT_CODE, false);
                 qemu_input_event_send_key_delay(0);
             }
             if (keycode & ALT) {
-                qemu_input_event_send_key_number(NULL, ALT_CODE, false);
+                qemu_input_event_send_key_number(dcl->con, ALT_CODE, false);
                 qemu_input_event_send_key_delay(0);
             }
             if (keycode & CNTRL) {
-                qemu_input_event_send_key_number(NULL, CNTRL_CODE, false);
+                qemu_input_event_send_key_number(dcl->con, CNTRL_CODE, false);
                 qemu_input_event_send_key_delay(0);
             }
             if (keycode & SHIFT) {
-                qemu_input_event_send_key_number(NULL, SHIFT_CODE, false);
+                qemu_input_event_send_key_number(dcl->con, SHIFT_CODE, false);
                 qemu_input_event_send_key_delay(0);
             }
         } else {
@@ -397,16 +414,25 @@ static void curses_refresh(DisplayChangeListener *dcl)
             if (keysym == -1)
                 keysym = chr;
 
-            kbd_put_keysym(keysym);
+            qemu_text_console_put_keysym(QEMU_TEXT_CONSOLE(dcl->con), keysym);
         }
     }
 }
 
-static void curses_atexit(void)
+static void curses_cleanup(void)
 {
+    if (!dcl) {
+        return;
+    }
+
+    curses_winch_cleanup();
     endwin();
-    g_free(vga_to_curses);
-    g_free(screen);
+    qemu_console_unregister_listener(dcl);
+    g_clear_pointer(&dcl, g_free);
+    g_clear_pointer(&screenpad, delwin);
+    g_clear_pointer(&vga_to_curses, g_free);
+    g_clear_pointer(&screen, g_free);
+    g_clear_pointer(&kbd_layout, kbd_layout_free);
 }
 
 /*
@@ -526,6 +552,7 @@ static void font_setup(void)
     iconv_t nativecharset_to_ucs2;
     iconv_t font_conv;
     int i;
+    g_autofree gchar *local_codeset = g_get_codeset();
 
     /*
      * Control characters are normally non-printable, but VGA does have
@@ -566,14 +593,14 @@ static void font_setup(void)
       0x25bc
     };
 
-    ucs2_to_nativecharset = iconv_open(nl_langinfo(CODESET), "UCS-2");
+    ucs2_to_nativecharset = iconv_open(local_codeset, "UCS-2");
     if (ucs2_to_nativecharset == (iconv_t) -1) {
         fprintf(stderr, "Could not convert font glyphs from UCS-2: '%s'\n",
                         strerror(errno));
         exit(1);
     }
 
-    nativecharset_to_ucs2 = iconv_open("UCS-2", nl_langinfo(CODESET));
+    nativecharset_to_ucs2 = iconv_open("UCS-2", local_codeset);
     if (nativecharset_to_ucs2 == (iconv_t) -1) {
         iconv_close(ucs2_to_nativecharset);
         fprintf(stderr, "Could not convert font glyphs to UCS-2: '%s'\n",
@@ -581,7 +608,7 @@ static void font_setup(void)
         exit(1);
     }
 
-    font_conv = iconv_open(nl_langinfo(CODESET), font_charset);
+    font_conv = iconv_open(local_codeset, font_charset);
     if (font_conv == (iconv_t) -1) {
         iconv_close(ucs2_to_nativecharset);
         iconv_close(nativecharset_to_ucs2);
@@ -602,7 +629,7 @@ static void font_setup(void)
     /* DEL */
     convert_ucs(0x7F, 0x2302, ucs2_to_nativecharset);
 
-    if (strcmp(nl_langinfo(CODESET), "UTF-8")) {
+    if (strcmp(local_codeset, "UTF-8")) {
         /* Non-Unicode capable, use termcap equivalents for those available */
         for (i = 0; i <= 0xFF; i++) {
             wchar_t wch[CCHARW_MAX];
@@ -759,8 +786,8 @@ static void curses_keyboard_setup(void)
         keyboard_layout = "en-us";
 #endif
     if(keyboard_layout) {
-        kbd_layout = init_keyboard_layout(name2keysym, keyboard_layout,
-                                          &error_fatal);
+        kbd_layout = kbd_layout_new(name2keysym, keyboard_layout,
+                                    &error_fatal);
     }
 }
 
@@ -785,17 +812,14 @@ static void curses_display_init(DisplayState *ds, DisplayOptions *opts)
     if (opts->u.curses.charset) {
         font_charset = opts->u.curses.charset;
     }
-    screen = g_new0(console_ch_t, 160 * 100);
+    screen = g_new0(uint32_t, 160 * 100);
     vga_to_curses = g_new0(cchar_t, 256);
     curses_setup();
     curses_keyboard_setup();
-    atexit(curses_atexit);
-
     curses_winch_init();
 
     dcl = g_new0(DisplayChangeListener, 1);
-    dcl->ops = &dcl_ops;
-    register_displaychangelistener(dcl);
+    qemu_console_register_listener(qemu_console_lookup_default(), dcl, &dcl_ops);
 
     invalidate = 1;
 }
@@ -803,6 +827,7 @@ static void curses_display_init(DisplayState *ds, DisplayOptions *opts)
 static QemuDisplay qemu_display_curses = {
     .type       = DISPLAY_TYPE_CURSES,
     .init       = curses_display_init,
+    .cleanup    = curses_cleanup,
 };
 
 static void register_curses(void)

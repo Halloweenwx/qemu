@@ -22,8 +22,10 @@
 #include "hw/s390x/sclp.h"
 #include "migration/vmstate.h"
 #include "hw/s390x/event-facility.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "hw/s390x/ebcdic.h"
+#include "qom/object.h"
 
 #define SIZE_BUFFER 4096
 #define NEWLINE     "\n"
@@ -37,18 +39,19 @@ typedef struct OprtnsCommand {
 /* max size for line-mode data in 4K SCCB page */
 #define SIZE_CONSOLE_BUFFER (SCCB_DATA_LEN - sizeof(OprtnsCommand))
 
-typedef struct SCLPConsoleLM {
+struct SCLPConsoleLM {
     SCLPEvent event;
-    CharBackend chr;
+    CharFrontend chr;
     bool echo;                  /* immediate echo of input if true        */
     uint32_t write_errors;      /* errors writing to char layer           */
     uint32_t length;            /* length of byte stream in buffer        */
     uint8_t buf[SIZE_CONSOLE_BUFFER];
-} SCLPConsoleLM;
+};
+typedef struct SCLPConsoleLM SCLPConsoleLM;
 
 #define TYPE_SCLPLM_CONSOLE "sclplmconsole"
-#define SCLPLM_CONSOLE(obj) \
-    OBJECT_CHECK(SCLPConsoleLM, (obj), TYPE_SCLPLM_CONSOLE)
+DECLARE_INSTANCE_CHECKER(SCLPConsoleLM, SCLPLM_CONSOLE,
+                         TYPE_SCLPLM_CONSOLE)
 
 /*
 *  Character layer call-back functions
@@ -211,7 +214,7 @@ static int process_mdb(SCLPEvent *event, MDBO *mdbo)
 {
     int rc;
     int len;
-    uint8_t buffer[SIZE_BUFFER];
+    QEMU_UNINITIALIZED uint8_t buffer[SIZE_BUFFER];
 
     len = be16_to_cpu(mdbo->length);
     len -= sizeof(mdbo->length) + sizeof(mdbo->type)
@@ -240,7 +243,8 @@ static int write_event_data(SCLPEvent *event, EventBufferHeader *ebh)
     SCLPConsoleLM *scon = SCLPLM_CONSOLE(event);
 
     len = be16_to_cpu(data->mdb.header.length);
-    if (len < sizeof(data->mdb.header)) {
+    if (len < sizeof(data->mdb.header) ||
+        len > be16_to_cpu(data->header.length) - sizeof(EventBufferHeader)) {
         return SCLP_RC_INCONSISTENT_LENGTHS;
     }
     len -= sizeof(data->mdb.header);
@@ -289,7 +293,7 @@ static const VMStateDescription vmstate_sclplmconsole = {
     .name = "sclplmconsole",
     .version_id = 0,
     .minimum_version_id = 0,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_BOOL(event.event_pending, SCLPConsoleLM),
         VMSTATE_UINT32(write_errors, SCLPConsoleLM),
         VMSTATE_UINT32(length, SCLPConsoleLM),
@@ -330,20 +334,19 @@ static void console_reset(DeviceState *dev)
    scon->write_errors = 0;
 }
 
-static Property console_properties[] = {
+static const Property console_properties[] = {
     DEFINE_PROP_CHR("chardev", SCLPConsoleLM, chr),
     DEFINE_PROP_UINT32("write_errors", SCLPConsoleLM, write_errors, 0),
     DEFINE_PROP_BOOL("echo", SCLPConsoleLM, echo, true),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void console_class_init(ObjectClass *klass, void *data)
+static void console_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SCLPEventClass *ec = SCLP_EVENT_CLASS(klass);
 
     device_class_set_props(dc, console_properties);
-    dc->reset = console_reset;
+    device_class_set_legacy_reset(dc, console_reset);
     dc->vmsd = &vmstate_sclplmconsole;
     ec->init = console_init;
     ec->get_send_mask = send_mask;
@@ -355,7 +358,7 @@ static void console_class_init(ObjectClass *klass, void *data)
 }
 
 static const TypeInfo sclp_console_info = {
-    .name          = "sclplmconsole",
+    .name          = TYPE_SCLPLM_CONSOLE,
     .parent        = TYPE_SCLP_EVENT,
     .instance_size = sizeof(SCLPConsoleLM),
     .class_init    = console_class_init,

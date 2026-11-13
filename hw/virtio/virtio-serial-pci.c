@@ -17,10 +17,11 @@
 
 #include "qemu/osdep.h"
 
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/virtio/virtio-serial.h"
 #include "qemu/module.h"
-#include "virtio-pci.h"
+#include "hw/virtio/virtio-pci.h"
+#include "qom/object.h"
 
 typedef struct VirtIOSerialPCI VirtIOSerialPCI;
 
@@ -28,8 +29,8 @@ typedef struct VirtIOSerialPCI VirtIOSerialPCI;
  * virtio-serial-pci: This extends VirtioPCIProxy.
  */
 #define TYPE_VIRTIO_SERIAL_PCI "virtio-serial-pci-base"
-#define VIRTIO_SERIAL_PCI(obj) \
-        OBJECT_CHECK(VirtIOSerialPCI, (obj), TYPE_VIRTIO_SERIAL_PCI)
+DECLARE_INSTANCE_CHECKER(VirtIOSerialPCI, VIRTIO_SERIAL_PCI,
+                         TYPE_VIRTIO_SERIAL_PCI)
 
 struct VirtIOSerialPCI {
     VirtIOPCIProxy parent_obj;
@@ -65,19 +66,17 @@ static void virtio_serial_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
         g_free(bus_name);
     }
 
-    qdev_set_parent_bus(vdev, BUS(&vpci_dev->bus));
-    object_property_set_bool(OBJECT(vdev), true, "realized", errp);
+    qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
 }
 
-static Property virtio_serial_pci_properties[] = {
+static const Property virtio_serial_pci_properties[] = {
     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 2),
     DEFINE_PROP_UINT32("class", VirtIOPCIProxy, class_code, 0),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void virtio_serial_pci_class_init(ObjectClass *klass, void *data)
+static void virtio_serial_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);

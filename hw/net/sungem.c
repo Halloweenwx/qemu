@@ -8,8 +8,8 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/pci/pci_device.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -17,12 +17,13 @@
 #include "net/eth.h"
 #include "net/checksum.h"
 #include "hw/net/mii.h"
-#include "sysemu/sysemu.h"
+#include "system/system.h"
 #include "trace.h"
+#include "qom/object.h"
 
 #define TYPE_SUNGEM "sungem"
 
-#define SUNGEM(obj) OBJECT_CHECK(SunGEMState, (obj), TYPE_SUNGEM)
+OBJECT_DECLARE_SIMPLE_TYPE(SunGEMState, SUNGEM)
 
 #define MAX_PACKET_SIZE 9016
 
@@ -106,6 +107,15 @@
 #define RXDMA_FTAG        0x0110UL    /* RX FIFO Tag */
 #define RXDMA_FSZ         0x0120UL    /* RX FIFO Size */
 
+/* WOL Registers */
+#define SUNGEM_MMIO_WOL_SIZE   0x14
+
+#define WOL_MATCH0        0x0000UL
+#define WOL_MATCH1        0x0004UL
+#define WOL_MATCH2        0x0008UL
+#define WOL_MCOUNT        0x000CUL
+#define WOL_WAKECSR       0x0010UL
+
 /* MAC Registers */
 #define SUNGEM_MMIO_MAC_SIZE   0x200
 
@@ -167,6 +177,7 @@
 #define SUNGEM_MMIO_PCS_SIZE   0x60
 #define PCS_MIISTAT       0x0004UL    /* PCS MII Status Register */
 #define PCS_ISTAT         0x0018UL    /* PCS Interrupt Status Reg */
+
 #define PCS_SSTATE        0x005CUL    /* Serialink State Register */
 
 /* Descriptors */
@@ -192,13 +203,14 @@ struct gem_rxd {
 #define RXDCTRL_ALTMAC    0x2000000000000000ULL  /* Matched ALT MAC */
 
 
-typedef struct {
+struct SunGEMState {
     PCIDevice pdev;
 
     MemoryRegion sungem;
     MemoryRegion greg;
     MemoryRegion txdma;
     MemoryRegion rxdma;
+    MemoryRegion wol;
     MemoryRegion mac;
     MemoryRegion mif;
     MemoryRegion pcs;
@@ -221,7 +233,7 @@ typedef struct {
     uint8_t tx_data[MAX_PACKET_SIZE];
     uint32_t tx_size;
     uint64_t tx_first_ctl;
-} SunGEMState;
+};
 
 
 static void sungem_eval_irq(SunGEMState *s)
@@ -305,7 +317,7 @@ static void sungem_send_packet(SunGEMState *s, const uint8_t *buf,
     NetClientState *nc = qemu_get_queue(s->nic);
 
     if (s->macregs[MAC_XIFCFG >> 2] & MAC_XIFCFG_LBCK) {
-        nc->info->receive(nc, buf, size);
+        qemu_receive_packet(nc, buf, size);
     } else {
         qemu_send_packet(nc, buf, size);
     }
@@ -433,7 +445,7 @@ static bool sungem_rx_full(SunGEMState *s, uint32_t kick, uint32_t done)
     return kick == ((done + 1) & s->rx_mask);
 }
 
-static int sungem_can_receive(NetClientState *nc)
+static bool sungem_can_receive(NetClientState *nc)
 {
     SunGEMState *s = qemu_get_nic_opaque(nc);
     uint32_t kick, done, rxdma_cfg, rxmac_cfg;
@@ -445,11 +457,11 @@ static int sungem_can_receive(NetClientState *nc)
     /* If MAC disabled, can't receive */
     if ((rxmac_cfg & MAC_RXCFG_ENAB) == 0) {
         trace_sungem_rx_mac_disabled();
-        return 0;
+        return false;
     }
     if ((rxdma_cfg & RXDMA_CFG_ENABLE) == 0) {
         trace_sungem_rx_txdma_disabled();
-        return 0;
+        return false;
     }
 
     /* Check RX availability */
@@ -549,7 +561,6 @@ static ssize_t sungem_receive(NetClientState *nc, const uint8_t *buf,
     PCIDevice *d = PCI_DEVICE(s);
     uint32_t mac_crc, done, kick, max_fsize;
     uint32_t fcs_size, ints, rxdma_cfg, rxmac_cfg, csum, coff;
-    uint8_t smallbuf[60];
     struct gem_rxd desc;
     uint64_t dbase, baddr;
     unsigned int rx_cond;
@@ -581,19 +592,6 @@ static ssize_t sungem_receive(NetClientState *nc, const uint8_t *buf,
         trace_sungem_rx_bad_frame_size(size);
         /* XXX Increment error statistics ? */
         return size;
-    }
-
-    /* We don't drop too small frames since we get them in qemu, we pad
-     * them instead. We should probably use the min frame size register
-     * but I don't want to use a variable size staging buffer and I
-     * know both MacOS and Linux use the default 64 anyway. We use 60
-     * here to account for the non-existent FCS.
-     */
-    if (size < 60) {
-        memcpy(smallbuf, buf, size);
-        memset(&smallbuf[size], 0, 60 - size);
-        buf = smallbuf;
-        size = 60;
     }
 
     /* Get MAC crc */
@@ -1075,6 +1073,43 @@ static const MemoryRegionOps sungem_mmio_rxdma_ops = {
     },
 };
 
+static void sungem_mmio_wol_write(void *opaque, hwaddr addr, uint64_t val,
+                                    unsigned size)
+{
+    trace_sungem_mmio_wol_write(addr, val);
+
+    switch (addr) {
+    case WOL_WAKECSR:
+        if (val != 0) {
+            qemu_log_mask(LOG_UNIMP, "sungem: WOL not supported\n");
+        }
+        break;
+    default:
+        qemu_log_mask(LOG_UNIMP, "sungem: WOL not supported\n");
+    }
+}
+
+static uint64_t sungem_mmio_wol_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint32_t val = -1;
+
+    qemu_log_mask(LOG_UNIMP, "sungem: WOL not supported\n");
+
+    trace_sungem_mmio_wol_read(addr, val);
+
+    return val;
+}
+
+static const MemoryRegionOps sungem_mmio_wol_ops = {
+    .read = sungem_mmio_wol_read,
+    .write = sungem_mmio_wol_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .impl = {
+        .min_access_size = 4,
+        .max_access_size = 4,
+    },
+};
+
 static void sungem_mmio_mac_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size)
 {
@@ -1193,7 +1228,7 @@ static void sungem_mmio_mif_write(void *opaque, hwaddr addr, uint64_t val,
     case MIF_SMACHINE:
         return; /* No actual write */
     case MIF_CFG:
-        /* Maintain the RO MDI bits to advertize an MDIO PHY on MDI0 */
+        /* Maintain the RO MDI bits to advertise an MDIO PHY on MDI0 */
         val &= ~MIF_CFG_MDI1;
         val |= MIF_CFG_MDI0;
         break;
@@ -1343,6 +1378,10 @@ static void sungem_realize(PCIDevice *pci_dev, Error **errp)
                           "sungem.rxdma", SUNGEM_MMIO_RXDMA_SIZE);
     memory_region_add_subregion(&s->sungem, 0x4000, &s->rxdma);
 
+    memory_region_init_io(&s->wol, OBJECT(s), &sungem_mmio_wol_ops, s,
+                          "sungem.wol", SUNGEM_MMIO_WOL_SIZE);
+    memory_region_add_subregion(&s->sungem, 0x3000, &s->wol);
+
     memory_region_init_io(&s->mac, OBJECT(s), &sungem_mmio_mac_ops, s,
                           "sungem.mac", SUNGEM_MMIO_MAC_SIZE);
     memory_region_add_subregion(&s->sungem, 0x6000, &s->mac);
@@ -1360,7 +1399,7 @@ static void sungem_realize(PCIDevice *pci_dev, Error **errp)
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
     s->nic = qemu_new_nic(&net_sungem_info, &s->conf,
                           object_get_typename(OBJECT(dev)),
-                          dev->id, s);
+                          dev->id, &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic),
                              s->conf.macaddr.a);
 }
@@ -1378,24 +1417,23 @@ static void sungem_instance_init(Object *obj)
 
     device_add_bootindex_property(obj, &s->conf.bootindex,
                                   "bootindex", "/ethernet-phy@0",
-                                  DEVICE(obj), NULL);
+                                  DEVICE(obj));
 }
 
-static Property sungem_properties[] = {
+static const Property sungem_properties[] = {
     DEFINE_NIC_PROPERTIES(SunGEMState, conf),
     /* Phy address should be 0 for most Apple machines except
      * for K2 in which case it's 1. Will be set by a machine
      * override.
      */
     DEFINE_PROP_UINT32("phy_addr", SunGEMState, phy_addr, 0),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static const VMStateDescription vmstate_sungem = {
     .name = "sungem",
     .version_id = 0,
     .minimum_version_id = 0,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(pdev, SunGEMState),
         VMSTATE_MACADDR(conf.macaddr, SunGEMState),
         VMSTATE_UINT32(phy_addr, SunGEMState),
@@ -1416,7 +1454,7 @@ static const VMStateDescription vmstate_sungem = {
     }
 };
 
-static void sungem_class_init(ObjectClass *klass, void *data)
+static void sungem_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -1428,7 +1466,7 @@ static void sungem_class_init(ObjectClass *klass, void *data)
     k->revision = 0x01;
     k->class_id = PCI_CLASS_NETWORK_ETHERNET;
     dc->vmsd = &vmstate_sungem;
-    dc->reset = sungem_reset;
+    device_class_set_legacy_reset(dc, sungem_reset);
     device_class_set_props(dc, sungem_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
 }
@@ -1439,7 +1477,7 @@ static const TypeInfo sungem_info = {
     .instance_size = sizeof(SunGEMState),
     .class_init    = sungem_class_init,
     .instance_init = sungem_instance_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { }
     }

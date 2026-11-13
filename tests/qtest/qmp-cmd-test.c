@@ -14,7 +14,8 @@
 #include "libqtest.h"
 #include "qapi/error.h"
 #include "qapi/qapi-visit-introspect.h"
-#include "qapi/qmp/qdict.h"
+#include "qobject/qdict.h"
+#include "qobject/qlist.h"
 #include "qapi/qobject-input-visitor.h"
 
 const char common_args[] = "-nodefaults -machine none";
@@ -31,6 +32,9 @@ static int query_error_class(const char *cmd)
 #ifndef CONFIG_SPICE
         { "query-spice", ERROR_CLASS_COMMAND_NOT_FOUND },
 #endif
+#ifndef CONFIG_TCG
+        { "query-replay", ERROR_CLASS_COMMAND_NOT_FOUND },
+#endif
 #ifndef CONFIG_VNC
         { "query-vnc", ERROR_CLASS_GENERIC_ERROR },
         { "query-vnc-servers", ERROR_CLASS_GENERIC_ERROR },
@@ -42,7 +46,15 @@ static int query_error_class(const char *cmd)
         { "query-acpi-ospm-status", ERROR_CLASS_GENERIC_ERROR },
         { "query-balloon", ERROR_CLASS_DEVICE_NOT_ACTIVE },
         { "query-hotpluggable-cpus", ERROR_CLASS_GENERIC_ERROR },
+        { "query-hv-balloon-status-report", ERROR_CLASS_GENERIC_ERROR },
         { "query-vm-generation-id", ERROR_CLASS_GENERIC_ERROR },
+        /* Only valid with a USB bus added */
+        { "x-query-usb", ERROR_CLASS_GENERIC_ERROR },
+        /* Only valid with accel=tcg */
+        { "x-query-jit", ERROR_CLASS_GENERIC_ERROR },
+        { "xen-event-list", ERROR_CLASS_GENERIC_ERROR },
+        /* requires firmware with memory buffer logging support */
+        { "query-firmware-log", ERROR_CLASS_GENERIC_ERROR },
         { NULL, -1 }
     };
     int i;
@@ -82,27 +94,33 @@ static void test_query(const void *data)
     qtest_quit(qts);
 }
 
-static bool query_is_blacklisted(const char *cmd)
+static bool query_is_ignored(const char *cmd)
 {
-    const char *blacklist[] = {
+    const char *ignored[] = {
         /* Not actually queries: */
         "add-fd",
         /* Success depends on target arch: */
         "query-cpu-definitions",  /* arm, i386, ppc, s390x */
         "query-gic-capabilities", /* arm */
+        "query-s390x-cpu-polarization", /* s390x */
         /* Success depends on target-specific build configuration: */
         "query-pci",              /* CONFIG_PCI */
+        "x-query-virtio",         /* CONFIG_VIRTIO */
         /* Success depends on launching SEV guest */
         "query-sev-launch-measure",
         /* Success depends on Host or Hypervisor SEV support */
         "query-sev",
         "query-sev-capabilities",
+        "query-sgx",
+        "query-sgx-capabilities",
+        /* Success depends on enabling dirty page rate limit */
+        "query-vcpu-dirty-limit",
         NULL
     };
     int i;
 
-    for (i = 0; blacklist[i]; i++) {
-        if (!strcmp(cmd, blacklist[i])) {
+    for (i = 0; ignored[i]; i++) {
+        if (!strcmp(cmd, ignored[i])) {
             return true;
         }
     }
@@ -113,6 +131,8 @@ typedef struct {
     SchemaInfoList *list;
     GHashTable *hash;
 } QmpSchema;
+
+static QmpSchema schema;
 
 static void qmp_schema_init(QmpSchema *schema)
 {
@@ -158,7 +178,7 @@ static bool object_type_has_mandatory_members(SchemaInfo *type)
     g_assert(type->meta_type == SCHEMA_META_TYPE_OBJECT);
 
     for (tail = type->u.object.members; tail; tail = tail->next) {
-        if (!tail->value->has_q_default) {
+        if (!tail->value->q_default) {
             return true;
         }
     }
@@ -179,7 +199,7 @@ static void add_query_tests(QmpSchema *schema)
             continue;
         }
 
-        if (query_is_blacklisted(si->name)) {
+        if (query_is_ignored(si->name)) {
             continue;
         }
 
@@ -200,22 +220,182 @@ static void add_query_tests(QmpSchema *schema)
     }
 }
 
-static void test_object_add_without_props(void)
+static void test_object_add_failure_modes(void)
 {
     QTestState *qts;
     QDict *resp;
 
+    /* attempt to create an object without props */
     qts = qtest_init(common_args);
     resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
-                    " {'qom-type': 'memory-backend-ram', 'id': 'ram1' } }");
+                     " {'qom-type': 'memory-backend-ram', 'id': 'ram1' } }");
     g_assert_nonnull(resp);
-    qmp_assert_error_class(resp, "GenericError");
+    qmp_expect_error_and_unref(resp, "GenericError");
+
+    /* attempt to create an object without qom-type */
+    resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
+                     " {'id': 'ram1' } }");
+    g_assert_nonnull(resp);
+    qmp_expect_error_and_unref(resp, "GenericError");
+
+    /* attempt to delete an object that does not exist */
+    resp = qtest_qmp(qts, "{'execute': 'object-del', 'arguments':"
+                     " {'id': 'ram1' } }");
+    g_assert_nonnull(resp);
+    qmp_expect_error_and_unref(resp, "GenericError");
+
+    /* attempt to create 2 objects with duplicate id */
+    resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
+                     " {'qom-type': 'memory-backend-ram', 'id': 'ram1',"
+                     " 'size': 1048576 } }");
+    g_assert_nonnull(resp);
+    g_assert(qdict_haskey(resp, "return"));
+    qobject_unref(resp);
+
+    resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
+                     " {'qom-type': 'memory-backend-ram', 'id': 'ram1',"
+                     " 'size': 1048576 } }");
+    g_assert_nonnull(resp);
+    qmp_expect_error_and_unref(resp, "GenericError");
+
+    /* delete ram1 object */
+    resp = qtest_qmp(qts, "{'execute': 'object-del', 'arguments':"
+                     " {'id': 'ram1' } }");
+    g_assert_nonnull(resp);
+    g_assert(qdict_haskey(resp, "return"));
+    qobject_unref(resp);
+
+    /* attempt to create an object with a property of a wrong type */
+    resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
+                     " {'qom-type': 'memory-backend-ram', 'id': 'ram1',"
+                     " 'size': '1048576' } }");
+    g_assert_nonnull(resp);
+    /* now do it right */
+    qmp_expect_error_and_unref(resp, "GenericError");
+
+    resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
+                     " {'qom-type': 'memory-backend-ram', 'id': 'ram1',"
+                     " 'size': 1048576 } }");
+    g_assert_nonnull(resp);
+    g_assert(qdict_haskey(resp, "return"));
+    qobject_unref(resp);
+
+    /* delete ram1 object */
+    resp = qtest_qmp(qts, "{'execute': 'object-del', 'arguments':"
+                     " {'id': 'ram1' } }");
+    g_assert_nonnull(resp);
+    g_assert(qdict_haskey(resp, "return"));
+    qobject_unref(resp);
+
+    /* attempt to create an object without the id */
+    resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
+                     " {'qom-type': 'memory-backend-ram',"
+                     " 'size': 1048576 } }");
+    g_assert_nonnull(resp);
+    qmp_expect_error_and_unref(resp, "GenericError");
+
+    /* now do it right */
+    resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
+                     " {'qom-type': 'memory-backend-ram', 'id': 'ram1',"
+                     " 'size': 1048576 } }");
+    g_assert_nonnull(resp);
+    g_assert(qdict_haskey(resp, "return"));
+    qobject_unref(resp);
+
+    /* delete ram1 object */
+    resp = qtest_qmp(qts, "{'execute': 'object-del', 'arguments':"
+                     " {'id': 'ram1' } }");
+    g_assert_nonnull(resp);
+    g_assert(qdict_haskey(resp, "return"));
+    qobject_unref(resp);
+
+    /* attempt to set a non existing property */
+    resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
+                     " {'qom-type': 'memory-backend-ram', 'id': 'ram1',"
+                     " 'sized': 1048576 } }");
+    g_assert_nonnull(resp);
+    qmp_expect_error_and_unref(resp, "GenericError");
+
+    /* now do it right */
+    resp = qtest_qmp(qts, "{'execute': 'object-add', 'arguments':"
+                     " {'qom-type': 'memory-backend-ram', 'id': 'ram1',"
+                     " 'size': 1048576 } }");
+    g_assert_nonnull(resp);
+    g_assert(qdict_haskey(resp, "return"));
+    qobject_unref(resp);
+
+    /* delete ram1 object without id */
+    resp = qtest_qmp(qts, "{'execute': 'object-del', 'arguments':"
+                     " {'ida': 'ram1' } }");
+    g_assert_nonnull(resp);
+    qobject_unref(resp);
+
+    /* delete ram1 object */
+    resp = qtest_qmp(qts, "{'execute': 'object-del', 'arguments':"
+                     " {'id': 'ram1' } }");
+    g_assert_nonnull(resp);
+    g_assert(qdict_haskey(resp, "return"));
+    qobject_unref(resp);
+
+    /* delete ram1 object that does not exist anymore*/
+    resp = qtest_qmp(qts, "{'execute': 'object-del', 'arguments':"
+                     " {'id': 'ram1' } }");
+    g_assert_nonnull(resp);
+    qmp_expect_error_and_unref(resp, "GenericError");
+
+    qtest_quit(qts);
+}
+
+static void test_qapi_type(void)
+{
+    QTestState *qts;
+    g_autoptr(QDict) resp = NULL;
+    QList *types;
+    QListEntry *type_entry, *prop_entry;
+
+    qts = qtest_init(common_args);
+
+    resp = qtest_qmp(qts,
+                     "{ 'execute': 'qom-list-types',"
+                     "  'arguments': { 'abstract': true } }");
+    g_assert(qdict_haskey(resp, "return"));
+    types = qdict_get_qlist(resp, "return");
+
+    QLIST_FOREACH_ENTRY(types, type_entry) {
+        QDict *type = qobject_to(QDict, qlist_entry_obj(type_entry));
+        const char *name = qdict_get_str(type, "name");
+        g_autoptr(QDict) props_resp = NULL;
+        QList *props;
+
+        props_resp = qtest_qmp(qts,
+                               "{ 'execute': 'qom-list-properties',"
+                               "  'arguments': { 'typename': %s } }",
+                               name);
+        if (!qdict_haskey(props_resp, "return")) {
+            continue;
+        }
+        props = qdict_get_qlist(props_resp, "return");
+
+        QLIST_FOREACH_ENTRY(props, prop_entry) {
+            QDict *prop = qobject_to(QDict, qlist_entry_obj(prop_entry));
+            const char *qapi_type = qdict_get_try_str(prop, "qapi-type");
+            const char *propname = qdict_get_str(prop, "name");
+            const char *ty = qdict_get_str(prop, "type");
+
+            if (qapi_type) {
+                g_assert_nonnull(qmp_schema_lookup(&schema, qapi_type));
+            } else if (!g_str_has_prefix(ty, "child<") &&
+                       !g_str_has_prefix(ty, "link<")) {
+                g_test_message("%s.%s %s has no associated qapi-type",
+                               name, propname, ty);
+            }
+        }
+    }
     qtest_quit(qts);
 }
 
 int main(int argc, char *argv[])
 {
-    QmpSchema schema;
     int ret;
 
     g_test_init(&argc, &argv, NULL);
@@ -223,9 +403,11 @@ int main(int argc, char *argv[])
     qmp_schema_init(&schema);
     add_query_tests(&schema);
 
-    qtest_add_func("qmp/object-add-without-props",
-                   test_object_add_without_props);
-    /* TODO: add coverage of generic object-add failure modes */
+    qtest_add_func("qmp/object-add-failure-modes",
+                   test_object_add_failure_modes);
+    if (g_test_slow()) {
+        qtest_add_func("qmp/qapi-type", test_qapi_type);
+    }
 
     ret = g_test_run();
 

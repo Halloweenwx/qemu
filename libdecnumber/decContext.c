@@ -24,9 +24,8 @@
    for more details.
 
    You should have received a copy of the GNU General Public License
-   along with GCC; see the file COPYING.  If not, write to the Free
-   Software Foundation, 51 Franklin Street, Fifth Floor, Boston, MA
-   02110-1301, USA.  */
+   along with GCC; see the file COPYING.  If not, see
+   <https://www.gnu.org/licenses/>.  */
 
 /* ------------------------------------------------------------------ */
 /* Decimal Context module					      */
@@ -53,12 +52,13 @@ static	const  Flag *mfctop=(Flag *)&mfcone; /* -> top byte */
 const uByte DECSTICKYTAB[10]={1,1,2,3,4,6,6,7,8,9}; /* used if sticky */
 
 /* ------------------------------------------------------------------ */
-/* Powers of ten (powers[n]==10**n, 0<=n<=9)			      */
+/* Powers of ten (powers[n]==10**n, 0<=n<=19)                         */
 /* ------------------------------------------------------------------ */
-const uLong DECPOWERS[19] = {1, 10, 100, 1000, 10000, 100000, 1000000,
+const uLong DECPOWERS[20] = {1, 10, 100, 1000, 10000, 100000, 1000000,
   10000000, 100000000, 1000000000, 10000000000ULL, 100000000000ULL,
   1000000000000ULL, 10000000000000ULL, 100000000000000ULL, 1000000000000000ULL,
-  10000000000000000ULL, 100000000000000000ULL, 1000000000000000000ULL, };
+  10000000000000000ULL, 100000000000000000ULL, 1000000000000000000ULL,
+  10000000000000000000ULL,};
 
 /* ------------------------------------------------------------------ */
 /* decContextClearStatus -- clear bits in current status	      */

@@ -1,11 +1,21 @@
+config PCI_BRIDGE
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+
 config PCIE_PORT
     bool
     default y if PCI_DEVICES
     depends on PCI_EXPRESS && MSI_NONBROKEN
 
+config PCIE_PCI_BRIDGE
+    bool
+    default y if PCIE_PORT
+    depends on PCIE_PORT
+
 config PXB
     bool
-    default y if Q35
+    default y if Q35 || ARM_VIRT
 
 config XIO3130
     bool
@@ -27,3 +37,8 @@ config DEC_PCI
 
 config SIMBA
     bool
+
+config CXL
+    bool
+    default y if PCI_EXPRESS && PXB
+    depends on PCI_EXPRESS && MSI_NONBROKEN && PXB

@@ -7,14 +7,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/timer.h"
-#include "hw/ptimer.h"
+#include "hw/core/ptimer.h"
 #include "migration/vmstate.h"
 #include "qemu/host-utils.h"
-#include "sysemu/replay.h"
-#include "sysemu/qtest.h"
-#include "block/aio.h"
-#include "sysemu/cpus.h"
+#include "exec/replay-core.h"
+#include "exec/icount.h"
+#include "system/qtest.h"
+#include "hw/core/clock.h"
 
 #define DELTA_ADJUST     1
 #define DELTA_NO_ADJUST -1
@@ -83,7 +82,7 @@ static void ptimer_reload(ptimer_state *s, int delta_adjust)
         delta = s->delta = s->limit;
     }
 
-    if (s->period == 0) {
+    if (s->period == 0 && s->period_frac == 0) {
         if (!qtest_enabled()) {
             fprintf(stderr, "Timer with period zero, disabling\n");
         }
@@ -117,6 +116,10 @@ static void ptimer_reload(ptimer_state *s, int delta_adjust)
     }
 
     if (delta == 0) {
+        if (s->enabled == 0) {
+            /* trigger callback disabled the timer already */
+            return;
+        }
         if (!qtest_enabled()) {
             fprintf(stderr, "Timer with delta zero, disabling\n");
         }
@@ -134,7 +137,8 @@ static void ptimer_reload(ptimer_state *s, int delta_adjust)
      * on the current generation of host machines.
      */
 
-    if (s->enabled == 1 && (delta * period < 10000) && !use_icount) {
+    if (s->enabled == 1 && (delta * period < 10000) &&
+        !icount_enabled() && !qtest_enabled()) {
         period = 10000 / delta;
         period_frac = 0;
     }
@@ -217,7 +221,8 @@ uint64_t ptimer_get_count(ptimer_state *s)
             uint32_t period_frac = s->period_frac;
             uint64_t period = s->period;
 
-            if (!oneshot && (s->delta * period < 10000) && !use_icount) {
+            if (!oneshot && (s->delta * period < 10000) &&
+                !icount_enabled() && !qtest_enabled()) {
                 period = 10000 / s->delta;
                 period_frac = 0;
             }
@@ -303,7 +308,7 @@ void ptimer_run(ptimer_state *s, int oneshot)
 
     assert(s->in_transaction);
 
-    if (was_disabled && s->period == 0) {
+    if (was_disabled && s->period == 0 && s->period_frac == 0) {
         if (!qtest_enabled()) {
             fprintf(stderr, "Timer with period zero, disabling\n");
         }
@@ -337,6 +342,39 @@ void ptimer_set_period(ptimer_state *s, int64_t period)
     s->delta = ptimer_get_count(s);
     s->period = period;
     s->period_frac = 0;
+    if (s->enabled) {
+        s->need_reload = true;
+    }
+}
+
+/* Set counter increment interval from a Clock */
+void ptimer_set_period_from_clock(ptimer_state *s, const Clock *clk,
+                                  unsigned int divisor)
+{
+    /*
+     * The raw clock period is a 64-bit value in units of 2^-32 ns;
+     * put another way it's a 32.32 fixed-point ns value. Our internal
+     * representation of the period is 64.32 fixed point ns, so
+     * the conversion is simple.
+     */
+    uint64_t raw_period = clock_get(clk);
+    uint64_t period_frac;
+
+    assert(s->in_transaction);
+    s->delta = ptimer_get_count(s);
+    s->period = extract64(raw_period, 32, 32);
+    period_frac = extract64(raw_period, 0, 32);
+    /*
+     * divisor specifies a possible frequency divisor between the
+     * clock and the timer, so it is a multiplier on the period.
+     * We do the multiply after splitting the raw period out into
+     * period and frac to avoid having to do a 32*64->96 multiply.
+     */
+    s->period *= divisor;
+    period_frac *= divisor;
+    s->period += extract64(period_frac, 32, 32);
+    s->period_frac = (uint32_t)period_frac;
+
     if (s->enabled) {
         s->need_reload = true;
     }
@@ -402,7 +440,7 @@ const VMStateDescription vmstate_ptimer = {
     .name = "ptimer",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT8(enabled, ptimer_state),
         VMSTATE_UINT64(limit, ptimer_state),
         VMSTATE_UINT64(delta, ptimer_state),

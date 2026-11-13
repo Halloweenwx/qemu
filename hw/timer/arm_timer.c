@@ -8,14 +8,15 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/timer.h"
-#include "hw/irq.h"
-#include "hw/ptimer.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/core/ptimer.h"
+#include "hw/core/qdev-properties.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
+#include "qom/object.h"
 
 /* Common timer implementation.  */
 
@@ -162,7 +163,7 @@ static const VMStateDescription vmstate_arm_timer = {
     .name = "arm_timer",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(control, arm_timer_state),
         VMSTATE_UINT32(limit, arm_timer_state),
         VMSTATE_INT32(int_level, arm_timer_state),
@@ -175,24 +176,25 @@ static arm_timer_state *arm_timer_init(uint32_t freq)
 {
     arm_timer_state *s;
 
-    s = (arm_timer_state *)g_malloc0(sizeof(arm_timer_state));
+    s = g_new0(arm_timer_state, 1);
     s->freq = freq;
     s->control = TIMER_CTRL_IE;
 
-    s->timer = ptimer_init(arm_timer_tick, s, PTIMER_POLICY_DEFAULT);
-    vmstate_register(NULL, VMSTATE_INSTANCE_ID_ANY, &vmstate_arm_timer, s);
+    s->timer = ptimer_init(arm_timer_tick, s, PTIMER_POLICY_LEGACY);
+    vmstate_register_any(NULL, &vmstate_arm_timer, s);
     return s;
 }
 
-/* ARM PrimeCell SP804 dual timer module.
+/*
+ * ARM PrimeCell SP804 dual timer module.
  * Docs at
- * http://infocenter.arm.com/help/index.jsp?topic=/com.arm.doc.ddi0271d/index.html
-*/
+ * https://developer.arm.com/documentation/ddi0271/latest/
+ */
 
 #define TYPE_SP804 "sp804"
-#define SP804(obj) OBJECT_CHECK(SP804State, (obj), TYPE_SP804)
+OBJECT_DECLARE_SIMPLE_TYPE(SP804State, SP804)
 
-typedef struct SP804State {
+struct SP804State {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
@@ -200,7 +202,7 @@ typedef struct SP804State {
     uint32_t freq0, freq1;
     int level[2];
     qemu_irq irq;
-} SP804State;
+};
 
 static const uint8_t sp804_ids[] = {
     /* Timer ID */
@@ -280,7 +282,7 @@ static const VMStateDescription vmstate_sp804 = {
     .name = "sp804",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_INT32_ARRAY(level, SP804State, 2),
         VMSTATE_END_OF_LIST()
     }
@@ -310,15 +312,14 @@ static void sp804_realize(DeviceState *dev, Error **errp)
 /* Integrator/CP timer module.  */
 
 #define TYPE_INTEGRATOR_PIT "integrator_pit"
-#define INTEGRATOR_PIT(obj) \
-    OBJECT_CHECK(icp_pit_state, (obj), TYPE_INTEGRATOR_PIT)
+OBJECT_DECLARE_SIMPLE_TYPE(icp_pit_state, INTEGRATOR_PIT)
 
-typedef struct {
+struct icp_pit_state {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     arm_timer_state *timer[3];
-} icp_pit_state;
+};
 
 static uint64_t icp_pit_read(void *opaque, hwaddr offset,
                              unsigned size)
@@ -386,13 +387,12 @@ static const TypeInfo icp_pit_info = {
     .instance_init = icp_pit_init,
 };
 
-static Property sp804_properties[] = {
+static const Property sp804_properties[] = {
     DEFINE_PROP_UINT32("freq0", SP804State, freq0, 1000000),
     DEFINE_PROP_UINT32("freq1", SP804State, freq1, 1000000),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void sp804_class_init(ObjectClass *klass, void *data)
+static void sp804_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *k = DEVICE_CLASS(klass);
 

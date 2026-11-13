@@ -15,19 +15,28 @@
 
 #include "qemu/osdep.h"
 #include "block/block.h"
+#include "block/thread-pool.h"
+#include "qapi/error.h"
+#include "qemu/main-loop.h"
+#include "qemu/lockcnt.h"
 #include "qemu/rcu.h"
 #include "qemu/rcu_queue.h"
 #include "qemu/sockets.h"
 #include "qemu/cutils.h"
+#include "system/iothread.h"
 #include "trace.h"
 #include "aio-posix.h"
 
 /* Stop userspace polling on a handler if it isn't active for some time */
 #define POLL_IDLE_INTERVAL_NS (7 * NANOSECONDS_PER_SECOND)
 
+static void update_handler_poll_times(AioContext *ctx, int64_t block_ns,
+                                      int64_t dispatch_time);
+static void adjust_polling_time(AioContext *ctx, int64_t block_ns);
+
 bool aio_poll_disabled(AioContext *ctx)
 {
-    return atomic_read(&ctx->poll_disable_cnt);
+    return qatomic_read(&ctx->poll_disable_cnt);
 }
 
 void aio_add_ready_handler(AioHandlerList *ready_list,
@@ -36,6 +45,14 @@ void aio_add_ready_handler(AioHandlerList *ready_list,
 {
     QLIST_SAFE_REMOVE(node, node_ready); /* remove from nested parent's list */
     node->pfd.revents = revents;
+    QLIST_INSERT_HEAD(ready_list, node, node_ready);
+}
+
+static void aio_add_poll_ready_handler(AioHandlerList *ready_list,
+                                       AioHandler *node)
+{
+    QLIST_SAFE_REMOVE(node, node_ready); /* remove from nested parent's list */
+    node->poll_ready = true;
     QLIST_INSERT_HEAD(ready_list, node, node_ready);
 }
 
@@ -56,16 +73,8 @@ static AioHandler *find_aio_handler(AioContext *ctx, int fd)
 
 static bool aio_remove_fd_handler(AioContext *ctx, AioHandler *node)
 {
-    /* If the GSource is in the process of being destroyed then
-     * g_source_remove_poll() causes an assertion failure.  Skip
-     * removal in that case, because glib cleans up its state during
-     * destruction anyway.
-     */
-    if (!g_source_is_destroyed(&ctx->source)) {
-        g_source_remove_poll(&ctx->source, &node->pfd);
-    }
-
     node->pfd.revents = 0;
+    node->poll_ready = false;
 
     /* If the fd monitor has already marked it deleted, leave it alone */
     if (QLIST_IS_INSERTED(node, node_deleted)) {
@@ -88,10 +97,10 @@ static bool aio_remove_fd_handler(AioContext *ctx, AioHandler *node)
 
 void aio_set_fd_handler(AioContext *ctx,
                         int fd,
-                        bool is_external,
                         IOHandler *io_read,
                         IOHandler *io_write,
                         AioPollFn *io_poll,
+                        IOHandler *io_poll_ready,
                         void *opaque)
 {
     AioHandler *node;
@@ -99,6 +108,10 @@ void aio_set_fd_handler(AioContext *ctx,
     bool is_new = false;
     bool deleted = false;
     int poll_disable_change;
+
+    if (io_poll && !io_poll_ready) {
+        io_poll = NULL; /* polling only makes sense if there is a handler */
+    }
 
     qemu_lockcnt_lock(&ctx->list_lock);
 
@@ -126,15 +139,14 @@ void aio_set_fd_handler(AioContext *ctx,
         new_node->io_read = io_read;
         new_node->io_write = io_write;
         new_node->io_poll = io_poll;
+        new_node->io_poll_ready = io_poll_ready;
         new_node->opaque = opaque;
-        new_node->is_external = is_external;
 
         if (is_new) {
             new_node->pfd.fd = fd;
         } else {
             new_node->pfd = node->pfd;
         }
-        g_source_add_poll(&ctx->source, &new_node->pfd);
 
         new_node->pfd.events = (io_read ? G_IO_IN | G_IO_HUP | G_IO_ERR : 0);
         new_node->pfd.events |= (io_write ? G_IO_OUT | G_IO_ERR : 0);
@@ -148,8 +160,8 @@ void aio_set_fd_handler(AioContext *ctx,
      * Changing handlers is a rare event, and a little wasted polling until
      * the aio_notify below is not an issue.
      */
-    atomic_set(&ctx->poll_disable_cnt,
-               atomic_read(&ctx->poll_disable_cnt) + poll_disable_change);
+    qatomic_set(&ctx->poll_disable_cnt,
+               qatomic_read(&ctx->poll_disable_cnt) + poll_disable_change);
 
     ctx->fdmon_ops->update(ctx, node, new_node);
     if (node) {
@@ -163,9 +175,9 @@ void aio_set_fd_handler(AioContext *ctx,
     }
 }
 
-void aio_set_fd_poll(AioContext *ctx, int fd,
-                     IOHandler *io_poll_begin,
-                     IOHandler *io_poll_end)
+static void aio_set_fd_poll(AioContext *ctx, int fd,
+                            IOHandler *io_poll_begin,
+                            IOHandler *io_poll_end)
 {
     AioHandler *node = find_aio_handler(ctx, fd);
 
@@ -179,12 +191,13 @@ void aio_set_fd_poll(AioContext *ctx, int fd,
 
 void aio_set_event_notifier(AioContext *ctx,
                             EventNotifier *notifier,
-                            bool is_external,
                             EventNotifierHandler *io_read,
-                            AioPollFn *io_poll)
+                            AioPollFn *io_poll,
+                            EventNotifierHandler *io_poll_ready)
 {
-    aio_set_fd_handler(ctx, event_notifier_get_fd(notifier), is_external,
-                       (IOHandler *)io_read, NULL, io_poll, notifier);
+    aio_set_fd_handler(ctx, event_notifier_get_fd(notifier),
+                       (IOHandler *)io_read, NULL, io_poll,
+                       (IOHandler *)io_poll_ready, notifier);
 }
 
 void aio_set_event_notifier_poll(AioContext *ctx,
@@ -197,7 +210,8 @@ void aio_set_event_notifier_poll(AioContext *ctx,
                     (IOHandler *)io_poll_end);
 }
 
-static bool poll_set_started(AioContext *ctx, bool started)
+static bool poll_set_started(AioContext *ctx, AioHandlerList *ready_list,
+                             bool started)
 {
     AioHandler *node;
     bool progress = false;
@@ -227,8 +241,9 @@ static bool poll_set_started(AioContext *ctx, bool started)
         }
 
         /* Poll one last time in case ->io_poll_end() raced with the event */
-        if (!started) {
-            progress = node->io_poll(node->opaque) || progress;
+        if (!started && node->io_poll(node->opaque)) {
+            aio_add_poll_ready_handler(ready_list, node);
+            progress = true;
         }
     }
     qemu_lockcnt_dec(&ctx->list_lock);
@@ -239,41 +254,19 @@ static bool poll_set_started(AioContext *ctx, bool started)
 
 bool aio_prepare(AioContext *ctx)
 {
-    /* Poll mode cannot be used with glib's event loop, disable it. */
-    poll_set_started(ctx, false);
+    AioHandlerList ready_list = QLIST_HEAD_INITIALIZER(ready_list);
 
+    /* Poll mode cannot be used with glib's event loop, disable it. */
+    poll_set_started(ctx, &ready_list, false);
+    /* TODO what to do with this list? */
+
+    ctx->fdmon_ops->gsource_prepare(ctx);
     return false;
 }
 
 bool aio_pending(AioContext *ctx)
 {
-    AioHandler *node;
-    bool result = false;
-
-    /*
-     * We have to walk very carefully in case aio_set_fd_handler is
-     * called while we're walking.
-     */
-    qemu_lockcnt_inc(&ctx->list_lock);
-
-    QLIST_FOREACH_RCU(node, &ctx->aio_handlers, node) {
-        int revents;
-
-        revents = node->pfd.revents & node->pfd.events;
-        if (revents & (G_IO_IN | G_IO_HUP | G_IO_ERR) && node->io_read &&
-            aio_node_check(ctx, node->is_external)) {
-            result = true;
-            break;
-        }
-        if (revents & (G_IO_OUT | G_IO_ERR) && node->io_write &&
-            aio_node_check(ctx, node->is_external)) {
-            result = true;
-            break;
-        }
-    }
-    qemu_lockcnt_dec(&ctx->list_lock);
-
-    return result;
+    return ctx->fdmon_ops->gsource_check(ctx);
 }
 
 static void aio_free_deleted_handlers(AioContext *ctx)
@@ -300,10 +293,14 @@ static void aio_free_deleted_handlers(AioContext *ctx)
 static bool aio_dispatch_handler(AioContext *ctx, AioHandler *node)
 {
     bool progress = false;
+    bool poll_ready;
     int revents;
 
     revents = node->pfd.revents & node->pfd.events;
     node->pfd.revents = 0;
+
+    poll_ready = node->poll_ready;
+    node->poll_ready = false;
 
     /*
      * Start polling AioHandlers when they become ready because activity is
@@ -311,19 +308,38 @@ static bool aio_dispatch_handler(AioContext *ctx, AioHandler *node)
      * fdmon_supports_polling(), but only until the fd fires for the first
      * time.
      */
-    if (!QLIST_IS_INSERTED(node, node_deleted) &&
-        !QLIST_IS_INSERTED(node, node_poll) &&
-        node->io_poll) {
+    if (ctx->poll_max_ns && !QLIST_IS_INSERTED(node, node_deleted) &&
+        !QLIST_IS_INSERTED(node, node_poll) && node->io_poll) {
         trace_poll_add(ctx, node, node->pfd.fd, revents);
         if (ctx->poll_started && node->io_poll_begin) {
             node->io_poll_begin(node->opaque);
         }
         QLIST_INSERT_HEAD(&ctx->poll_aio_handlers, node, node_poll);
     }
+    if (!QLIST_IS_INSERTED(node, node_deleted) &&
+        poll_ready && revents == 0 && node->io_poll_ready) {
+        /*
+         * Remove temporarily to avoid infinite loops when ->io_poll_ready()
+         * calls aio_poll() before clearing the condition that made the poll
+         * handler become ready.
+         */
+        QLIST_SAFE_REMOVE(node, node_poll);
+
+        node->io_poll_ready(node->opaque);
+
+        if (!QLIST_IS_INSERTED(node, node_poll)) {
+            QLIST_INSERT_HEAD(&ctx->poll_aio_handlers, node, node_poll);
+        }
+
+        /*
+         * Return early since revents was zero. aio_notify() does not count as
+         * progress.
+         */
+        return node->opaque != &ctx->notifier;
+    }
 
     if (!QLIST_IS_INSERTED(node, node_deleted) &&
         (revents & (G_IO_IN | G_IO_HUP | G_IO_ERR)) &&
-        aio_node_check(ctx, node->is_external) &&
         node->io_read) {
         node->io_read(node->opaque);
 
@@ -334,7 +350,6 @@ static bool aio_dispatch_handler(AioContext *ctx, AioHandler *node)
     }
     if (!QLIST_IS_INSERTED(node, node_deleted) &&
         (revents & (G_IO_OUT | G_IO_ERR)) &&
-        aio_node_check(ctx, node->is_external) &&
         node->io_write) {
         node->io_write(node->opaque);
         progress = true;
@@ -343,12 +358,9 @@ static bool aio_dispatch_handler(AioContext *ctx, AioHandler *node)
     return progress;
 }
 
-/*
- * If we have a list of ready handlers then this is more efficient than
- * scanning all handlers with aio_dispatch_handlers().
- */
 static bool aio_dispatch_ready_handlers(AioContext *ctx,
-                                        AioHandlerList *ready_list)
+                                        AioHandlerList *ready_list,
+                                        int64_t dispatch_time)
 {
     bool progress = false;
     AioHandler *node;
@@ -356,19 +368,14 @@ static bool aio_dispatch_ready_handlers(AioContext *ctx,
     while ((node = QLIST_FIRST(ready_list))) {
         QLIST_REMOVE(node, node_ready);
         progress = aio_dispatch_handler(ctx, node) || progress;
-    }
 
-    return progress;
-}
-
-/* Slower than aio_dispatch_ready_handlers() but only used via glib */
-static bool aio_dispatch_handlers(AioContext *ctx)
-{
-    AioHandler *node, *tmp;
-    bool progress = false;
-
-    QLIST_FOREACH_SAFE_RCU(node, &ctx->aio_handlers, node, tmp) {
-        progress = aio_dispatch_handler(ctx, node) || progress;
+        /*
+         * Update last_dispatch_timestamp to mark this as an active
+         * handler for polling time adjustment and prevent idle removal.
+         */
+        if (ctx->poll_max_ns && QLIST_IS_INSERTED(node, node_poll)) {
+            node->last_dispatch_timestamp = dispatch_time;
+        }
     }
 
     return progress;
@@ -376,9 +383,21 @@ static bool aio_dispatch_handlers(AioContext *ctx)
 
 void aio_dispatch(AioContext *ctx)
 {
+    AioHandlerList ready_list = QLIST_HEAD_INITIALIZER(ready_list);
+
     qemu_lockcnt_inc(&ctx->list_lock);
+
     aio_bh_poll(ctx);
-    aio_dispatch_handlers(ctx);
+
+    ctx->fdmon_ops->gsource_dispatch(ctx, &ready_list);
+
+    if (ctx->fdmon_ops->dispatch) {
+        ctx->fdmon_ops->dispatch(ctx);
+    }
+
+    /* Set now to 0 as polling is disabled in the glib event loop */
+    aio_dispatch_ready_handlers(ctx, &ready_list, 0);
+
     aio_free_deleted_handlers(ctx);
     qemu_lockcnt_dec(&ctx->list_lock);
 
@@ -386,6 +405,7 @@ void aio_dispatch(AioContext *ctx)
 }
 
 static bool run_poll_handlers_once(AioContext *ctx,
+                                   AioHandlerList *ready_list,
                                    int64_t now,
                                    int64_t *timeout)
 {
@@ -394,10 +414,8 @@ static bool run_poll_handlers_once(AioContext *ctx,
     AioHandler *tmp;
 
     QLIST_FOREACH_SAFE(node, &ctx->poll_aio_handlers, node_poll, tmp) {
-        if (aio_node_check(ctx, node->is_external) &&
-            node->io_poll(node->opaque)) {
-            node->poll_idle_timeout = now + POLL_IDLE_INTERVAL_NS;
-
+        if (node->io_poll(node->opaque)) {
+            aio_add_poll_ready_handler(ready_list, node);
             /*
              * Polling was successful, exit try_poll_mode immediately
              * to adjust the next polling time.
@@ -419,7 +437,9 @@ static bool fdmon_supports_polling(AioContext *ctx)
     return ctx->fdmon_ops->need_wait != aio_poll_disabled;
 }
 
-static bool remove_idle_poll_handlers(AioContext *ctx, int64_t now)
+static bool remove_idle_poll_handlers(AioContext *ctx,
+                                      AioHandlerList *ready_list,
+                                      int64_t now)
 {
     AioHandler *node;
     AioHandler *tmp;
@@ -436,11 +456,10 @@ static bool remove_idle_poll_handlers(AioContext *ctx, int64_t now)
     }
 
     QLIST_FOREACH_SAFE(node, &ctx->poll_aio_handlers, node_poll, tmp) {
-        if (node->poll_idle_timeout == 0LL) {
-            node->poll_idle_timeout = now + POLL_IDLE_INTERVAL_NS;
-        } else if (now >= node->poll_idle_timeout) {
+        if (node->poll_ready == false &&
+            now >= node->last_dispatch_timestamp + POLL_IDLE_INTERVAL_NS) {
             trace_poll_remove(ctx, node, node->pfd.fd);
-            node->poll_idle_timeout = 0LL;
+            node->last_dispatch_timestamp = 0LL;
             QLIST_SAFE_REMOVE(node, node_poll);
             if (ctx->poll_started && node->io_poll_end) {
                 node->io_poll_end(node->opaque);
@@ -450,7 +469,10 @@ static bool remove_idle_poll_handlers(AioContext *ctx, int64_t now)
                  * Nevermind about re-adding the handler in the rare case where
                  * this causes progress.
                  */
-                progress = node->io_poll(node->opaque) || progress;
+                if (node->io_poll(node->opaque)) {
+                    aio_add_poll_ready_handler(ready_list, node);
+                    progress = true;
+                }
             }
         }
     }
@@ -460,23 +482,21 @@ static bool remove_idle_poll_handlers(AioContext *ctx, int64_t now)
 
 /* run_poll_handlers:
  * @ctx: the AioContext
+ * @ready_list: the list to place ready handlers on
  * @max_ns: maximum time to poll for, in nanoseconds
  *
  * Polls for a given time.
- *
- * Note that ctx->notify_me must be non-zero so this function can detect
- * aio_notify().
  *
  * Note that the caller must have incremented ctx->list_lock.
  *
  * Returns: true if progress was made, false otherwise
  */
-static bool run_poll_handlers(AioContext *ctx, int64_t max_ns, int64_t *timeout)
+static bool run_poll_handlers(AioContext *ctx, AioHandlerList *ready_list,
+                              int64_t max_ns, int64_t *timeout)
 {
     bool progress;
     int64_t start_time, elapsed_time;
 
-    assert(ctx->notify_me);
     assert(qemu_lockcnt_count(&ctx->list_lock) > 0);
 
     trace_run_poll_handlers_begin(ctx, max_ns, *timeout);
@@ -493,13 +513,22 @@ static bool run_poll_handlers(AioContext *ctx, int64_t max_ns, int64_t *timeout)
 
     start_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     do {
-        progress = run_poll_handlers_once(ctx, start_time, timeout);
+        progress = run_poll_handlers_once(ctx, ready_list,
+                                          start_time, timeout);
         elapsed_time = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start_time;
         max_ns = qemu_soonest_timeout(*timeout, max_ns);
         assert(!(max_ns && progress));
-    } while (elapsed_time < max_ns && !ctx->fdmon_ops->need_wait(ctx));
 
-    if (remove_idle_poll_handlers(ctx, start_time + elapsed_time)) {
+        if (ctx->fdmon_ops->need_wait(ctx)) {
+            if (fdmon_supports_polling(ctx)) {
+                *timeout = 0; /* stay in polling mode */
+            }
+            break;
+        }
+    } while (elapsed_time < max_ns);
+
+    if (remove_idle_poll_handlers(ctx, ready_list,
+                                  start_time + elapsed_time)) {
         *timeout = 0;
         progress = true;
     }
@@ -517,16 +546,16 @@ static bool run_poll_handlers(AioContext *ctx, int64_t max_ns, int64_t *timeout)
 
 /* try_poll_mode:
  * @ctx: the AioContext
+ * @ready_list: list to add handlers that need to be run
  * @timeout: timeout for blocking wait, computed by the caller and updated if
  *    polling succeeds.
- *
- * ctx->notify_me must be non-zero so this function can detect aio_notify().
  *
  * Note that the caller must have incremented ctx->list_lock.
  *
  * Returns: true if progress was made, false otherwise
  */
-static bool try_poll_mode(AioContext *ctx, int64_t *timeout)
+static bool try_poll_mode(AioContext *ctx, AioHandlerList *ready_list,
+                          int64_t *timeout)
 {
     int64_t max_ns;
 
@@ -535,42 +564,112 @@ static bool try_poll_mode(AioContext *ctx, int64_t *timeout)
     }
 
     max_ns = qemu_soonest_timeout(*timeout, ctx->poll_ns);
-    if (max_ns && !ctx->fdmon_ops->need_wait(ctx)) {
-        poll_set_started(ctx, true);
 
-        if (run_poll_handlers(ctx, max_ns, timeout)) {
+    if (max_ns && !ctx->fdmon_ops->need_wait(ctx)) {
+        /*
+         * Enable poll mode. It pairs with the poll_set_started() in
+         * aio_poll() which disables poll mode.
+         */
+        poll_set_started(ctx, ready_list, true);
+
+        if (run_poll_handlers(ctx, ready_list, max_ns, timeout)) {
             return true;
         }
     }
-
-    if (poll_set_started(ctx, false)) {
-        *timeout = 0;
-        return true;
-    }
-
     return false;
+}
+
+static void adjust_polling_time(AioContext *ctx, int64_t block_ns)
+{
+    if (block_ns > ctx->poll_ns) {
+        /* There is room to grow, poll longer */
+        int64_t old = ctx->poll_ns;
+        int64_t grow = ctx->poll_grow;
+
+        if (block_ns > ctx->poll_ns * grow) {
+            ctx->poll_ns = block_ns;
+        } else {
+            ctx->poll_ns *= grow;
+        }
+
+        if (ctx->poll_ns > ctx->poll_max_ns) {
+            ctx->poll_ns = ctx->poll_max_ns;
+        }
+
+        trace_poll_grow(ctx, old, ctx->poll_ns);
+    } else if (block_ns < (ctx->poll_ns / ctx->poll_shrink)) {
+        int64_t old = ctx->poll_ns;
+        ctx->poll_ns /= ctx->poll_shrink;
+
+        trace_poll_shrink(ctx, old, ctx->poll_ns);
+    }
+}
+
+static void update_handler_poll_times(AioContext *ctx, int64_t block_ns,
+                                      int64_t dispatch_time)
+{
+    AioHandler *node;
+    int64_t max_poll_ns = -1;
+
+    QLIST_FOREACH(node, &ctx->poll_aio_handlers, node_poll) {
+        if (node->last_dispatch_timestamp == dispatch_time) {
+            /*
+             * Active handler: had an event in this aio_poll() call.
+             * Update poll.ns using a weighted average of the current
+             * block_ns and previous poll.ns to smooth adjustments.
+             */
+            node->poll.ns = node->poll.ns
+                ? (node->poll.ns - (node->poll.ns >> ctx->poll_weight))
+                + (block_ns >> ctx->poll_weight) : block_ns;
+
+            if (node->poll.ns > ctx->poll_max_ns) {
+                node->poll.ns = 0;
+            }
+            /*
+             * Track the maximum poll.ns among active handlers to
+             * calculate the next polling time.
+             */
+            max_poll_ns = MAX(max_poll_ns, node->poll.ns);
+        } else {
+            /*
+             * Inactive handler: no event in this aio_poll() call but
+             * was active before. Increase poll.ns by block_ns. If it
+             * exceeds poll_max_ns, reset to 0 until next event.
+             */
+            if (node->poll.ns != 0) {
+                node->poll.ns += block_ns;
+                if (node->poll.ns > ctx->poll_max_ns) {
+                    node->poll.ns = 0;
+                }
+            }
+        }
+    }
+    if (max_poll_ns >= 0) {
+        adjust_polling_time(ctx, max_poll_ns);
+    }
 }
 
 bool aio_poll(AioContext *ctx, bool blocking)
 {
     AioHandlerList ready_list = QLIST_HEAD_INITIALIZER(ready_list);
-    int ret = 0;
-    bool progress;
+    bool progress = false;
+    bool use_notify_me;
     int64_t timeout;
     int64_t start = 0;
+    int64_t block_ns = 0;
+    int64_t dispatch_ns = 0;
 
-    assert(in_aio_context_home_thread(ctx));
-
-    /* aio_notify can avoid the expensive event_notifier_set if
-     * everything (file descriptors, bottom halves, timers) will
-     * be re-evaluated before the next blocking poll().  This is
-     * already true when aio_poll is called with blocking == false;
-     * if blocking == true, it is only true after poll() returns,
-     * so disable the optimization now.
+    /*
+     * There cannot be two concurrent aio_poll calls for the same AioContext (or
+     * an aio_poll concurrent with a GSource prepare/check/dispatch callback).
+     * We rely on this below to avoid slow locked accesses to ctx->notify_me.
+     *
+     * aio_poll() may only be called in the AioContext's thread. iohandler_ctx
+     * is special in that it runs in the main thread, but that thread's context
+     * is qemu_aio_context.
      */
-    if (blocking) {
-        atomic_add(&ctx->notify_me, 2);
-    }
+    assert(in_aio_context_home_thread(ctx == iohandler_get_aio_context() ?
+                                      qemu_get_aio_context() : ctx));
 
     qemu_lockcnt_inc(&ctx->list_lock);
 
@@ -579,69 +678,78 @@ bool aio_poll(AioContext *ctx, bool blocking)
     }
 
     timeout = blocking ? aio_compute_timeout(ctx) : 0;
-    progress = try_poll_mode(ctx, &timeout);
+    if (ctx->poll_max_ns != 0) {
+        progress = try_poll_mode(ctx, &ready_list, &timeout);
+    }
     assert(!(timeout && progress));
+
+    /*
+     * aio_notify can avoid the expensive event_notifier_set if
+     * everything (file descriptors, bottom halves, timers) will
+     * be re-evaluated before the next blocking poll().  This is
+     * already true when aio_poll is called with blocking == false;
+     * if blocking == true, it is only true after poll() returns,
+     * so disable the optimization now.
+     */
+    use_notify_me = timeout != 0;
+    if (use_notify_me) {
+        qatomic_set(&ctx->notify_me, qatomic_read(&ctx->notify_me) + 2);
+        /*
+         * Write ctx->notify_me before reading ctx->notified.  Pairs with
+         * smp_mb in aio_notify().
+         */
+        smp_mb();
+
+        /* Don't block if aio_notify() was called */
+        if (qatomic_read(&ctx->notified)) {
+            timeout = 0;
+        }
+    }
 
     /* If polling is allowed, non-blocking aio_poll does not need the
      * system call---a single round of run_poll_handlers_once suffices.
      */
     if (timeout || ctx->fdmon_ops->need_wait(ctx)) {
-        ret = ctx->fdmon_ops->wait(ctx, &ready_list, timeout);
-    }
-
-    if (blocking) {
-        atomic_sub(&ctx->notify_me, 2);
-        aio_notify_accept(ctx);
-    }
-
-    /* Adjust polling time */
-    if (ctx->poll_max_ns) {
-        int64_t block_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - start;
-
-        if (block_ns <= ctx->poll_ns) {
-            /* This is the sweet spot, no adjustment needed */
-        } else if (block_ns > ctx->poll_max_ns) {
-            /* We'd have to poll for too long, poll less */
-            int64_t old = ctx->poll_ns;
-
-            if (ctx->poll_shrink) {
-                ctx->poll_ns /= ctx->poll_shrink;
-            } else {
-                ctx->poll_ns = 0;
-            }
-
-            trace_poll_shrink(ctx, old, ctx->poll_ns);
-        } else if (ctx->poll_ns < ctx->poll_max_ns &&
-                   block_ns < ctx->poll_max_ns) {
-            /* There is room to grow, poll longer */
-            int64_t old = ctx->poll_ns;
-            int64_t grow = ctx->poll_grow;
-
-            if (grow == 0) {
-                grow = 2;
-            }
-
-            if (ctx->poll_ns) {
-                ctx->poll_ns *= grow;
-            } else {
-                ctx->poll_ns = 4000; /* start polling at 4 microseconds */
-            }
-
-            if (ctx->poll_ns > ctx->poll_max_ns) {
-                ctx->poll_ns = ctx->poll_max_ns;
-            }
-
-            trace_poll_grow(ctx, old, ctx->poll_ns);
+        /*
+         * Disable poll mode. poll mode should be disabled before the call
+         * of ctx->fdmon_ops->wait() so that guest's notification can wake
+         * up IO threads when some work becomes pending. It is essential to
+         * avoid hangs or unnecessary latency.
+         */
+        if (timeout && poll_set_started(ctx, &ready_list, false)) {
+            timeout = 0;
+            progress = true;
         }
+
+        ctx->fdmon_ops->wait(ctx, &ready_list, timeout);
+    }
+
+    if (use_notify_me) {
+        /* Finish the poll before clearing the flag.  */
+        qatomic_store_release(&ctx->notify_me,
+                             qatomic_read(&ctx->notify_me) - 2);
+    }
+
+    aio_notify_accept(ctx);
+
+    /* Calculate blocked time for adaptive polling */
+    if (ctx->poll_max_ns) {
+        dispatch_ns = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        block_ns = dispatch_ns - start;
+    }
+
+    if (ctx->fdmon_ops->dispatch) {
+        progress |= ctx->fdmon_ops->dispatch(ctx);
     }
 
     progress |= aio_bh_poll(ctx);
-
-    if (ret > 0) {
-        progress |= aio_dispatch_ready_handlers(ctx, &ready_list);
-    }
+    progress |= aio_dispatch_ready_handlers(ctx, &ready_list, dispatch_ns);
 
     aio_free_deleted_handlers(ctx);
+
+    if (ctx->poll_max_ns) {
+        update_handler_poll_times(ctx, block_ns, dispatch_ns);
+    }
 
     qemu_lockcnt_dec(&ctx->list_lock);
 
@@ -650,35 +758,101 @@ bool aio_poll(AioContext *ctx, bool blocking)
     return progress;
 }
 
-void aio_context_setup(AioContext *ctx)
+bool aio_context_setup(AioContext *ctx, Error **errp)
 {
     ctx->fdmon_ops = &fdmon_poll_ops;
     ctx->epollfd = -1;
+    ctx->epollfd_tag = NULL;
 
-    /* Use the fastest fd monitoring implementation if available */
-    if (fdmon_io_uring_setup(ctx)) {
-        return;
+#ifdef CONFIG_LINUX_IO_URING
+    {
+        static bool need_io_uring;
+        Error *local_err = NULL; /* ERRP_GUARD() doesn't handle error_abort */
+
+        /* io_uring takes precedence because it provides aio_add_sqe() support */
+        if (fdmon_io_uring_setup(ctx, &local_err)) {
+            /*
+             * If one AioContext gets io_uring, then all AioContexts need io_uring
+             * so that aio_add_sqe() support is available across all threads.
+             */
+            need_io_uring = true;
+            return true;
+        }
+        if (need_io_uring) {
+            error_propagate(errp, local_err);
+            return false;
+        }
+
+        /* Silently fall back on systems where io_uring is unavailable */
+        error_free(local_err);
     }
+#endif /* CONFIG_LINUX_IO_URING */
 
     fdmon_epoll_setup(ctx);
+    return true;
 }
 
 void aio_context_destroy(AioContext *ctx)
 {
+#ifdef CONFIG_LINUX_IO_URING
     fdmon_io_uring_destroy(ctx);
+#endif
+
+    qemu_lockcnt_lock(&ctx->list_lock);
     fdmon_epoll_disable(ctx);
+    qemu_lockcnt_unlock(&ctx->list_lock);
+
+    aio_free_deleted_handlers(ctx);
 }
 
 void aio_context_set_poll_params(AioContext *ctx, int64_t max_ns,
-                                 int64_t grow, int64_t shrink, Error **errp)
+                                 int64_t grow, int64_t shrink,
+                                 int64_t weight, Error **errp)
 {
+    AioHandler *node;
+
+    qemu_lockcnt_inc(&ctx->list_lock);
+    QLIST_FOREACH(node, &ctx->aio_handlers, node) {
+        node->poll.ns = 0;
+    }
+    qemu_lockcnt_dec(&ctx->list_lock);
+
     /* No thread synchronization here, it doesn't matter if an incorrect value
      * is used once.
      */
     ctx->poll_max_ns = max_ns;
+    ctx->poll_grow = (grow ? grow : IOTHREAD_POLL_GROW_DEFAULT);
+    ctx->poll_shrink = (shrink ? shrink : IOTHREAD_POLL_SHRINK_DEFAULT);
+    ctx->poll_weight = (weight ? weight : IOTHREAD_POLL_WEIGHT_DEFAULT);
     ctx->poll_ns = 0;
-    ctx->poll_grow = grow;
-    ctx->poll_shrink = shrink;
 
     aio_notify(ctx);
 }
+
+void aio_context_set_aio_params(AioContext *ctx, int64_t max_batch)
+{
+    /*
+     * No thread synchronization here, it doesn't matter if an incorrect value
+     * is used once.
+     */
+    ctx->aio_max_batch = max_batch;
+
+    aio_notify(ctx);
+}
+
+#ifdef CONFIG_LINUX_IO_URING
+void aio_add_sqe(void (*prep_sqe)(struct io_uring_sqe *sqe, void *opaque),
+                 void *opaque, CqeHandler *cqe_handler)
+{
+    AioContext *ctx = qemu_get_current_aio_context();
+    ctx->fdmon_ops->add_sqe(ctx, prep_sqe, opaque, cqe_handler);
+
+    /*
+     * Wake the main loop if it is sleeping in ppoll().  When a vCPU thread
+     * queues SQEs, the actual io_uring_submit() only happens in
+     * gsource_prepare() in the main loop thread.  Without this notify, the
+     * main loop thread's ppoll() can sleep up to 499ms before submitting.
+     */
+    aio_notify(ctx);
+}
+#endif /* CONFIG_LINUX_IO_URING */

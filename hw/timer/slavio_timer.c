@@ -24,13 +24,14 @@
 
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
-#include "hw/irq.h"
-#include "hw/ptimer.h"
-#include "hw/qdev-properties.h"
-#include "hw/sysbus.h"
+#include "hw/core/irq.h"
+#include "hw/core/ptimer.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "trace.h"
 #include "qemu/module.h"
+#include "qom/object.h"
 
 /*
  * Registers of hardware timer in sun4m.
@@ -59,22 +60,22 @@ typedef struct CPUTimerState {
 } CPUTimerState;
 
 #define TYPE_SLAVIO_TIMER "slavio_timer"
-#define SLAVIO_TIMER(obj) \
-    OBJECT_CHECK(SLAVIO_TIMERState, (obj), TYPE_SLAVIO_TIMER)
-
-typedef struct SLAVIO_TIMERState {
-    SysBusDevice parent_obj;
-
-    uint32_t num_cpus;
-    uint32_t cputimer_mode;
-    CPUTimerState cputimer[MAX_CPUS + 1];
-} SLAVIO_TIMERState;
+OBJECT_DECLARE_SIMPLE_TYPE(SLAVIO_TIMERState, SLAVIO_TIMER)
 
 typedef struct TimerContext {
     MemoryRegion iomem;
     SLAVIO_TIMERState *s;
     unsigned int timer_index; /* 0 for system, 1 ... MAX_CPUS for CPU timers */
 } TimerContext;
+
+struct SLAVIO_TIMERState {
+    SysBusDevice parent_obj;
+
+    uint32_t num_cpus;
+    uint32_t cputimer_mode;
+    CPUTimerState cputimer[MAX_CPUS + 1];
+    TimerContext timer_context[MAX_CPUS + 1];
+};
 
 #define SYS_TIMER_SIZE 0x14
 #define CPU_TIMER_SIZE 0x10
@@ -329,8 +330,12 @@ static void slavio_timer_mem_writel(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_timer_mem_ops = {
     .read = slavio_timer_mem_readl,
     .write = slavio_timer_mem_writel,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
+        .min_access_size = 4,
+        .max_access_size = 8,
+    },
+    .impl = {
         .min_access_size = 4,
         .max_access_size = 4,
     },
@@ -340,7 +345,7 @@ static const VMStateDescription vmstate_timer = {
     .name ="timer",
     .version_id = 3,
     .minimum_version_id = 3,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT64(limit, CPUTimerState),
         VMSTATE_UINT32(count, CPUTimerState),
         VMSTATE_UINT32(counthigh, CPUTimerState),
@@ -355,7 +360,7 @@ static const VMStateDescription vmstate_slavio_timer = {
     .name ="slavio_timer",
     .version_id = 3,
     .minimum_version_id = 3,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(cputimer, SLAVIO_TIMERState, MAX_CPUS + 1, 3,
                              vmstate_timer, CPUTimerState),
         VMSTATE_END_OF_LIST()
@@ -396,12 +401,12 @@ static void slavio_timer_init(Object *obj)
         uint64_t size;
         char timer_name[20];
 
-        tc = g_malloc0(sizeof(TimerContext));
+        tc = &s->timer_context[i];
         tc->s = s;
         tc->timer_index = i;
 
         s->cputimer[i].timer = ptimer_init(slavio_timer_irq, tc,
-                                           PTIMER_POLICY_DEFAULT);
+                                           PTIMER_POLICY_LEGACY);
         ptimer_transaction_begin(s->cputimer[i].timer);
         ptimer_set_period(s->cputimer[i].timer, TIMER_PERIOD);
         ptimer_transaction_commit(s->cputimer[i].timer);
@@ -416,16 +421,24 @@ static void slavio_timer_init(Object *obj)
     }
 }
 
-static Property slavio_timer_properties[] = {
+static void slavio_timer_finalize(Object *obj)
+{
+    SLAVIO_TIMERState *s = SLAVIO_TIMER(obj);
+
+    for (int i = 0; i <= MAX_CPUS; i++) {
+        ptimer_free(s->cputimer[i].timer);
+    }
+}
+
+static const Property slavio_timer_properties[] = {
     DEFINE_PROP_UINT32("num_cpus",  SLAVIO_TIMERState, num_cpus,  0),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void slavio_timer_class_init(ObjectClass *klass, void *data)
+static void slavio_timer_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = slavio_timer_reset;
+    device_class_set_legacy_reset(dc, slavio_timer_reset);
     dc->vmsd = &vmstate_slavio_timer;
     device_class_set_props(dc, slavio_timer_properties);
 }
@@ -435,6 +448,7 @@ static const TypeInfo slavio_timer_info = {
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(SLAVIO_TIMERState),
     .instance_init = slavio_timer_init,
+    .instance_finalize = slavio_timer_finalize,
     .class_init    = slavio_timer_class_init,
 };
 

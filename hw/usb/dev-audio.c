@@ -31,11 +31,12 @@
 
 #include "qemu/osdep.h"
 #include "qemu/module.h"
-#include "hw/qdev-properties.h"
-#include "hw/usb.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/usb/usb.h"
 #include "migration/vmstate.h"
 #include "desc.h"
-#include "audio/audio.h"
+#include "qemu/audio.h"
+#include "qom/object.h"
 
 static void usb_audio_reinit(USBDevice *dev, unsigned channels);
 
@@ -123,7 +124,6 @@ static const USBDescIface desc_iface[] = {
         .bNumEndpoints                 = 0,
         .bInterfaceClass               = USB_CLASS_AUDIO,
         .bInterfaceSubClass            = USB_SUBCLASS_AUDIO_CONTROL,
-        .bInterfaceProtocol            = 0x04,
         .iInterface                    = STRING_USBAUDIO_CONTROL,
         .ndesc                         = 4,
         .descs = (USBDescOther[]) {
@@ -167,7 +167,7 @@ static const USBDescIface desc_iface[] = {
                     STRING_FEATURE_UNIT,        /*  u8  iFeature */
                 }
             },{
-                /* Headphone Ouptut Terminal ID3 Descriptor */
+                /* Headphone Output Terminal ID3 Descriptor */
                 .data = (uint8_t[]) {
                     0x09,                       /*  u8  bLength */
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
@@ -281,7 +281,6 @@ static const USBDescIface desc_iface_multi[] = {
         .bNumEndpoints                 = 0,
         .bInterfaceClass               = USB_CLASS_AUDIO,
         .bInterfaceSubClass            = USB_SUBCLASS_AUDIO_CONTROL,
-        .bInterfaceProtocol            = 0x04,
         .iInterface                    = STRING_USBAUDIO_CONTROL,
         .ndesc                         = 4,
         .descs = (USBDescOther[]) {
@@ -292,7 +291,7 @@ static const USBDescIface desc_iface_multi[] = {
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
                     DST_AC_HEADER,              /*  u8  bDescriptorSubtype */
                     U16(0x0100),                /* u16  bcdADC */
-                    U16(0x38),                  /* u16  wTotalLength */
+                    U16(0x37),                  /* u16  wTotalLength */
                     0x01,                       /*  u8  bInCollection */
                     0x01,                       /*  u8  baInterfaceNr */
                 }
@@ -331,7 +330,7 @@ static const USBDescIface desc_iface_multi[] = {
                     STRING_FEATURE_UNIT,        /*  u8  iFeature */
                 }
             },{
-                /* Headphone Ouptut Terminal ID3 Descriptor */
+                /* Headphone Output Terminal ID3 Descriptor */
                 .data = (uint8_t[]) {
                     0x09,                       /*  u8  bLength */
                     USB_DT_CS_INTERFACE,        /*  u8  bDescriptorType */
@@ -633,10 +632,10 @@ static uint8_t *streambuf_get(struct streambuf *buf, size_t *len)
     return data;
 }
 
-typedef struct USBAudioState {
+struct USBAudioState {
     /* qemu interfaces */
     USBDevice dev;
-    QEMUSoundCard card;
+    AudioBackend *audio_be;
 
     /* state */
     struct {
@@ -652,10 +651,10 @@ typedef struct USBAudioState {
     uint32_t debug;
     uint32_t buffer_user, buffer;
     bool multi;
-} USBAudioState;
+};
 
 #define TYPE_USB_AUDIO "usb-audio"
-#define USB_AUDIO(obj) OBJECT_CHECK(USBAudioState, (obj), TYPE_USB_AUDIO)
+OBJECT_DECLARE_SIMPLE_TYPE(USBAudioState, USB_AUDIO)
 
 static void output_callback(void *opaque, int avail)
 {
@@ -670,7 +669,7 @@ static void output_callback(void *opaque, int avail)
             return;
         }
 
-        written = AUD_write(s->out.voice, data, len);
+        written = audio_be_write(s->audio_be, s->out.voice, data, len);
         avail -= written;
         s->out.buf.cons += written;
 
@@ -684,7 +683,7 @@ static int usb_audio_set_output_altset(USBAudioState *s, int altset)
 {
     switch (altset) {
     case ALTSET_OFF:
-        AUD_set_active_out(s->out.voice, false);
+        audio_be_set_active_out(s->audio_be, s->out.voice, false);
         break;
     case ALTSET_STEREO:
     case ALTSET_51:
@@ -693,7 +692,7 @@ static int usb_audio_set_output_altset(USBAudioState *s, int altset)
             usb_audio_reinit(USB_DEVICE(s), altset_channels[altset]);
         }
         streambuf_init(&s->out.buf, s->buffer, s->out.channels);
-        AUD_set_active_out(s->out.voice, true);
+        audio_be_set_active_out(s->audio_be, s->out.voice, true);
         break;
     default:
         return -1;
@@ -806,7 +805,7 @@ static int usb_audio_set_control(USBAudioState *s, uint8_t attrib,
             }
             fprintf(stderr, "\n");
         }
-        audio_set_volume_out(s->out.voice, &s->out.vol);
+        audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
     }
 
     return ret;
@@ -923,7 +922,7 @@ static void usb_audio_handle_data(USBDevice *dev, USBPacket *p)
     }
 }
 
-static void usb_audio_unrealize(USBDevice *dev, Error **errp)
+static void usb_audio_unrealize(USBDevice *dev)
 {
     USBAudioState *s = USB_AUDIO(dev);
 
@@ -932,8 +931,7 @@ static void usb_audio_unrealize(USBDevice *dev, Error **errp)
     }
 
     usb_audio_set_output_altset(s, ALTSET_OFF);
-    AUD_close_out(&s->card, s->out.voice);
-    AUD_remove_card(&s->card);
+    audio_be_close_out(s->audio_be, s->out.voice);
 
     streambuf_fini(&s->out.buf);
 }
@@ -943,12 +941,15 @@ static void usb_audio_realize(USBDevice *dev, Error **errp)
     USBAudioState *s = USB_AUDIO(dev);
     int i;
 
+    if (!audio_be_check(&s->audio_be, errp)) {
+        return;
+    }
+
     dev->usb_desc = s->multi ? &desc_audio_multi : &desc_audio;
 
     usb_desc_create_serial(dev);
     usb_desc_init(dev);
     s->dev.opaque = s;
-    AUD_register_card(TYPE_USB_AUDIO, &s->card);
 
     s->out.altset        = ALTSET_OFF;
     s->out.vol.mute      = false;
@@ -974,13 +975,13 @@ static void usb_audio_reinit(USBDevice *dev, unsigned channels)
     s->out.as.freq       = USBAUDIO_SAMPLE_RATE;
     s->out.as.nchannels  = s->out.channels;
     s->out.as.fmt        = AUDIO_FORMAT_S16;
-    s->out.as.endianness = 0;
+    s->out.as.big_endian = false;
     streambuf_init(&s->out.buf, s->buffer, s->out.channels);
 
-    s->out.voice = AUD_open_out(&s->card, s->out.voice, TYPE_USB_AUDIO,
+    s->out.voice = audio_be_open_out(s->audio_be, s->out.voice, TYPE_USB_AUDIO,
                                 s, output_callback, &s->out.as);
-    audio_set_volume_out(s->out.voice, &s->out.vol);
-    AUD_set_active_out(s->out.voice, 0);
+    audio_be_set_volume_out(s->audio_be, s->out.voice, &s->out.vol);
+    audio_be_set_active_out(s->audio_be, s->out.voice, 0);
 }
 
 static const VMStateDescription vmstate_usb_audio = {
@@ -988,15 +989,14 @@ static const VMStateDescription vmstate_usb_audio = {
     .unmigratable = 1,
 };
 
-static Property usb_audio_properties[] = {
-    DEFINE_AUDIO_PROPERTIES(USBAudioState, card),
+static const Property usb_audio_properties[] = {
+    DEFINE_AUDIO_PROPERTIES(USBAudioState, audio_be),
     DEFINE_PROP_UINT32("debug", USBAudioState, debug, 0),
     DEFINE_PROP_UINT32("buffer", USBAudioState, buffer_user, 0),
     DEFINE_PROP_BOOL("multi", USBAudioState, multi, false),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void usb_audio_class_init(ObjectClass *klass, void *data)
+static void usb_audio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     USBDeviceClass *k = USB_DEVICE_CLASS(klass);
@@ -1023,7 +1023,6 @@ static const TypeInfo usb_audio_info = {
 static void usb_audio_register_types(void)
 {
     type_register_static(&usb_audio_info);
-    usb_legacy_register(TYPE_USB_AUDIO, "audio", NULL);
 }
 
 type_init(usb_audio_register_types)

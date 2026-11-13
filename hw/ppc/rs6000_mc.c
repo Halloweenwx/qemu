@@ -3,10 +3,12 @@
  *
  * Copyright (c) 2017 Hervé Poussineau
  *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ *
  * This program is free software: you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation, either version 2 of the License, or
- * (at your option) version 3 or any later version.
+ * (at your option) any later version.
  *
  * This program is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -20,18 +22,17 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "hw/isa/isa.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
-#include "exec/address-spaces.h"
-#include "hw/boards.h"
+#include "system/address-spaces.h"
 #include "qapi/error.h"
 #include "trace.h"
+#include "qom/object.h"
 
 #define TYPE_RS6000MC "rs6000-mc"
-#define RS6000MC_DEVICE(obj) \
-    OBJECT_CHECK(RS6000MCState, (obj), TYPE_RS6000MC)
+OBJECT_DECLARE_SIMPLE_TYPE(RS6000MCState, RS6000MC)
 
-typedef struct RS6000MCState {
+struct RS6000MCState {
     ISADevice parent_obj;
     /* see US patent 5,684,979 for details (expired 2001-11-04) */
     uint32_t ram_size;
@@ -41,7 +42,7 @@ typedef struct RS6000MCState {
     uint32_t end_address[8];
     uint8_t port0820_index;
     PortioList portio;
-} RS6000MCState;
+};
 
 /* P0RT 0803 -- SIMM ID Register (32/8 MB) (Read Only) */
 
@@ -141,10 +142,9 @@ static const MemoryRegionPortio rs6000mc_port_list[] = {
 
 static void rs6000mc_realize(DeviceState *dev, Error **errp)
 {
-    RS6000MCState *s = RS6000MC_DEVICE(dev);
+    RS6000MCState *s = RS6000MC(dev);
     int socket = 0;
     unsigned int ram_size = s->ram_size / MiB;
-    Error *local_err = NULL;
 
     while (socket < 6) {
         if (ram_size >= 64) {
@@ -166,10 +166,9 @@ static void rs6000mc_realize(DeviceState *dev, Error **errp)
         if (s->simm_size[socket]) {
             char name[] = "simm.?";
             name[5] = socket + '0';
-            memory_region_init_ram(&s->simm[socket], OBJECT(dev), name,
-                                   s->simm_size[socket] * MiB, &local_err);
-            if (local_err) {
-                goto out;
+            if (!memory_region_init_ram(&s->simm[socket], OBJECT(dev), name,
+                                        s->simm_size[socket] * MiB, errp)) {
+                return;
             }
             memory_region_add_subregion_overlap(get_system_memory(), 0,
                                                 &s->simm[socket], socket);
@@ -177,10 +176,10 @@ static void rs6000mc_realize(DeviceState *dev, Error **errp)
     }
     if (ram_size) {
         /* unable to push all requested RAM in SIMMs */
-        error_setg(&local_err, "RAM size incompatible with this board. "
+        error_setg(errp, "RAM size incompatible with this board. "
                    "Try again with something else, like %" PRId64 " MB",
                    s->ram_size / MiB - ram_size);
-        goto out;
+        return;
     }
 
     if (s->autoconfigure) {
@@ -196,27 +195,24 @@ static void rs6000mc_realize(DeviceState *dev, Error **errp)
 
     isa_register_portio_list(ISA_DEVICE(dev), &s->portio, 0x0,
                              rs6000mc_port_list, s, "rs6000mc");
-out:
-    error_propagate(errp, local_err);
 }
 
 static const VMStateDescription vmstate_rs6000mc = {
     .name = "rs6000-mc",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT8(port0820_index, RS6000MCState),
         VMSTATE_END_OF_LIST()
     },
 };
 
-static Property rs6000mc_properties[] = {
+static const Property rs6000mc_properties[] = {
     DEFINE_PROP_UINT32("ram-size", RS6000MCState, ram_size, 0),
     DEFINE_PROP_BOOL("auto-configure", RS6000MCState, autoconfigure, true),
-    DEFINE_PROP_END_OF_LIST()
 };
 
-static void rs6000mc_class_initfn(ObjectClass *klass, void *data)
+static void rs6000mc_class_initfn(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

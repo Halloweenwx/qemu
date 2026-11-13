@@ -23,12 +23,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/irq.h"
-#include "hw/sysbus.h"
+#include "hw/core/irq.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/module.h"
-#include "sysemu/runstate.h"
+#include "system/runstate.h"
 #include "trace.h"
+#include "qom/object.h"
 
 /*
  * This is the auxio port, chip control and system control part of
@@ -39,9 +40,9 @@
  */
 
 #define TYPE_SLAVIO_MISC "slavio_misc"
-#define SLAVIO_MISC(obj) OBJECT_CHECK(MiscState, (obj), TYPE_SLAVIO_MISC)
+OBJECT_DECLARE_SIMPLE_TYPE(MiscState, SLAVIO_MISC)
 
-typedef struct MiscState {
+struct MiscState {
     SysBusDevice parent_obj;
 
     MemoryRegion cfg_iomem;
@@ -59,17 +60,19 @@ typedef struct MiscState {
     uint8_t diag, mctrl;
     uint8_t sysctrl;
     uint16_t leds;
-} MiscState;
+};
 
 #define TYPE_APC "apc"
-#define APC(obj) OBJECT_CHECK(APCState, (obj), TYPE_APC)
+typedef struct APCState APCState;
+DECLARE_INSTANCE_CHECKER(APCState, APC,
+                         TYPE_APC)
 
-typedef struct APCState {
+struct APCState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     qemu_irq cpu_halt;
-} APCState;
+};
 
 #define MISC_SIZE 1
 #define LED_SIZE 2
@@ -144,7 +147,7 @@ static uint64_t slavio_cfg_mem_readb(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_cfg_mem_ops = {
     .read = slavio_cfg_mem_readb,
     .write = slavio_cfg_mem_writeb,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 1,
@@ -174,7 +177,7 @@ static uint64_t slavio_diag_mem_readb(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_diag_mem_ops = {
     .read = slavio_diag_mem_readb,
     .write = slavio_diag_mem_writeb,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 1,
@@ -204,7 +207,7 @@ static uint64_t slavio_mdm_mem_readb(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_mdm_mem_ops = {
     .read = slavio_mdm_mem_readb,
     .write = slavio_mdm_mem_writeb,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 1,
@@ -242,7 +245,7 @@ static uint64_t slavio_aux1_mem_readb(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_aux1_mem_ops = {
     .read = slavio_aux1_mem_readb,
     .write = slavio_aux1_mem_writeb,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 1,
@@ -279,7 +282,7 @@ static uint64_t slavio_aux2_mem_readb(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_aux2_mem_ops = {
     .read = slavio_aux2_mem_readb,
     .write = slavio_aux2_mem_writeb,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 1,
@@ -307,7 +310,7 @@ static uint64_t apc_mem_readb(void *opaque, hwaddr addr,
 static const MemoryRegionOps apc_mem_ops = {
     .read = apc_mem_readb,
     .write = apc_mem_writeb,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 1,
@@ -352,7 +355,7 @@ static void slavio_sysctrl_mem_writel(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_sysctrl_mem_ops = {
     .read = slavio_sysctrl_mem_readl,
     .write = slavio_sysctrl_mem_writel,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -394,7 +397,7 @@ static void slavio_led_mem_writew(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_led_mem_ops = {
     .read = slavio_led_mem_readw,
     .write = slavio_led_mem_writew,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 2,
         .max_access_size = 2,
@@ -405,7 +408,7 @@ static const VMStateDescription vmstate_misc = {
     .name ="slavio_misc",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(dummy, MiscState),
         VMSTATE_UINT8(config, MiscState),
         VMSTATE_UINT8(aux1, MiscState),
@@ -480,11 +483,11 @@ static void slavio_misc_init(Object *obj)
     qdev_init_gpio_in(dev, slavio_set_power_fail, 1);
 }
 
-static void slavio_misc_class_init(ObjectClass *klass, void *data)
+static void slavio_misc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = slavio_misc_reset;
+    device_class_set_legacy_reset(dc, slavio_misc_reset);
     dc->vmsd = &vmstate_misc;
 }
 

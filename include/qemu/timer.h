@@ -6,6 +6,7 @@
 #include "qemu/host-utils.h"
 
 #define NANOSECONDS_PER_SECOND 1000000000LL
+#define MICROSECONDS_PER_SECOND 1000000LL
 
 /* timers */
 
@@ -166,8 +167,8 @@ bool qemu_clock_expired(QEMUClockType type);
  *
  * Determine whether a clock should be used for deadline
  * calculations. Some clocks, for instance vm_clock with
- * use_icount set, do not count in nanoseconds. Such clocks
- * are not used for deadline calculations, and are presumed
+ * icount_enabled() set, do not count in nanoseconds.
+ * Such clocks are not used for deadline calculations, and are presumed
  * to interrupt any poll using qemu_notify/aio_notify
  * etc.
  *
@@ -189,16 +190,6 @@ bool qemu_clock_use_for_deadline(QEMUClockType type);
  * Returns: time until expiry in nanoseconds or -1
  */
 int64_t qemu_clock_deadline_ns_all(QEMUClockType type, int attr_mask);
-
-/**
- * qemu_clock_get_main_loop_timerlist:
- * @type: the clock type
- *
- * Return the default timer list associated with a clock.
- *
- * Returns: the default timer list
- */
-QEMUTimerList *qemu_clock_get_main_loop_timerlist(QEMUClockType type);
 
 /**
  * qemu_clock_nofify:
@@ -225,13 +216,6 @@ void qemu_clock_notify(QEMUClockType type);
 void qemu_clock_enable(QEMUClockType type, bool enabled);
 
 /**
- * qemu_start_warp_timer:
- *
- * Starts a timer for virtual clock update
- */
-void qemu_start_warp_timer(void);
-
-/**
  * qemu_clock_run_timers:
  * @type: clock on which to operate
  *
@@ -252,6 +236,21 @@ bool qemu_clock_run_timers(QEMUClockType type);
  */
 bool qemu_clock_run_all_timers(void);
 
+/**
+ * qemu_clock_advance_virtual_time(): advance the virtual time tick
+ * @target_ns: target time in nanoseconds
+ *
+ * This function is used where the control of the flow of time has
+ * been delegated to outside the clock subsystem (be it qtest, icount
+ * or some other external source). You can ask the clock system to
+ * return @early at the first expired timer.
+ *
+ * Time can only move forward, attempts to reverse time would lead to
+ * an error.
+ *
+ * Returns: new virtual time.
+ */
+int64_t qemu_clock_advance_virtual_time(int64_t target_ns);
 
 /*
  * QEMUTimerList
@@ -317,17 +316,6 @@ bool timerlist_expired(QEMUTimerList *timer_list);
  * timer expires -1 if none
  */
 int64_t timerlist_deadline_ns(QEMUTimerList *timer_list);
-
-/**
- * timerlist_get_clock:
- * @timer_list: the timer list to operate on
- *
- * Determine the clock type associated with a timer list.
- *
- * Returns: the clock type associated with the
- * timer list.
- */
-QEMUClockType timerlist_get_clock(QEMUTimerList *timer_list);
 
 /**
  * timerlist_run_timers:
@@ -520,6 +508,8 @@ static inline void timer_init_ms(QEMUTimer *ts, QEMUClockType type,
  * with an AioContext---each of them runs its timer callbacks in its own
  * AioContext thread.
  *
+ * The timer returned must be freed using timer_free().
+ *
  * Returns: a pointer to the timer
  */
 static inline QEMUTimer *timer_new_full(QEMUTimerListGroup *timer_list_group,
@@ -527,7 +517,7 @@ static inline QEMUTimer *timer_new_full(QEMUTimerListGroup *timer_list_group,
                                         int scale, int attributes,
                                         QEMUTimerCB *cb, void *opaque)
 {
-    QEMUTimer *ts = g_malloc0(sizeof(QEMUTimer));
+    QEMUTimer *ts = g_new0(QEMUTimer, 1);
     timer_init_full(ts, timer_list_group, type, scale, attributes, cb, opaque);
     return ts;
 }
@@ -542,6 +532,8 @@ static inline QEMUTimer *timer_new_full(QEMUTimerListGroup *timer_list_group,
  * Create a new timer with the given scale,
  * and associate it with the default timer list for the clock type @type.
  * See timer_new_full for details.
+ *
+ * The timer returned must be freed using timer_free().
  *
  * Returns: a pointer to the timer
  */
@@ -561,6 +553,8 @@ static inline QEMUTimer *timer_new(QEMUClockType type, int scale,
  * associated with the clock.
  * See timer_new_full for details.
  *
+ * The timer returned must be freed using timer_free().
+ *
  * Returns: a pointer to the newly created timer
  */
 static inline QEMUTimer *timer_new_ns(QEMUClockType type, QEMUTimerCB *cb,
@@ -579,6 +573,8 @@ static inline QEMUTimer *timer_new_ns(QEMUClockType type, QEMUTimerCB *cb,
  * associated with the clock.
  * See timer_new_full for details.
  *
+ * The timer returned must be freed using timer_free().
+ *
  * Returns: a pointer to the newly created timer
  */
 static inline QEMUTimer *timer_new_us(QEMUClockType type, QEMUTimerCB *cb,
@@ -596,6 +592,8 @@ static inline QEMUTimer *timer_new_us(QEMUClockType type, QEMUTimerCB *cb,
  * Create a new timer with millisecond scale on the default timer list
  * associated with the clock.
  * See timer_new_full for details.
+ *
+ * The timer returned must be freed using timer_free().
  *
  * Returns: a pointer to the newly created timer
  */
@@ -617,17 +615,6 @@ static inline QEMUTimer *timer_new_ms(QEMUClockType type, QEMUTimerCB *cb,
 void timer_deinit(QEMUTimer *ts);
 
 /**
- * timer_free:
- * @ts: the timer
- *
- * Free a timer (it must not be on the active list)
- */
-static inline void timer_free(QEMUTimer *ts)
-{
-    g_free(ts);
-}
-
-/**
  * timer_del:
  * @ts: the timer
  *
@@ -637,6 +624,21 @@ static inline void timer_free(QEMUTimer *ts)
  * freed while this function is running.
  */
 void timer_del(QEMUTimer *ts);
+
+/**
+ * timer_free:
+ * @ts: the timer
+ *
+ * Free a timer. This will call timer_del() for you to remove
+ * the timer from the active list if it was still active.
+ */
+static inline void timer_free(QEMUTimer *ts)
+{
+    if (ts) {
+        timer_del(ts);
+        g_free(ts);
+    }
+}
 
 /**
  * timer_mod_ns:
@@ -679,7 +681,7 @@ void timer_mod(QEMUTimer *ts, int64_t expire_timer);
 /**
  * timer_mod_anticipate:
  * @ts: the timer
- * @expire_time: the expiry time in nanoseconds
+ * @expire_time: the expire time in the units associated with the timer
  *
  * Modify a timer to expire at @expire_time or the current time, whichever
  * comes earlier, taking into account the scale associated with the timer.
@@ -698,7 +700,7 @@ void timer_mod_anticipate(QEMUTimer *ts, int64_t expire_time);
  *
  * Returns: true if the timer is pending
  */
-bool timer_pending(QEMUTimer *ts);
+bool timer_pending(const QEMUTimer *ts);
 
 /**
  * timer_expired:
@@ -709,7 +711,7 @@ bool timer_pending(QEMUTimer *ts);
  *
  * Returns: true if the timer has expired
  */
-bool timer_expired(QEMUTimer *timer_head, int64_t current_time);
+bool timer_expired(const QEMUTimer *timer_head, int64_t current_time);
 
 /**
  * timer_expire_time_ns:
@@ -719,7 +721,7 @@ bool timer_expired(QEMUTimer *timer_head, int64_t current_time);
  *
  * Returns: the expiry time in nanoseconds
  */
-uint64_t timer_expire_time_ns(QEMUTimer *ts);
+uint64_t timer_expire_time_ns(const QEMUTimer *ts);
 
 /**
  * timer_get:
@@ -785,17 +787,12 @@ static inline int64_t qemu_soonest_timeout(int64_t timeout1, int64_t timeout2)
 }
 
 /**
- * initclocks:
+ * qemu_init_clocks:
+ * @notify_cb: optional call-back for timer expiry
  *
  * Initialise the clock & timer infrastructure
  */
-void init_clocks(QEMUTimerListNotifyCB *notify_cb);
-
-int64_t cpu_get_ticks(void);
-/* Caller must hold BQL */
-void cpu_enable_ticks(void);
-/* Caller must hold BQL */
-void cpu_disable_ticks(void);
+void qemu_init_clocks(QEMUTimerListNotifyCB *notify_cb);
 
 static inline int64_t get_max_clock_jump(void)
 {
@@ -818,6 +815,8 @@ static inline int64_t get_clock_realtime(void)
     gettimeofday(&tv, NULL);
     return tv.tv_sec * 1000000000LL + (tv.tv_usec * 1000);
 }
+
+extern int64_t clock_start;
 
 /* Warning: don't insert tracepoints into these functions, they are
    also used by simpletrace backend and tracepoints would cause
@@ -850,22 +849,14 @@ static inline int64_t get_clock(void)
 }
 #endif
 
-/* icount */
-int64_t cpu_get_icount_raw(void);
-int64_t cpu_get_icount(void);
-int64_t cpu_get_clock(void);
-int64_t cpu_icount_to_ns(int64_t icount);
-void    cpu_update_icount(CPUState *cpu);
-
 /*******************************************/
 /* host CPU ticks (if available) */
 
-#if defined(_ARCH_PPC)
+#if defined(_ARCH_PPC64)
 
 static inline int64_t cpu_get_host_ticks(void)
 {
     int64_t retval;
-#ifdef _ARCH_PPC64
     /* This reads timebase in one 64bit go and includes Cell workaround from:
        http://ozlabs.org/pipermail/linuxppc-dev/2006-October/027052.html
     */
@@ -873,26 +864,7 @@ static inline int64_t cpu_get_host_ticks(void)
                           "cmpwi   %0,0\n\t"
                           "beq-    $-8"
                           : "=r" (retval));
-#else
-    /* http://ozlabs.org/pipermail/linuxppc-dev/1999-October/003889.html */
-    unsigned long junk;
-    __asm__ __volatile__ ("mfspr   %1,269\n\t"  /* mftbu */
-                          "mfspr   %L0,268\n\t" /* mftb */
-                          "mfspr   %0,269\n\t"  /* mftbu */
-                          "cmpw    %0,%1\n\t"
-                          "bne     $-16"
-                          : "=r" (retval), "=r" (junk));
-#endif
     return retval;
-}
-
-#elif defined(__i386__)
-
-static inline int64_t cpu_get_host_ticks(void)
-{
-    int64_t val;
-    asm volatile ("rdtsc" : "=A" (val));
-    return val;
 }
 
 #elif defined(__x86_64__)
@@ -917,7 +889,7 @@ static inline int64_t cpu_get_host_ticks(void)
     return val;
 }
 
-#elif defined(__s390__)
+#elif defined(__s390x__)
 
 static inline int64_t cpu_get_host_ticks(void)
 {
@@ -950,36 +922,6 @@ static inline int64_t cpu_get_host_ticks (void)
 #endif
 }
 
-#elif defined(__mips__) && \
-    ((defined(__mips_isa_rev) && __mips_isa_rev >= 2) || defined(__linux__))
-/*
- * binutils wants to use rdhwr only on mips32r2
- * but as linux kernel emulate it, it's fine
- * to use it.
- *
- */
-#define MIPS_RDHWR(rd, value) {                         \
-        __asm__ __volatile__ (".set   push\n\t"         \
-                              ".set mips32r2\n\t"       \
-                              "rdhwr  %0, "rd"\n\t"     \
-                              ".set   pop"              \
-                              : "=r" (value));          \
-    }
-
-static inline int64_t cpu_get_host_ticks(void)
-{
-    /* On kernels >= 2.6.25 rdhwr <reg>, $2 and $3 are emulated */
-    uint32_t count;
-    static uint32_t cyc_per_count = 0;
-
-    if (!cyc_per_count) {
-        MIPS_RDHWR("$3", cyc_per_count);
-    }
-
-    MIPS_RDHWR("$2", count);
-    return (int64_t)(count * cyc_per_count);
-}
-
 #elif defined(__alpha__)
 
 static inline int64_t cpu_get_host_ticks(void)
@@ -993,6 +935,37 @@ static inline int64_t cpu_get_host_ticks(void)
     return cur - ofs;
 }
 
+#elif defined(__riscv) && __riscv_xlen == 32
+static inline int64_t cpu_get_host_ticks(void)
+{
+    uint32_t lo, hi, tmph;
+    do {
+        asm volatile("RDTIMEH %0\n\t"
+                     "RDTIME %1\n\t"
+                     "RDTIMEH %2"
+                     : "=r"(hi), "=r"(lo), "=r"(tmph));
+    } while (unlikely(tmph != hi));
+    return lo | (uint64_t)hi << 32;
+}
+
+#elif defined(__riscv) && __riscv_xlen > 32
+static inline int64_t cpu_get_host_ticks(void)
+{
+    int64_t val;
+
+    asm volatile("RDTIME %0" : "=r"(val));
+    return val;
+}
+
+#elif defined(__loongarch64)
+static inline int64_t cpu_get_host_ticks(void)
+{
+    uint64_t val;
+
+    asm volatile("rdtime.d %0, $zero" : "=r"(val));
+    return val;
+}
+
 #else
 /* The host CPU doesn't have an easily accessible cycle counter.
    Just return a monotonically increasing value.  This will be
@@ -1001,15 +974,6 @@ static inline int64_t cpu_get_host_ticks(void)
 {
     return get_clock();
 }
-#endif
-
-#ifdef CONFIG_PROFILER
-static inline int64_t profile_getclock(void)
-{
-    return get_clock();
-}
-
-extern int64_t dev_time;
 #endif
 
 #endif

@@ -13,9 +13,8 @@
 
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
-#include "hw/boards.h"
-#include "sysemu/sysemu.h"
-#include "exec/address-spaces.h"
+#include "hw/core/boards.h"
+#include "system/address-spaces.h"
 #include "hw/core/cpu.h"
 
 static void machine_none_init(MachineState *mch)
@@ -50,6 +49,10 @@ static void machine_none_machine_init(MachineClass *mc)
     mc->max_cpus = 1;
     mc->default_ram_size = 0;
     mc->default_ram_id = "ram";
+    mc->no_serial = 1;
+    mc->no_parallel = 1;
+    mc->no_floppy = 1;
+    mc->no_cdrom = 1;
 }
 
 DEFINE_MACHINE("none", machine_none_machine_init)

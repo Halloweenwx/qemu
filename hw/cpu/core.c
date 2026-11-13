@@ -8,12 +8,12 @@
  */
 
 #include "qemu/osdep.h"
+
+#include "hw/core/boards.h"
 #include "hw/cpu/core.h"
-#include "qapi/visitor.h"
-#include "qemu/module.h"
 #include "qapi/error.h"
-#include "sysemu/cpus.h"
-#include "hw/boards.h"
+#include "qapi/qapi-builtin-type-infos.h"
+#include "qapi/visitor.h"
 
 static void core_prop_get_core_id(Object *obj, Visitor *v, const char *name,
                                   void *opaque, Error **errp)
@@ -28,12 +28,9 @@ static void core_prop_set_core_id(Object *obj, Visitor *v, const char *name,
                                   void *opaque, Error **errp)
 {
     CPUCore *core = CPU_CORE(obj);
-    Error *local_err = NULL;
     int64_t value;
 
-    visit_type_int(v, name, &value, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_int(v, name, &value, errp)) {
         return;
     }
 
@@ -58,12 +55,9 @@ static void core_prop_set_nr_threads(Object *obj, Visitor *v, const char *name,
                                      void *opaque, Error **errp)
 {
     CPUCore *core = CPU_CORE(obj);
-    Error *local_err = NULL;
     int64_t value;
 
-    visit_type_int(v, name, &value, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_int(v, name, &value, errp)) {
         return;
     }
 
@@ -72,21 +66,29 @@ static void core_prop_set_nr_threads(Object *obj, Visitor *v, const char *name,
 
 static void cpu_core_instance_init(Object *obj)
 {
-    MachineState *ms = MACHINE(qdev_get_machine());
     CPUCore *core = CPU_CORE(obj);
 
-    object_property_add(obj, "core-id", "int", core_prop_get_core_id,
-                        core_prop_set_core_id, NULL, NULL, NULL);
-    object_property_add(obj, "nr-threads", "int", core_prop_get_nr_threads,
-                        core_prop_set_nr_threads, NULL, NULL, NULL);
-    core->nr_threads = ms->smp.threads;
+    /*
+     * Only '-device something-cpu-core,help' can get us there before
+     * the machine has been created. We don't care to set nr_threads
+     * in this case since it isn't used afterwards.
+     */
+    if (current_machine) {
+        core->nr_threads = current_machine->smp.threads;
+    }
 }
 
-static void cpu_core_class_init(ObjectClass *oc, void *data)
+static void cpu_core_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     set_bit(DEVICE_CATEGORY_CPU, dc->categories);
+    object_class_property_add(oc, "core-id", "int", &int_type_info,
+                              core_prop_get_core_id,
+                              core_prop_set_core_id, NULL, NULL);
+    object_class_property_add(oc, "nr-threads", "int", &int_type_info,
+                              core_prop_get_nr_threads,
+                              core_prop_set_nr_threads, NULL, NULL);
 }
 
 static const TypeInfo cpu_core_type_info = {

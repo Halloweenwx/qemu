@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -18,11 +18,12 @@
  */
 
 #include "qemu/osdep.h"
-#include "sysemu/hw_accel.h"
-#include "sysemu/kvm.h"
+#include "system/hw_accel.h"
+#include "system/kvm.h"
 #include "kvm_ppc.h"
-#include "sysemu/cpus.h"
+#include "system/cpus.h"
 #include "qemu/error-report.h"
+#include "qapi/qapi-builtin-type-infos.h"
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "cpu-models.h"
@@ -100,6 +101,13 @@ static const CompatInfo compat_table[] = {
         .pcr_level = PCR_COMPAT_3_10,
         .max_vthreads = 8,
     },
+    { /* POWER11, ISA3.10 */
+        .name = "power11",
+        .pvr = CPU_POWERPC_LOGICAL_3_10_P11,
+        .pcr = PCR_COMPAT_3_10,
+        .pcr_level = PCR_COMPAT_3_10,
+        .max_vthreads = 8,
+    },
 };
 
 static const CompatInfo *compat_by_pvr(uint32_t pvr)
@@ -132,6 +140,10 @@ static bool pcc_compat(PowerPCCPUClass *pcc, uint32_t compat_pvr,
         /* Outside specified range */
         return false;
     }
+    if (compat->pvr > pcc->spapr_logical_pvr) {
+        /* Older CPU cannot support a newer processor's compat mode */
+        return false;
+    }
     if (!(pcc->pcr_supported & compat->pcr_level)) {
         /* Not supported by this CPU */
         return false;
@@ -158,7 +170,7 @@ bool ppc_type_check_compat(const char *cputype, uint32_t compat_pvr,
     return pcc_compat(pcc, compat_pvr, min_compat_pvr, max_compat_pvr);
 }
 
-void ppc_set_compat(PowerPCCPU *cpu, uint32_t compat_pvr, Error **errp)
+int ppc_set_compat(PowerPCCPU *cpu, uint32_t compat_pvr, Error **errp)
 {
     const CompatInfo *compat = compat_by_pvr(compat_pvr);
     CPUPPCState *env = &cpu->env;
@@ -169,11 +181,11 @@ void ppc_set_compat(PowerPCCPU *cpu, uint32_t compat_pvr, Error **errp)
         pcr = 0;
     } else if (!compat) {
         error_setg(errp, "Unknown compatibility PVR 0x%08"PRIx32, compat_pvr);
-        return;
+        return -EINVAL;
     } else if (!ppc_check_compat(cpu, compat_pvr, 0, 0)) {
         error_setg(errp, "Compatibility PVR 0x%08"PRIx32" not valid for CPU",
                    compat_pvr);
-        return;
+        return -EINVAL;
     } else {
         pcr = compat->pcr;
     }
@@ -185,17 +197,19 @@ void ppc_set_compat(PowerPCCPU *cpu, uint32_t compat_pvr, Error **errp)
         if (ret < 0) {
             error_setg_errno(errp, -ret,
                              "Unable to set CPU compatibility mode in KVM");
-            return;
+            return ret;
         }
     }
 
     cpu->compat_pvr = compat_pvr;
     env->spr[SPR_PCR] = pcr & pcc->pcr_mask;
+    return 0;
 }
 
 typedef struct {
     uint32_t compat_pvr;
-    Error *err;
+    Error **errp;
+    int ret;
 } SetCompatState;
 
 static void do_set_compat(CPUState *cs, run_on_cpu_data arg)
@@ -203,26 +217,47 @@ static void do_set_compat(CPUState *cs, run_on_cpu_data arg)
     PowerPCCPU *cpu = POWERPC_CPU(cs);
     SetCompatState *s = arg.host_ptr;
 
-    ppc_set_compat(cpu, s->compat_pvr, &s->err);
+    s->ret = ppc_set_compat(cpu, s->compat_pvr, s->errp);
 }
 
-void ppc_set_compat_all(uint32_t compat_pvr, Error **errp)
+int ppc_set_compat_all(uint32_t compat_pvr, Error **errp)
 {
     CPUState *cs;
 
     CPU_FOREACH(cs) {
         SetCompatState s = {
             .compat_pvr = compat_pvr,
-            .err = NULL,
+            .errp = errp,
+            .ret = 0,
         };
 
         run_on_cpu(cs, do_set_compat, RUN_ON_CPU_HOST_PTR(&s));
 
-        if (s.err) {
-            error_propagate(errp, s.err);
-            return;
+        if (s.ret < 0) {
+            return s.ret;
         }
     }
+
+    return 0;
+}
+
+/* To be used when the machine is not running */
+int ppc_init_compat_all(uint32_t compat_pvr, Error **errp)
+{
+    CPUState *cs;
+
+    CPU_FOREACH(cs) {
+        PowerPCCPU *cpu = POWERPC_CPU(cs);
+        int ret;
+
+        ret = ppc_set_compat(cpu, compat_pvr, errp);
+
+        if (ret < 0) {
+            return ret;
+        }
+    }
+
+    return 0;
 }
 
 int ppc_compat_max_vthreads(PowerPCCPU *cpu)
@@ -260,13 +295,10 @@ static void ppc_compat_prop_get(Object *obj, Visitor *v, const char *name,
 static void ppc_compat_prop_set(Object *obj, Visitor *v, const char *name,
                                 void *opaque, Error **errp)
 {
-    Error *local_err = NULL;
     char *value;
     uint32_t compat_pvr;
 
-    visit_type_str(v, name, &value, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (!visit_type_str(v, name, &value, errp)) {
         return;
     }
 
@@ -298,20 +330,15 @@ out:
 }
 
 void ppc_compat_add_property(Object *obj, const char *name,
-                             uint32_t *compat_pvr, const char *basedesc,
-                             Error **errp)
+                             uint32_t *compat_pvr, const char *basedesc)
 {
-    Error *local_err = NULL;
     gchar *namesv[ARRAY_SIZE(compat_table) + 1];
     gchar *names, *desc;
     int i;
 
-    object_property_add(obj, name, "string",
+    object_property_add(obj, name, "string", &str_type_info,
                         ppc_compat_prop_get, ppc_compat_prop_set, NULL,
-                        compat_pvr, &local_err);
-    if (local_err) {
-        goto out;
-    }
+                        compat_pvr);
 
     for (i = 0; i < ARRAY_SIZE(compat_table); i++) {
         /*
@@ -324,11 +351,8 @@ void ppc_compat_add_property(Object *obj, const char *name,
 
     names = g_strjoinv(", ", namesv);
     desc = g_strdup_printf("%s. Valid values are %s.", basedesc, names);
-    object_property_set_description(obj, name, desc, &local_err);
+    object_property_set_description(obj, name, desc);
 
     g_free(names);
     g_free(desc);
-
-out:
-    error_propagate(errp, local_err);
 }

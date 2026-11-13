@@ -7,17 +7,20 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu/module.h"
-#include "cpu.h"
-#include "hw/hw.h"
-#include "hw/irq.h"
-#include "hw/sysbus.h"
+#include "qemu/log.h"
+#include "target/m68k/cpu.h"
+#include "hw/core/irq.h"
+#include "hw/core/sysbus.h"
 #include "hw/m68k/mcf.h"
+#include "hw/core/qdev-properties.h"
+#include "qom/object.h"
 
 #define TYPE_MCF_INTC "mcf-intc"
-#define MCF_INTC(obj) OBJECT_CHECK(mcf_intc_state, (obj), TYPE_MCF_INTC)
+OBJECT_DECLARE_SIMPLE_TYPE(mcf_intc_state, MCF_INTC)
 
-typedef struct {
+struct mcf_intc_state {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
@@ -28,7 +31,7 @@ typedef struct {
     uint8_t icr[64];
     M68kCPU *cpu;
     int active_vector;
-} mcf_intc_state;
+};
 
 static void mcf_intc_update(mcf_intc_state *s)
 {
@@ -80,7 +83,9 @@ static uint64_t mcf_intc_read(void *opaque, hwaddr addr,
     case 0xe1: case 0xe2: case 0xe3: case 0xe4:
     case 0xe5: case 0xe6: case 0xe7:
         /* LnIACK */
-        hw_error("mcf_intc_read: LnIACK not implemented\n");
+        qemu_log_mask(LOG_UNIMP, "%s: LnIACK not implemented (offset 0x%02x)\n",
+                      __func__, offset);
+        /* fallthru */
     default:
         return 0;
     }
@@ -127,8 +132,9 @@ static void mcf_intc_write(void *opaque, hwaddr addr,
         }
         break;
     default:
-        hw_error("mcf_intc_write: Bad write offset %d\n", offset);
-        break;
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad offset 0x%02x\n",
+                      __func__, offset);
+        return;
     }
     mcf_intc_update(s);
 }
@@ -160,7 +166,7 @@ static void mcf_intc_reset(DeviceState *dev)
 static const MemoryRegionOps mcf_intc_ops = {
     .read = mcf_intc_read,
     .write = mcf_intc_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
 };
 
 static void mcf_intc_instance_init(Object *obj)
@@ -168,14 +174,22 @@ static void mcf_intc_instance_init(Object *obj)
     mcf_intc_state *s = MCF_INTC(obj);
 
     memory_region_init_io(&s->iomem, obj, &mcf_intc_ops, s, "mcf", 0x100);
+    sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->iomem);
+    qdev_init_gpio_in(DEVICE(s), mcf_intc_set_irq, 64);
 }
 
-static void mcf_intc_class_init(ObjectClass *oc, void *data)
+static const Property mcf_intc_properties[] = {
+    DEFINE_PROP_LINK("m68k-cpu", mcf_intc_state, cpu,
+                     TYPE_M68K_CPU, M68kCPU *),
+};
+
+static void mcf_intc_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
+    device_class_set_props(dc, mcf_intc_properties);
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
-    dc->reset = mcf_intc_reset;
+    device_class_set_legacy_reset(dc, mcf_intc_reset);
 }
 
 static const TypeInfo mcf_intc_gate_info = {
@@ -193,20 +207,15 @@ static void mcf_intc_register_types(void)
 
 type_init(mcf_intc_register_types)
 
-qemu_irq *mcf_intc_init(MemoryRegion *sysmem,
-                        hwaddr base,
-                        M68kCPU *cpu)
+DeviceState *mcf_intc_init(MemoryRegion *sysmem, hwaddr base, M68kCPU *cpu)
 {
     DeviceState  *dev;
-    mcf_intc_state *s;
 
-    dev = qdev_create(NULL, TYPE_MCF_INTC);
-    qdev_init_nofail(dev);
-
-    s = MCF_INTC(dev);
-    s->cpu = cpu;
-
-    memory_region_add_subregion(sysmem, base, &s->iomem);
-
-    return qemu_allocate_irqs(mcf_intc_set_irq, s, 64);
+    dev = qdev_new(TYPE_MCF_INTC);
+    object_property_set_link(OBJECT(dev), "m68k-cpu",
+                             OBJECT(cpu), &error_abort);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
+    memory_region_add_subregion(sysmem, base,
+                                sysbus_mmio_get_region(SYS_BUS_DEVICE(dev), 0));
+    return dev;
 }

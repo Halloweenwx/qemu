@@ -27,21 +27,22 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "cpu.h"
-#include "sysemu/device_tree.h"
-#include "sysemu/runstate.h"
+#include "system/device_tree.h"
+#include "system/physmem.h"
+#include "system/runstate.h"
 
 #include "hw/ppc/fdt.h"
 #include "hw/ppc/spapr.h"
 #include "hw/ppc/spapr_vio.h"
 #include "hw/pci/pci.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/pci-host/spapr.h"
 #include "hw/ppc/spapr_drc.h"
 #include "qemu/help_option.h"
 #include "qemu/bcd.h"
 #include "qemu/main-loop.h"
 #include "hw/ppc/spapr_ovec.h"
+#include "exec/cpu-common.h"
 #include <libfdt.h>
 #include "migration/blocker.h"
 
@@ -243,6 +244,14 @@ struct rtas_event_log_v6_mc {
 #define RTAS_LOG_V6_MC_TLB_PARITY                        1
 #define RTAS_LOG_V6_MC_TLB_MULTIHIT                      2
 #define RTAS_LOG_V6_MC_TLB_INDETERMINATE                 3
+/*
+ * Per PAPR,
+ * For UE error type, set bit 1 of sub_err_type to indicate effective addr is
+ * provided. For other error types (SLB/ERAT/TLB), set bit 0 to indicate
+ * same.
+ */
+#define RTAS_LOG_V6_MC_UE_EA_ADDR_PROVIDED               0x40
+#define RTAS_LOG_V6_MC_EA_ADDR_PROVIDED                  0x80
     uint8_t reserved_1[6];
     uint64_t effective_address;
     uint64_t logical_address;
@@ -452,7 +461,7 @@ static void rtas_event_log_queue(SpaprMachineState *spapr,
 static SpaprEventLogEntry *rtas_event_log_dequeue(SpaprMachineState *spapr,
                                                   uint32_t event_mask)
 {
-    SpaprEventLogEntry *entry = NULL;
+    SpaprEventLogEntry *entry;
 
     QTAILQ_FOREACH(entry, &spapr->pending_events, next) {
         const SpaprEventSource *source =
@@ -472,10 +481,9 @@ static SpaprEventLogEntry *rtas_event_log_dequeue(SpaprMachineState *spapr,
     return entry;
 }
 
-static bool rtas_event_log_contains(uint32_t event_mask)
+static bool rtas_event_log_contains(SpaprMachineState *spapr, uint32_t event_mask)
 {
-    SpaprMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
-    SpaprEventLogEntry *entry = NULL;
+    SpaprEventLogEntry *entry;
 
     QTAILQ_FOREACH(entry, &spapr->pending_events, next) {
         const SpaprEventSource *source =
@@ -501,10 +509,10 @@ static void spapr_init_v6hdr(struct rtas_event_log_v6 *v6hdr)
     v6hdr->company = cpu_to_be32(RTAS_LOG_V6_COMPANY_IBM);
 }
 
-static void spapr_init_maina(struct rtas_event_log_v6_maina *maina,
+static void spapr_init_maina(SpaprMachineState *spapr,
+                             struct rtas_event_log_v6_maina *maina,
                              int section_count)
 {
-    SpaprMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
     struct tm tm;
     int year;
 
@@ -552,7 +560,7 @@ static void spapr_powerdown_req(Notifier *n, void *opaque)
     entry->extended_length = sizeof(*new_epow);
 
     spapr_init_v6hdr(v6hdr);
-    spapr_init_maina(maina, 3 /* Main-A, Main-B and EPOW */);
+    spapr_init_maina(spapr, maina, 3 /* Main-A, Main-B and EPOW */);
 
     mainb->hdr.section_id = cpu_to_be16(RTAS_LOG_V6_SECTION_ID_MAINB);
     mainb->hdr.section_length = cpu_to_be16(sizeof(*mainb));
@@ -588,7 +596,7 @@ static void spapr_hotplug_req_event(uint8_t hp_id, uint8_t hp_action,
     struct rtas_event_log_v6_hp *hp;
 
     entry = g_new(SpaprEventLogEntry, 1);
-    new_hp = g_malloc0(sizeof(struct hp_extended_log));
+    new_hp = g_new0(struct hp_extended_log, 1);
     entry->extended_log = new_hp;
 
     v6hdr = &new_hp->v6hdr;
@@ -605,7 +613,7 @@ static void spapr_hotplug_req_event(uint8_t hp_id, uint8_t hp_action,
     entry->extended_length = sizeof(*new_hp);
 
     spapr_init_v6hdr(v6hdr);
-    spapr_init_maina(maina, 3 /* Main-A, Main-B, HP */);
+    spapr_init_maina(spapr, maina, 3 /* Main-A, Main-B, HP */);
 
     mainb->hdr.section_id = cpu_to_be16(RTAS_LOG_V6_SECTION_ID_MAINB);
     mainb->hdr.section_length = cpu_to_be16(sizeof(*mainb));
@@ -639,8 +647,7 @@ static void spapr_hotplug_req_event(uint8_t hp_id, uint8_t hp_action,
         /* we shouldn't be signaling hotplug events for resources
          * that don't support them
          */
-        g_assert(false);
-        return;
+        g_assert_not_reached();
     }
 
     if (hp_id == RTAS_LOG_V6_HP_ID_DRC_COUNT) {
@@ -651,7 +658,7 @@ static void spapr_hotplug_req_event(uint8_t hp_id, uint8_t hp_action,
         /* we should not be using count_indexed value unless the guest
          * supports dedicated hotplug event source
          */
-        g_assert(spapr_ovec_test(spapr->ov5_cas, OV5_HP_EVT));
+        g_assert(spapr_memory_hot_unplug_supported(spapr));
         hp->drc_id.count_indexed.count =
             cpu_to_be32(drc_id->count_indexed.count);
         hp->drc_id.count_indexed.index =
@@ -726,6 +733,22 @@ void spapr_hotplug_req_remove_by_count_indexed(SpaprDrcType drc_type,
                             RTAS_LOG_V6_HP_ACTION_REMOVE, drc_type, &drc_id);
 }
 
+static void spapr_mc_set_ea_provided_flag(struct mc_extended_log *ext_elog)
+{
+    switch (ext_elog->mc.error_type) {
+    case RTAS_LOG_V6_MC_TYPE_UE:
+        ext_elog->mc.sub_err_type |= RTAS_LOG_V6_MC_UE_EA_ADDR_PROVIDED;
+        break;
+    case RTAS_LOG_V6_MC_TYPE_SLB:
+    case RTAS_LOG_V6_MC_TYPE_ERAT:
+    case RTAS_LOG_V6_MC_TYPE_TLB:
+        ext_elog->mc.sub_err_type |= RTAS_LOG_V6_MC_EA_ADDR_PROVIDED;
+        break;
+    default:
+        break;
+    }
+}
+
 static uint32_t spapr_mce_get_elog_type(PowerPCCPU *cpu, bool recovered,
                                         struct mc_extended_log *ext_elog)
 {
@@ -751,6 +774,7 @@ static uint32_t spapr_mce_get_elog_type(PowerPCCPU *cpu, bool recovered,
             ext_elog->mc.sub_err_type = mc_derror_table[i].error_subtype;
             if (mc_derror_table[i].dar_valid) {
                 ext_elog->mc.effective_address = cpu_to_be64(env->spr[SPR_DAR]);
+                spapr_mc_set_ea_provided_flag(ext_elog);
             }
 
             summary |= mc_derror_table[i].initiator
@@ -769,6 +793,7 @@ static uint32_t spapr_mce_get_elog_type(PowerPCCPU *cpu, bool recovered,
             ext_elog->mc.sub_err_type = mc_ierror_table[i].error_subtype;
             if (mc_ierror_table[i].nip_valid) {
                 ext_elog->mc.effective_address = cpu_to_be64(env->nip);
+                spapr_mc_set_ea_provided_flag(ext_elog);
             }
 
             summary |= mc_ierror_table[i].initiator
@@ -782,31 +807,15 @@ static uint32_t spapr_mce_get_elog_type(PowerPCCPU *cpu, bool recovered,
     return summary;
 }
 
-static void spapr_mce_dispatch_elog(PowerPCCPU *cpu, bool recovered)
+static void spapr_mce_dispatch_elog(SpaprMachineState *spapr, PowerPCCPU *cpu,
+                                    bool recovered)
 {
-    SpaprMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
     CPUState *cs = CPU(cpu);
-    uint64_t rtas_addr;
     CPUPPCState *env = &cpu->env;
-    PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cpu);
-    target_ulong msr = 0;
+    uint64_t rtas_addr;
     struct rtas_error_log log;
     struct mc_extended_log *ext_elog;
     uint32_t summary;
-
-    /*
-     * Properly set bits in MSR before we invoke the handler.
-     * SRR0/1, DAR and DSISR are properly set by KVM
-     */
-    if (!(*pcc->interrupts_big_endian)(cpu)) {
-        msr |= (1ULL << MSR_LE);
-    }
-
-    if (env->msr & (1ULL << MSR_SF)) {
-        msr |= (1ULL << MSR_SF);
-    }
-
-    msr |= (1ULL << MSR_ME);
 
     ext_elog = g_malloc0(sizeof(*ext_elog));
     summary = spapr_mce_get_elog_type(cpu, recovered, ext_elog);
@@ -823,25 +832,40 @@ static void spapr_mce_dispatch_elog(PowerPCCPU *cpu, bool recovered)
     /* get rtas addr from fdt */
     rtas_addr = spapr_get_rtas_addr();
     if (!rtas_addr) {
-        /* Unable to fetch rtas_addr. Hence reset the guest */
-        ppc_cpu_do_system_reset(cs);
+        if (!recovered) {
+            error_report(
+"FWNMI: Unable to deliver machine check to guest: rtas_addr not found.");
+            qemu_system_guest_panicked(NULL);
+        } else {
+            warn_report(
+"FWNMI: Unable to deliver machine check to guest: rtas_addr not found. "
+"Machine check recovered.");
+        }
         g_free(ext_elog);
         return;
     }
 
+    /*
+     * By taking the interlock, we assume that the MCE will be
+     * delivered to the guest. CAUTION: don't add anything that could
+     * prevent the MCE to be delivered after this line, otherwise the
+     * guest won't be able to release the interlock and ultimately
+     * hang/crash?
+     */
+    spapr->fwnmi_machine_check_interlock = cpu->vcpu_id;
+
     stq_be_phys(&address_space_memory, rtas_addr + RTAS_ERROR_LOG_OFFSET,
                 env->gpr[3]);
-    cpu_physical_memory_write(rtas_addr + RTAS_ERROR_LOG_OFFSET +
+    physical_memory_write(rtas_addr + RTAS_ERROR_LOG_OFFSET +
                               sizeof(env->gpr[3]), &log, sizeof(log));
-    cpu_physical_memory_write(rtas_addr + RTAS_ERROR_LOG_OFFSET +
+    physical_memory_write(rtas_addr + RTAS_ERROR_LOG_OFFSET +
                               sizeof(env->gpr[3]) + sizeof(log), ext_elog,
                               sizeof(*ext_elog));
+    g_free(ext_elog);
 
     env->gpr[3] = rtas_addr + RTAS_ERROR_LOG_OFFSET;
-    env->msr = msr;
-    env->nip = spapr->guest_machine_check_addr;
 
-    g_free(ext_elog);
+    ppc_cpu_do_fwnmi_machine_check(cs, spapr->fwnmi_machine_check_addr);
 }
 
 void spapr_mce_req_event(PowerPCCPU *cpu, bool recovered)
@@ -849,50 +873,64 @@ void spapr_mce_req_event(PowerPCCPU *cpu, bool recovered)
     SpaprMachineState *spapr = SPAPR_MACHINE(qdev_get_machine());
     CPUState *cs = CPU(cpu);
     int ret;
-    Error *local_err = NULL;
 
-    if (spapr->guest_machine_check_addr == -1) {
-        /*
-         * This implies that we have hit a machine check either when the
-         * guest has not registered FWNMI (i.e., "ibm,nmi-register" not
-         * called) or between system reset and "ibm,nmi-register".
-         * Fall back to the old machine check behavior in such cases.
-         */
+    if (spapr->fwnmi_machine_check_addr == -1) {
+        /* Non-FWNMI case, deliver it like an architected CPU interrupt. */
         cs->exception_index = POWERPC_EXCP_MCHECK;
         ppc_cpu_do_interrupt(cs);
         return;
     }
 
-    while (spapr->mc_status != -1) {
+    /* Wait for FWNMI interlock. */
+    while (spapr->fwnmi_machine_check_interlock != -1) {
         /*
          * Check whether the same CPU got machine check error
          * while still handling the mc error (i.e., before
          * that CPU called "ibm,nmi-interlock")
          */
-        if (spapr->mc_status == cpu->vcpu_id) {
-            qemu_system_guest_panicked(NULL);
+        if (spapr->fwnmi_machine_check_interlock == cpu->vcpu_id) {
+            if (!recovered) {
+                error_report(
+"FWNMI: Unable to deliver machine check to guest: nested machine check.");
+                qemu_system_guest_panicked(NULL);
+            } else {
+                warn_report(
+"FWNMI: Unable to deliver machine check to guest: nested machine check. "
+"Machine check recovered.");
+            }
             return;
         }
-        qemu_cond_wait_iothread(&spapr->mc_delivery_cond);
-        /* Meanwhile if the system is reset, then just return */
-        if (spapr->guest_machine_check_addr == -1) {
+        qemu_cond_wait_bql(&spapr->fwnmi_machine_check_interlock_cond);
+        if (spapr->fwnmi_machine_check_addr == -1) {
+            /*
+             * If the machine was reset while waiting for the interlock,
+             * abort the delivery. The machine check applies to a context
+             * that no longer exists, so it wouldn't make sense to deliver
+             * it now.
+             */
             return;
         }
     }
 
-    ret = migrate_add_blocker(spapr->fwnmi_migration_blocker, &local_err);
+    /*
+     * Try to block migration while FWNMI is being handled, so the
+     * machine check handler runs where the information passed to it
+     * actually makes sense.  This shouldn't actually block migration,
+     * only delay it slightly, assuming migration is retried.  If the
+     * attempt to block fails, carry on.  Unfortunately, it always
+     * fails when running with -only-migrate.  A proper interface to
+     * delay migration completion for a bit could avoid that.
+     */
+    error_setg(&spapr->fwnmi_migration_blocker,
+        "A machine check is being handled during migration. The handler"
+        "may run and log hardware error on the destination");
+
+    ret = migrate_add_blocker(&spapr->fwnmi_migration_blocker, NULL);
     if (ret == -EBUSY) {
-        /*
-         * We don't want to abort so we let the migration to continue.
-         * In a rare case, the machine check handler will run on the target.
-         * Though this is not preferable, it is better than aborting
-         * the migration or killing the VM.
-         */
         warn_report("Received a fwnmi while migration was in progress");
     }
 
-    spapr->mc_status = cpu->vcpu_id;
-    spapr_mce_dispatch_elog(cpu, recovered);
+    spapr_mce_dispatch_elog(spapr, cpu, recovered);
 }
 
 static void check_exception(PowerPCCPU *cpu, SpaprMachineState *spapr,
@@ -901,7 +939,6 @@ static void check_exception(PowerPCCPU *cpu, SpaprMachineState *spapr,
                             uint32_t nret, target_ulong rets)
 {
     uint32_t mask, buf, len, event_len;
-    uint64_t xinfo;
     SpaprEventLogEntry *event;
     struct rtas_error_log header;
     int i;
@@ -911,13 +948,9 @@ static void check_exception(PowerPCCPU *cpu, SpaprMachineState *spapr,
         return;
     }
 
-    xinfo = rtas_ld(args, 1);
     mask = rtas_ld(args, 2);
     buf = rtas_ld(args, 4);
     len = rtas_ld(args, 5);
-    if (nargs == 7) {
-        xinfo |= (uint64_t)rtas_ld(args, 6) << 32;
-    }
 
     event = rtas_event_log_dequeue(spapr, mask);
     if (!event) {
@@ -932,8 +965,8 @@ static void check_exception(PowerPCCPU *cpu, SpaprMachineState *spapr,
 
     header.summary = cpu_to_be32(event->summary);
     header.extended_length = cpu_to_be32(event->extended_length);
-    cpu_physical_memory_write(buf, &header, sizeof(header));
-    cpu_physical_memory_write(buf + sizeof(header), event->extended_log,
+    physical_memory_write(buf, &header, sizeof(header));
+    physical_memory_write(buf + sizeof(header), event->extended_log,
                               event->extended_length);
     rtas_st(rets, 0, RTAS_OUT_SUCCESS);
     g_free(event->extended_log);
@@ -945,7 +978,7 @@ static void check_exception(PowerPCCPU *cpu, SpaprMachineState *spapr,
      * interrupts.
      */
     for (i = 0; i < EVENT_CLASS_MAX; i++) {
-        if (rtas_event_log_contains(EVENT_CLASS_MASK(i))) {
+        if (rtas_event_log_contains(spapr, EVENT_CLASS_MASK(i))) {
             const SpaprEventSource *source =
                 spapr_event_sources_get_source(spapr->event_sources, i);
 
@@ -965,10 +998,22 @@ static void event_scan(PowerPCCPU *cpu, SpaprMachineState *spapr,
                        target_ulong args,
                        uint32_t nret, target_ulong rets)
 {
+    int i;
     if (nargs != 4 || nret != 1) {
         rtas_st(rets, 0, RTAS_OUT_PARAM_ERROR);
         return;
     }
+
+    for (i = 0; i < EVENT_CLASS_MAX; i++) {
+        if (rtas_event_log_contains(spapr, EVENT_CLASS_MASK(i))) {
+            const SpaprEventSource *source =
+                spapr_event_sources_get_source(spapr->event_sources, i);
+
+            g_assert(source->enabled);
+            qemu_irq_pulse(spapr_qirq(spapr, source->irq));
+        }
+    }
+
     rtas_st(rets, 0, RTAS_OUT_NO_ERRORS_FOUND);
 }
 
@@ -983,22 +1028,29 @@ void spapr_clear_pending_events(SpaprMachineState *spapr)
     }
 }
 
+void spapr_clear_pending_hotplug_events(SpaprMachineState *spapr)
+{
+    SpaprEventLogEntry *entry = NULL, *next_entry;
+
+    QTAILQ_FOREACH_SAFE(entry, &spapr->pending_events, next, next_entry) {
+        if (spapr_event_log_entry_type(entry) == RTAS_LOG_TYPE_HOTPLUG) {
+            QTAILQ_REMOVE(&spapr->pending_events, entry, next);
+            g_free(entry->extended_log);
+            g_free(entry);
+        }
+    }
+}
+
 void spapr_events_init(SpaprMachineState *spapr)
 {
-    int epow_irq = SPAPR_IRQ_EPOW;
-
-    if (SPAPR_MACHINE_GET_CLASS(spapr)->legacy_irq_allocation) {
-        epow_irq = spapr_irq_findone(spapr, &error_fatal);
-    }
-
-    spapr_irq_claim(spapr, epow_irq, false, &error_fatal);
+    spapr_irq_claim(spapr, SPAPR_IRQ_EPOW, false, &error_fatal);
 
     QTAILQ_INIT(&spapr->pending_events);
 
     spapr->event_sources = spapr_event_sources_new();
 
     spapr_event_sources_register(spapr->event_sources, EVENT_CLASS_EPOW,
-                                 epow_irq);
+                                 SPAPR_IRQ_EPOW);
 
     /* NOTE: if machine supports modern/dedicated hotplug event source,
      * we add it to the device-tree unconditionally. This means we may
@@ -1009,16 +1061,10 @@ void spapr_events_init(SpaprMachineState *spapr)
      * checking that it's enabled.
      */
     if (spapr->use_hotplug_event_source) {
-        int hp_irq = SPAPR_IRQ_HOTPLUG;
-
-        if (SPAPR_MACHINE_GET_CLASS(spapr)->legacy_irq_allocation) {
-            hp_irq = spapr_irq_findone(spapr, &error_fatal);
-        }
-
-        spapr_irq_claim(spapr, hp_irq, false, &error_fatal);
+        spapr_irq_claim(spapr, SPAPR_IRQ_HOTPLUG, false, &error_fatal);
 
         spapr_event_sources_register(spapr->event_sources, EVENT_CLASS_HOT_PLUG,
-                                     hp_irq);
+                                     SPAPR_IRQ_HOTPLUG);
     }
 
     spapr->epow_notifier.notify = spapr_powerdown_req;

@@ -156,7 +156,7 @@ static QVirtioSCSIQueues *qvirtio_scsi_init(QVirtioDevice *dev)
     return vs;
 }
 
-static void hotplug(void *obj, void *data, QGuestAllocator *alloc)
+static void hotplug(void *obj, void *data, QGuestAllocator *t_alloc)
 {
     QTestState *qts = global_qtest;
 
@@ -200,13 +200,122 @@ static void test_unaligned_write_same(void *obj, void *data,
     qvirtio_scsi_pci_free(vs);
 }
 
+/* Test UNMAP with a large LBA, issue #345 */
+static void test_unmap_large_lba(void *obj, void *data,
+                                      QGuestAllocator *t_alloc)
+{
+    QVirtioSCSI *scsi = obj;
+    QVirtioSCSIQueues *vs;
+    const uint8_t unmap[VIRTIO_SCSI_CDB_SIZE] = {
+        0x42, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00
+    };
+
+    /*
+     * Default null-co device size is 2**30
+     * LBA 0x7fff is ~ 1/8 into device, with 4k blocks
+     * if check_lba_range incorrectly using 512 bytes, will trigger sense error
+     */
+    uint8_t unmap_params[0x18] = {
+        0x00, 0x16, /* unmap data length */
+        0x00, 0x10, /* unmap block descriptor data length */
+        0x00, 0x00, 0x00, 0x00, /* reserved */
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xff, /* LBA */
+        0x00, 0x00, 0x03, 0xff, /* sector count */
+        0x00, 0x00, 0x00, 0x00, /* reserved */
+    };
+    struct virtio_scsi_cmd_resp resp;
+
+    alloc = t_alloc;
+    vs = qvirtio_scsi_init(scsi->vdev);
+
+    virtio_scsi_do_command(vs, unmap, NULL, 0, unmap_params,
+                           sizeof(unmap_params), &resp);
+    g_assert_cmphex(resp.response, ==, 0);
+    g_assert_cmphex(resp.status, !=, CHECK_CONDITION);
+
+    qvirtio_scsi_pci_free(vs);
+}
+
+/* Test replacing the backing node with one of a different size */
+static void test_replaced_node_size(void *obj, void *data,
+                                    QGuestAllocator *t_alloc)
+{
+    QVirtioSCSI *scsi = obj;
+    QVirtioSCSIQueues *vs;
+    uint8_t buf[512] = { 0 };
+    /* READ(10), LBA 0, transfer length 1 */
+    const uint8_t read_low_cdb[VIRTIO_SCSI_CDB_SIZE] = {
+        0x28, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00
+    };
+    /* READ(10), LBA 0x1000 (2 MiB), transfer length 1 */
+    const uint8_t read_high_cdb[VIRTIO_SCSI_CDB_SIZE] = {
+        0x28, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x01, 0x00
+    };
+    struct virtio_scsi_cmd_resp resp;
+
+    alloc = t_alloc;
+    vs = qvirtio_scsi_init(scsi->vdev);
+
+    /* LBA 0 is inside the 1 MiB node the device was realized with */
+    virtio_scsi_do_command(vs, read_low_cdb, buf, sizeof(buf), NULL, 0, &resp);
+    g_assert_cmphex(resp.response, ==, 0);
+    g_assert_cmphex(resp.status, ==, GOOD);
+
+    /* Swap in a 128 MiB node; the device is not reset by this */
+    qtest_qmp_assert_success(global_qtest,
+                             "{'execute': 'qom-set', 'arguments': {"
+                             "  'path': '/machine/peripheral/scsi-hd0',"
+                             "  'property': 'drive', 'value': 'big'}}");
+
+    /* The guest has to be told that the capacity it knows is stale */
+    virtio_scsi_do_command(vs, read_high_cdb, buf, sizeof(buf), NULL, 0, &resp);
+    g_assert_cmphex(resp.response, ==, 0);
+    g_assert_cmphex(resp.status, ==, CHECK_CONDITION);
+    g_assert_cmphex(resp.sense[2], ==, UNIT_ATTENTION);
+    g_assert_cmphex(resp.sense[12], ==, 0x2a);
+    g_assert_cmphex(resp.sense[13], ==, 0x09); /* CAPACITY DATA HAS CHANGED */
+
+    /* LBA 0x1000 is past the old node but well inside the new one */
+    virtio_scsi_do_command(vs, read_high_cdb, buf, sizeof(buf), NULL, 0, &resp);
+    g_assert_cmphex(resp.response, ==, 0);
+    g_assert_cmphex(resp.status, ==, GOOD);
+
+    qvirtio_scsi_pci_free(vs);
+}
+
+static void test_write_to_cdrom(void *obj, void *data,
+                                QGuestAllocator *t_alloc)
+{
+    QVirtioSCSI *scsi = obj;
+    QVirtioSCSIQueues *vs;
+    uint8_t buf[2048] = { 0 };
+    const uint8_t write_cdb[VIRTIO_SCSI_CDB_SIZE] = {
+        /* WRITE(10) to LBA 0, transfer length 1 */
+        0x2a, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00
+    };
+    struct virtio_scsi_cmd_resp resp;
+
+    alloc = t_alloc;
+    vs = qvirtio_scsi_init(scsi->vdev);
+
+    virtio_scsi_do_command(vs, write_cdb, NULL, 0, buf, 2048, &resp);
+    g_assert_cmphex(resp.response, ==, 0);
+    g_assert_cmphex(resp.status, ==, CHECK_CONDITION);
+    g_assert_cmphex(resp.sense[0], ==, 0x70);
+    g_assert_cmphex(resp.sense[2], ==, DATA_PROTECT);
+    g_assert_cmphex(resp.sense[12], ==, 0x27); /* WRITE PROTECTED */
+    g_assert_cmphex(resp.sense[13], ==, 0x00); /* WRITE PROTECTED */
+
+    qvirtio_scsi_pci_free(vs);
+}
+
 static void test_iothread_attach_node(void *obj, void *data,
                                       QGuestAllocator *t_alloc)
 {
     QVirtioSCSIPCI *scsi_pci = obj;
     QVirtioSCSI *scsi = &scsi_pci->scsi;
     QVirtioSCSIQueues *vs;
-    char tmp_path[] = "/tmp/qtest.XXXXXX";
+    g_autofree char *tmp_path = NULL;
     int fd;
     int ret;
 
@@ -220,7 +329,7 @@ static void test_iothread_attach_node(void *obj, void *data,
     vs = qvirtio_scsi_init(scsi->vdev);
 
     /* Create a temporary qcow2 overlay*/
-    fd = mkstemp(tmp_path);
+    fd = g_file_open_tmp("qtest.XXXXXX", &tmp_path, NULL);
     g_assert(fd >= 0);
     close(fd);
 
@@ -249,6 +358,31 @@ fail:
     unlink(tmp_path);
 }
 
+static void test_iothread_virtio_error(void *obj, void *data,
+                                       QGuestAllocator *t_alloc)
+{
+    QVirtioSCSIPCI *scsi_pci = obj;
+    QVirtioSCSI *scsi = &scsi_pci->scsi;
+    QVirtioSCSIQueues *vs;
+    QVirtQueue *vq;
+
+    alloc = t_alloc;
+    vs = qvirtio_scsi_init(scsi->vdev);
+    vq = vs->vq[2];
+
+    /* Move avail.idx out of bounds to trigger virtio_error() */
+    qvirtqueue_set_avail_idx(global_qtest, scsi->vdev, vq, vq->size * 2);
+    scsi->vdev->bus->virtqueue_kick(scsi->vdev, vq);
+
+    /*
+     * Reset the device out of the error state. If QEMU hangs or crashes then
+     * this will fail.
+     */
+    qvirtio_reset(scsi->vdev);
+
+    qvirtio_scsi_pci_free(vs);
+}
+
 static void *virtio_scsi_hotplug_setup(GString *cmd_line, void *arg)
 {
     g_string_append(cmd_line,
@@ -264,6 +398,39 @@ static void *virtio_scsi_setup(GString *cmd_line, void *arg)
                     "file.image.read-zeroes=on,"
                     "if=none,id=dr1,format=raw,file.align=4k "
                     "-device scsi-hd,drive=dr1,lun=0,scsi-id=1");
+    return arg;
+}
+
+static void *virtio_scsi_setup_4k(GString *cmd_line, void *arg)
+{
+    g_string_append(cmd_line,
+                    " -drive file=blkdebug::null-co://,"
+                    "file.image.read-zeroes=on,"
+                    "if=none,id=dr1,format=raw "
+                    "-device scsi-hd,drive=dr1,lun=0,scsi-id=1"
+                    ",logical_block_size=4k,physical_block_size=4k");
+    return arg;
+}
+
+static void *virtio_scsi_setup_replace(GString *cmd_line, void *arg)
+{
+    g_string_append(cmd_line,
+                    " -blockdev driver=null-co,read-zeroes=on,"
+                    "size=1048576,node-name=small"
+                    " -blockdev driver=null-co,read-zeroes=on,"
+                    "size=134217728,node-name=big"
+                    " -device scsi-hd,id=scsi-hd0,drive=small,"
+                    "lun=0,scsi-id=1");
+    return arg;
+}
+
+static void *virtio_scsi_setup_cd(GString *cmd_line, void *arg)
+{
+    g_string_append(cmd_line,
+                    " -drive file=null-co://,"
+                    "file.read-zeroes=on,"
+                    "if=none,id=dr1,format=raw "
+                    "-device scsi-cd,drive=dr1,lun=0,scsi-id=1");
     return arg;
 }
 
@@ -287,12 +454,30 @@ static void register_virtio_scsi_test(void)
     qos_add_test("unaligned-write-same", "virtio-scsi",
                  test_unaligned_write_same, &opts);
 
+    opts.before = virtio_scsi_setup_4k;
+    qos_add_test("large-lba-unmap", "virtio-scsi",
+                 test_unmap_large_lba, &opts);
+
+    opts.before = virtio_scsi_setup_replace;
+    qos_add_test("replaced-node-size", "virtio-scsi",
+                 test_replaced_node_size, &opts);
+
+    opts.before = virtio_scsi_setup_cd;
+    qos_add_test("write-to-cdrom", "virtio-scsi", test_write_to_cdrom, &opts);
+
     opts.before = virtio_scsi_setup_iothread;
     opts.edge = (QOSGraphEdgeOptions) {
         .extra_device_opts = "iothread=thread0",
     };
     qos_add_test("iothread-attach-node", "virtio-scsi-pci",
                  test_iothread_attach_node, &opts);
+
+    opts.before = virtio_scsi_setup_iothread;
+    opts.edge = (QOSGraphEdgeOptions) {
+        .extra_device_opts = "iothread=thread0",
+    };
+    qos_add_test("iothread-virtio-error", "virtio-scsi-pci",
+                 test_iothread_virtio_error, &opts);
 }
 
 libqos_init(register_virtio_scsi_test);

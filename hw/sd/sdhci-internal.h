@@ -24,7 +24,7 @@
 #ifndef SDHCI_INTERNAL_H
 #define SDHCI_INTERNAL_H
 
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
 
 /* R/W SDMA System Address register 0x0 */
 #define SDHC_SYSAD                     0x00
@@ -201,6 +201,7 @@ FIELD(SDHC_HOSTCTL2, UHS_II_ENA,       8, 1); /* since v4 */
 FIELD(SDHC_HOSTCTL2, ADMA2_LENGTH,    10, 1); /* since v4 */
 FIELD(SDHC_HOSTCTL2, CMD23_ENA,       11, 1); /* since v4 */
 FIELD(SDHC_HOSTCTL2, VERSION4,        12, 1); /* since v4 */
+FIELD(SDHC_HOSTCTL2, ADDRESSING_64,   13, 1); /* since v4 */
 FIELD(SDHC_HOSTCTL2, ASYNC_INT,       14, 1);
 FIELD(SDHC_HOSTCTL2, PRESET_ENA,      15, 1);
 
@@ -287,23 +288,6 @@ enum {
 
 extern const VMStateDescription sdhci_vmstate;
 
-
-#define ESDHC_MIX_CTRL                  0x48
-#define ESDHC_VENDOR_SPEC               0xc0
-#define ESDHC_DLL_CTRL                  0x60
-
-#define ESDHC_TUNING_CTRL               0xcc
-#define ESDHC_TUNE_CTRL_STATUS          0x68
-#define ESDHC_WTMK_LVL                  0x44
-
-/* Undocumented register used by guests working around erratum ERR004536 */
-#define ESDHC_UNDOCUMENTED_REG27        0x6c
-
-#define ESDHC_CTRL_4BITBUS              (0x1 << 1)
-#define ESDHC_CTRL_8BITBUS              (0x2 << 1)
-
-#define ESDHC_PRNSTS_SDSTB              (1 << 3)
-
 /*
  * Default SD/MMC host controller features information, which will be
  * presented in CAPABILITIES register of generic SD host controller at reset.
@@ -335,7 +319,7 @@ extern const VMStateDescription sdhci_vmstate;
 void sdhci_initfn(SDHCIState *s);
 void sdhci_uninitfn(SDHCIState *s);
 void sdhci_common_realize(SDHCIState *s, Error **errp);
-void sdhci_common_unrealize(SDHCIState *s, Error **errp);
-void sdhci_common_class_init(ObjectClass *klass, void *data);
+void sdhci_common_unrealize(SDHCIState *s);
+void sdhci_common_class_init(ObjectClass *klass, const void *data);
 
 #endif

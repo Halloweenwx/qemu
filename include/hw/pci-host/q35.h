@@ -22,21 +22,20 @@
 #ifndef HW_Q35_H
 #define HW_Q35_H
 
-#include "hw/pci/pci.h"
+#include "hw/pci/pci_device.h"
 #include "hw/pci/pcie_host.h"
 #include "hw/pci-host/pam.h"
 #include "qemu/units.h"
 #include "qemu/range.h"
+#include "qom/object.h"
 
 #define TYPE_Q35_HOST_DEVICE "q35-pcihost"
-#define Q35_HOST_DEVICE(obj) \
-     OBJECT_CHECK(Q35PCIHost, (obj), TYPE_Q35_HOST_DEVICE)
+OBJECT_DECLARE_SIMPLE_TYPE(Q35PCIHost, Q35_HOST_DEVICE)
 
 #define TYPE_MCH_PCI_DEVICE "mch"
-#define MCH_PCI_DEVICE(obj) \
-     OBJECT_CHECK(MCHPCIState, (obj), TYPE_MCH_PCI_DEVICE)
+OBJECT_DECLARE_SIMPLE_TYPE(MCHPCIState, MCH_PCI_DEVICE)
 
-typedef struct MCHPCIState {
+struct MCHPCIState {
     /*< private >*/
     PCIDevice parent_obj;
     /*< public >*/
@@ -45,28 +44,28 @@ typedef struct MCHPCIState {
     MemoryRegion *pci_address_space;
     MemoryRegion *system_memory;
     MemoryRegion *address_space_io;
-    PAMMemoryRegion pam_regions[13];
+    PAMMemoryRegion pam_regions[PAM_REGIONS_COUNT];
     MemoryRegion smram_region, open_high_smram;
     MemoryRegion smram, low_smram, high_smram;
     MemoryRegion tseg_blackhole, tseg_window;
     MemoryRegion smbase_blackhole, smbase_window;
     bool has_smram_at_smbase;
+    bool has_smm_ranges;
     Range pci_hole;
     uint64_t below_4g_mem_size;
     uint64_t above_4g_mem_size;
     uint64_t pci_hole64_size;
-    uint32_t short_root_bus;
     uint16_t ext_tseg_mbytes;
-} MCHPCIState;
+};
 
-typedef struct Q35PCIHost {
+struct Q35PCIHost {
     /*< private >*/
     PCIExpressHost parent_obj;
     /*< public >*/
 
     bool pci_hole64_fix;
     MCHPCIState mch;
-} Q35PCIHost;
+};
 
 #define Q35_MASK(bit, ms_bit, ls_bit) \
 ((uint##bit##_t)(((1ULL << ((ms_bit) + 1)) - 1) & ~((1ULL << ls_bit) - 1)))
@@ -74,11 +73,6 @@ typedef struct Q35PCIHost {
 /*
  * gmch part
  */
-
-#define MCH_HOST_PROP_RAM_MEM "ram-mem"
-#define MCH_HOST_PROP_PCI_MEM "pci-mem"
-#define MCH_HOST_PROP_SYSTEM_MEM "system-mem"
-#define MCH_HOST_PROP_IO_MEM "io-mem"
 
 /* PCI configuration */
 #define MCH_HOST_BRIDGE                        "MCH"
@@ -106,8 +100,8 @@ typedef struct Q35PCIHost {
 #define MCH_HOST_BRIDGE_PCIEXBAR_DEFAULT       0xb0000000
 #define MCH_HOST_BRIDGE_PCIEXBAR_MAX           (0x10000000) /* 256M */
 #define MCH_HOST_BRIDGE_PCIEXBAR_ADMSK         Q35_MASK(64, 35, 28)
-#define MCH_HOST_BRIDGE_PCIEXBAR_128ADMSK      ((uint64_t)(1 << 26))
-#define MCH_HOST_BRIDGE_PCIEXBAR_64ADMSK       ((uint64_t)(1 << 25))
+#define MCH_HOST_BRIDGE_PCIEXBAR_128ADMSK      ((uint64_t)(1 << 27))
+#define MCH_HOST_BRIDGE_PCIEXBAR_64ADMSK       ((uint64_t)(1 << 26))
 #define MCH_HOST_BRIDGE_PCIEXBAR_LENGTH_MASK   ((uint64_t)(0x3 << 1))
 #define MCH_HOST_BRIDGE_PCIEXBAR_LENGTH_256M   ((uint64_t)(0x0 << 1))
 #define MCH_HOST_BRIDGE_PCIEXBAR_LENGTH_128M   ((uint64_t)(0x1 << 1))
@@ -186,8 +180,6 @@ typedef struct Q35PCIHost {
 /* D1:F0 PCIE* port*/
 #define MCH_PCIE_DEV                           1
 #define MCH_PCIE_FUNC                          0
-
-uint64_t mch_mcfg_base(void);
 
 /*
  * Arbitrary but unique BNF number for IOAPIC device.

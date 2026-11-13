@@ -8,20 +8,21 @@
 #ifndef HW_RTC_ASPEED_RTC_H
 #define HW_RTC_ASPEED_RTC_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
+#include "qom/object.h"
 
-typedef struct AspeedRtcState {
+struct AspeedRtcState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     qemu_irq irq;
 
     uint32_t reg[0x18];
-    int offset;
+    int64_t offset;
 
-} AspeedRtcState;
+};
 
 #define TYPE_ASPEED_RTC "aspeed.rtc"
-#define ASPEED_RTC(obj) OBJECT_CHECK(AspeedRtcState, (obj), TYPE_ASPEED_RTC)
+OBJECT_DECLARE_SIMPLE_TYPE(AspeedRtcState, ASPEED_RTC)
 
 #endif /* HW_RTC_ASPEED_RTC_H */

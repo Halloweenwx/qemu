@@ -12,8 +12,8 @@
 /*
  * This is a model of the "APB watchdog" which is part of the Cortex-M
  * System Design Kit (CMSDK) and documented in the Cortex-M System
- * Design Kit Technical Reference Manual (ARM DDI0479C):
- * https://developer.arm.com/products/system-design/system-design-kits/cortex-m-system-design-kit
+ * Design Kit Technical Reference Manual (ARM DDI0479):
+ * https://developer.arm.com/documentation/ddi0479/
  *
  * We also support the variant of this device found in the TI
  * Stellaris/Luminary boards and documented in:
@@ -25,11 +25,12 @@
 #include "trace.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
-#include "sysemu/watchdog.h"
-#include "hw/sysbus.h"
-#include "hw/irq.h"
-#include "hw/qdev-properties.h"
-#include "hw/registerfields.h"
+#include "system/watchdog.h"
+#include "hw/core/sysbus.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/registerfields.h"
+#include "hw/core/qdev-clock.h"
 #include "hw/watchdog/cmsdk-apb-watchdog.h"
 #include "migration/vmstate.h"
 
@@ -195,16 +196,13 @@ static void cmsdk_apb_watchdog_write(void *opaque, hwaddr offset,
 
     switch (offset) {
     case A_WDOGLOAD:
-        /*
-         * Reset the load value and the current count, and make sure
-         * we're counting.
-         */
+        /* Reset the load value and the current count. */
         ptimer_transaction_begin(s->timer);
         ptimer_set_limit(s->timer, value, 1);
-        ptimer_run(s->timer, 0);
         ptimer_transaction_commit(s->timer);
         break;
-    case A_WDOGCONTROL:
+    case A_WDOGCONTROL: {
+        uint32_t prev_control = s->control;
         if (s->is_luminary && 0 != (R_WDOGCONTROL_INTEN_MASK & s->control)) {
             /*
              * The Luminary version of this device ignores writes to
@@ -214,8 +212,25 @@ static void cmsdk_apb_watchdog_write(void *opaque, hwaddr offset,
             break;
         }
         s->control = value & R_WDOGCONTROL_VALID_MASK;
+        if (R_WDOGCONTROL_INTEN_MASK & (s->control ^ prev_control)) {
+            ptimer_transaction_begin(s->timer);
+            if (R_WDOGCONTROL_INTEN_MASK & s->control) {
+                /*
+                 * Set HIGH to enable the counter and the interrupt. Reloads
+                 * the counter from the value in WDOGLOAD when the interrupt
+                 * is enabled, after previously being disabled.
+                 */
+                ptimer_set_count(s->timer, ptimer_get_limit(s->timer));
+                ptimer_run(s->timer, 0);
+            } else {
+                /* Or LOW to disable the counter and interrupt. */
+                ptimer_stop(s->timer);
+            }
+            ptimer_transaction_commit(s->timer);
+        }
         cmsdk_apb_watchdog_update(s);
         break;
+    }
     case A_WDOGINTCLR:
         s->intstatus = 0;
         ptimer_transaction_begin(s->timer);
@@ -225,6 +240,7 @@ static void cmsdk_apb_watchdog_write(void *opaque, hwaddr offset,
         break;
     case A_WDOGLOCK:
         s->lock = (value != WDOG_UNLOCK_VALUE);
+        trace_cmsdk_apb_watchdog_lock(s->lock);
         break;
     case A_WDOGITCR:
         if (s->is_luminary) {
@@ -303,8 +319,23 @@ static void cmsdk_apb_watchdog_reset(DeviceState *dev)
     s->resetstatus = 0;
     /* Set the limit and the count */
     ptimer_transaction_begin(s->timer);
+    /*
+     * We need to stop the ptimer before setting its limit reset value. If the
+     * order is the opposite when the code executes the stop after setting a new
+     * limit it may want to recalculate the count based on the current time (if
+     * the timer was currently running) and it won't get the proper reset value.
+     */
+    ptimer_stop(s->timer);
     ptimer_set_limit(s->timer, 0xffffffff, 1);
-    ptimer_run(s->timer, 0);
+    ptimer_transaction_commit(s->timer);
+}
+
+static void cmsdk_apb_watchdog_clk_update(void *opaque, ClockEvent event)
+{
+    CMSDKAPBWatchdog *s = CMSDK_APB_WATCHDOG(opaque);
+
+    ptimer_transaction_begin(s->timer);
+    ptimer_set_period_from_clock(s->timer, s->wdogclk, 1);
     ptimer_transaction_commit(s->timer);
 }
 
@@ -317,6 +348,9 @@ static void cmsdk_apb_watchdog_init(Object *obj)
                           s, "cmsdk-apb-watchdog", 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
     sysbus_init_irq(sbd, &s->wdogint);
+    s->wdogclk = qdev_init_clock_in(DEVICE(s), "WDOGCLK",
+                                    cmsdk_apb_watchdog_clk_update, s,
+                                    ClockUpdate);
 
     s->is_luminary = false;
     s->id = cmsdk_apb_watchdog_id;
@@ -326,9 +360,9 @@ static void cmsdk_apb_watchdog_realize(DeviceState *dev, Error **errp)
 {
     CMSDKAPBWatchdog *s = CMSDK_APB_WATCHDOG(dev);
 
-    if (s->wdogclk_frq == 0) {
+    if (!clock_has_source(s->wdogclk)) {
         error_setg(errp,
-                   "CMSDK APB watchdog: wdogclk-frq property must be set");
+                   "CMSDK APB watchdog: WDOGCLK clock must be connected");
         return;
     }
 
@@ -339,15 +373,16 @@ static void cmsdk_apb_watchdog_realize(DeviceState *dev, Error **errp)
                            PTIMER_POLICY_NO_COUNTER_ROUND_DOWN);
 
     ptimer_transaction_begin(s->timer);
-    ptimer_set_freq(s->timer, s->wdogclk_frq);
+    ptimer_set_period_from_clock(s->timer, s->wdogclk, 1);
     ptimer_transaction_commit(s->timer);
 }
 
 static const VMStateDescription cmsdk_apb_watchdog_vmstate = {
     .name = "cmsdk-apb-watchdog",
-    .version_id = 1,
-    .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .fields = (const VMStateField[]) {
+        VMSTATE_CLOCK(wdogclk, CMSDKAPBWatchdog),
         VMSTATE_PTIMER(timer, CMSDKAPBWatchdog),
         VMSTATE_UINT32(control, CMSDKAPBWatchdog),
         VMSTATE_UINT32(intstatus, CMSDKAPBWatchdog),
@@ -359,19 +394,13 @@ static const VMStateDescription cmsdk_apb_watchdog_vmstate = {
     }
 };
 
-static Property cmsdk_apb_watchdog_properties[] = {
-    DEFINE_PROP_UINT32("wdogclk-frq", CMSDKAPBWatchdog, wdogclk_frq, 0),
-    DEFINE_PROP_END_OF_LIST(),
-};
-
-static void cmsdk_apb_watchdog_class_init(ObjectClass *klass, void *data)
+static void cmsdk_apb_watchdog_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = cmsdk_apb_watchdog_realize;
     dc->vmsd = &cmsdk_apb_watchdog_vmstate;
-    dc->reset = cmsdk_apb_watchdog_reset;
-    device_class_set_props(dc, cmsdk_apb_watchdog_properties);
+    device_class_set_legacy_reset(dc, cmsdk_apb_watchdog_reset);
 }
 
 static const TypeInfo cmsdk_apb_watchdog_info = {

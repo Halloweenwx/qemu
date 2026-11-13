@@ -1,21 +1,21 @@
 #include "qemu/osdep.h"
 #include "block/qdict.h" /* for qdict_extract_subqdict() */
 #include "qapi/error.h"
-#include "qapi/qapi-commands-misc.h"
-#include "qapi/qmp/qdict.h"
-#include "qapi/qmp/qlist.h"
+#include "qobject/qdict.h"
+#include "qobject/qlist.h"
 #include "qemu/error-report.h"
 #include "qemu/option.h"
 #include "qemu/config-file.h"
 
-static QemuOptsList *vm_config_groups[48];
-static QemuOptsList *drive_config_groups[5];
+QemuOptsList *vm_config_groups[48];
+QemuOptsList *drive_config_groups[5];
 
 static QemuOptsList *find_list(QemuOptsList **lists, const char *group,
                                Error **errp)
 {
     int i;
 
+    qemu_load_module_for_opts(group);
     for (i = 0; lists[i] != NULL; i++) {
         if (strcmp(lists[i]->name, group) == 0)
             break;
@@ -51,229 +51,6 @@ QemuOpts *qemu_find_opts_singleton(const char *group)
         opts = qemu_opts_create(list, NULL, 0, &error_abort);
     }
     return opts;
-}
-
-static CommandLineParameterInfoList *query_option_descs(const QemuOptDesc *desc)
-{
-    CommandLineParameterInfoList *param_list = NULL, *entry;
-    CommandLineParameterInfo *info;
-    int i;
-
-    for (i = 0; desc[i].name != NULL; i++) {
-        info = g_malloc0(sizeof(*info));
-        info->name = g_strdup(desc[i].name);
-
-        switch (desc[i].type) {
-        case QEMU_OPT_STRING:
-            info->type = COMMAND_LINE_PARAMETER_TYPE_STRING;
-            break;
-        case QEMU_OPT_BOOL:
-            info->type = COMMAND_LINE_PARAMETER_TYPE_BOOLEAN;
-            break;
-        case QEMU_OPT_NUMBER:
-            info->type = COMMAND_LINE_PARAMETER_TYPE_NUMBER;
-            break;
-        case QEMU_OPT_SIZE:
-            info->type = COMMAND_LINE_PARAMETER_TYPE_SIZE;
-            break;
-        }
-
-        if (desc[i].help) {
-            info->has_help = true;
-            info->help = g_strdup(desc[i].help);
-        }
-        if (desc[i].def_value_str) {
-            info->has_q_default = true;
-            info->q_default = g_strdup(desc[i].def_value_str);
-        }
-
-        entry = g_malloc0(sizeof(*entry));
-        entry->value = info;
-        entry->next = param_list;
-        param_list = entry;
-    }
-
-    return param_list;
-}
-
-/* remove repeated entry from the info list */
-static void cleanup_infolist(CommandLineParameterInfoList *head)
-{
-    CommandLineParameterInfoList *pre_entry, *cur, *del_entry;
-
-    cur = head;
-    while (cur->next) {
-        pre_entry = head;
-        while (pre_entry != cur->next) {
-            if (!strcmp(pre_entry->value->name, cur->next->value->name)) {
-                del_entry = cur->next;
-                cur->next = cur->next->next;
-                del_entry->next = NULL;
-                qapi_free_CommandLineParameterInfoList(del_entry);
-                break;
-            }
-            pre_entry = pre_entry->next;
-        }
-        cur = cur->next;
-    }
-}
-
-/* merge the description items of two parameter infolists */
-static void connect_infolist(CommandLineParameterInfoList *head,
-                             CommandLineParameterInfoList *new)
-{
-    CommandLineParameterInfoList *cur;
-
-    cur = head;
-    while (cur->next) {
-        cur = cur->next;
-    }
-    cur->next = new;
-}
-
-/* access all the local QemuOptsLists for drive option */
-static CommandLineParameterInfoList *get_drive_infolist(void)
-{
-    CommandLineParameterInfoList *head = NULL, *cur;
-    int i;
-
-    for (i = 0; drive_config_groups[i] != NULL; i++) {
-        if (!head) {
-            head = query_option_descs(drive_config_groups[i]->desc);
-        } else {
-            cur = query_option_descs(drive_config_groups[i]->desc);
-            connect_infolist(head, cur);
-        }
-    }
-    cleanup_infolist(head);
-
-    return head;
-}
-
-/* restore machine options that are now machine's properties */
-static QemuOptsList machine_opts = {
-    .merge_lists = true,
-    .head = QTAILQ_HEAD_INITIALIZER(machine_opts.head),
-    .desc = {
-        {
-            .name = "type",
-            .type = QEMU_OPT_STRING,
-            .help = "emulated machine"
-        },{
-            .name = "accel",
-            .type = QEMU_OPT_STRING,
-            .help = "accelerator list",
-        },{
-            .name = "kernel_irqchip",
-            .type = QEMU_OPT_BOOL,
-            .help = "use KVM in-kernel irqchip",
-        },{
-            .name = "kvm_shadow_mem",
-            .type = QEMU_OPT_SIZE,
-            .help = "KVM shadow MMU size",
-        },{
-            .name = "kernel",
-            .type = QEMU_OPT_STRING,
-            .help = "Linux kernel image file",
-        },{
-            .name = "initrd",
-            .type = QEMU_OPT_STRING,
-            .help = "Linux initial ramdisk file",
-        },{
-            .name = "append",
-            .type = QEMU_OPT_STRING,
-            .help = "Linux kernel command line",
-        },{
-            .name = "dtb",
-            .type = QEMU_OPT_STRING,
-            .help = "Linux kernel device tree file",
-        },{
-            .name = "dumpdtb",
-            .type = QEMU_OPT_STRING,
-            .help = "Dump current dtb to a file and quit",
-        },{
-            .name = "phandle_start",
-            .type = QEMU_OPT_NUMBER,
-            .help = "The first phandle ID we may generate dynamically",
-        },{
-            .name = "dt_compatible",
-            .type = QEMU_OPT_STRING,
-            .help = "Overrides the \"compatible\" property of the dt root node",
-        },{
-            .name = "dump-guest-core",
-            .type = QEMU_OPT_BOOL,
-            .help = "Include guest memory in  a core dump",
-        },{
-            .name = "mem-merge",
-            .type = QEMU_OPT_BOOL,
-            .help = "enable/disable memory merge support",
-        },{
-            .name = "usb",
-            .type = QEMU_OPT_BOOL,
-            .help = "Set on/off to enable/disable usb",
-        },{
-            .name = "firmware",
-            .type = QEMU_OPT_STRING,
-            .help = "firmware image",
-        },{
-            .name = "iommu",
-            .type = QEMU_OPT_BOOL,
-            .help = "Set on/off to enable/disable Intel IOMMU (VT-d)",
-        },{
-            .name = "suppress-vmdesc",
-            .type = QEMU_OPT_BOOL,
-            .help = "Set on to disable self-describing migration",
-        },{
-            .name = "aes-key-wrap",
-            .type = QEMU_OPT_BOOL,
-            .help = "enable/disable AES key wrapping using the CPACF wrapping key",
-        },{
-            .name = "dea-key-wrap",
-            .type = QEMU_OPT_BOOL,
-            .help = "enable/disable DEA key wrapping using the CPACF wrapping key",
-        },{
-            .name = "loadparm",
-            .type = QEMU_OPT_STRING,
-            .help = "Up to 8 chars in set of [A-Za-z0-9. ](lower case chars"
-                    " converted to upper case) to pass to machine"
-                    " loader, boot manager, and guest kernel",
-        },
-        { /* End of list */ }
-    }
-};
-
-CommandLineOptionInfoList *qmp_query_command_line_options(bool has_option,
-                                                          const char *option,
-                                                          Error **errp)
-{
-    CommandLineOptionInfoList *conf_list = NULL, *entry;
-    CommandLineOptionInfo *info;
-    int i;
-
-    for (i = 0; vm_config_groups[i] != NULL; i++) {
-        if (!has_option || !strcmp(option, vm_config_groups[i]->name)) {
-            info = g_malloc0(sizeof(*info));
-            info->option = g_strdup(vm_config_groups[i]->name);
-            if (!strcmp("drive", vm_config_groups[i]->name)) {
-                info->parameters = get_drive_infolist();
-            } else if (!strcmp("machine", vm_config_groups[i]->name)) {
-                info->parameters = query_option_descs(machine_opts.desc);
-            } else {
-                info->parameters =
-                    query_option_descs(vm_config_groups[i]->desc);
-            }
-            entry = g_malloc0(sizeof(*entry));
-            entry->value = info;
-            entry->next = conf_list;
-            conf_list = entry;
-        }
-    }
-
-    if (conf_list == NULL) {
-        error_setg(errp, "invalid option name: %s", option);
-    }
-
-    return conf_list;
 }
 
 QemuOptsList *qemu_find_opts_err(const char *group, Error **errp)
@@ -313,96 +90,20 @@ void qemu_add_opts(QemuOptsList *list)
     abort();
 }
 
-int qemu_set_option(const char *str)
-{
-    Error *local_err = NULL;
-    char group[64], id[64], arg[64];
-    QemuOptsList *list;
-    QemuOpts *opts;
-    int rc, offset;
-
-    rc = sscanf(str, "%63[^.].%63[^.].%63[^=]%n", group, id, arg, &offset);
-    if (rc < 3 || str[offset] != '=') {
-        error_report("can't parse: \"%s\"", str);
-        return -1;
-    }
-
-    list = qemu_find_opts(group);
-    if (list == NULL) {
-        return -1;
-    }
-
-    opts = qemu_opts_find(list, id);
-    if (!opts) {
-        error_report("there is no %s \"%s\" defined",
-                     list->name, id);
-        return -1;
-    }
-
-    qemu_opt_set(opts, arg, str + offset + 1, &local_err);
-    if (local_err) {
-        error_report_err(local_err);
-        return -1;
-    }
-    return 0;
-}
-
-struct ConfigWriteData {
-    QemuOptsList *list;
-    FILE *fp;
-};
-
-static int config_write_opt(void *opaque, const char *name, const char *value,
-                            Error **errp)
-{
-    struct ConfigWriteData *data = opaque;
-
-    fprintf(data->fp, "  %s = \"%s\"\n", name, value);
-    return 0;
-}
-
-static int config_write_opts(void *opaque, QemuOpts *opts, Error **errp)
-{
-    struct ConfigWriteData *data = opaque;
-    const char *id = qemu_opts_id(opts);
-
-    if (id) {
-        fprintf(data->fp, "[%s \"%s\"]\n", data->list->name, id);
-    } else {
-        fprintf(data->fp, "[%s]\n", data->list->name);
-    }
-    qemu_opt_foreach(opts, config_write_opt, data, NULL);
-    fprintf(data->fp, "\n");
-    return 0;
-}
-
-void qemu_config_write(FILE *fp)
-{
-    struct ConfigWriteData data = { .fp = fp };
-    QemuOptsList **lists = vm_config_groups;
-    int i;
-
-    fprintf(fp, "# qemu config file\n\n");
-    for (i = 0; lists[i] != NULL; i++) {
-        data.list = lists[i];
-        qemu_opts_foreach(data.list, config_write_opts, &data, NULL);
-    }
-}
-
 /* Returns number of config groups on success, -errno on error */
-int qemu_config_parse(FILE *fp, QemuOptsList **lists, const char *fname)
+static int qemu_config_foreach(FILE *fp, QEMUConfigCB *cb, void *opaque,
+                               const char *fname, Error **errp)
 {
-    char line[1024], group[64], id[64], arg[64], value[1024];
+    ERRP_GUARD();
+    char line[1024], prev_group[64], group[64], arg[64], value[1024];
     Location loc;
-    QemuOptsList *list = NULL;
-    Error *local_err = NULL;
-    QemuOpts *opts = NULL;
+    QDict *qdict = NULL;
     int res = -EINVAL, lno = 0;
     int count = 0;
 
     loc_push_none(&loc);
     while (fgets(line, sizeof(line), fp) != NULL) {
-        loc_set_file(fname, ++lno);
+        ++lno;
         if (line[0] == '\n') {
             /* skip empty lines */
             continue;
@@ -411,77 +112,98 @@ int qemu_config_parse(FILE *fp, QemuOptsList **lists, const char *fname)
             /* comment */
             continue;
         }
-        if (sscanf(line, "[%63s \"%63[^\"]\"]", group, id) == 2) {
-            /* group with id */
-            list = find_list(lists, group, &local_err);
-            if (local_err) {
-                error_report_err(local_err);
-                goto out;
+        if (line[0] == '[') {
+            QDict *prev = qdict;
+            if (sscanf(line, "[%63s \"%63[^\"]\"]", group, value) == 2) {
+                qdict = qdict_new();
+                qdict_put_str(qdict, "id", value);
+                count++;
+            } else if (sscanf(line, "[%63[^]]]", group) == 1) {
+                qdict = qdict_new();
+                count++;
             }
-            opts = qemu_opts_create(list, id, 1, NULL);
-            count++;
-            continue;
-        }
-        if (sscanf(line, "[%63[^]]]", group) == 1) {
-            /* group without id */
-            list = find_list(lists, group, &local_err);
-            if (local_err) {
-                error_report_err(local_err);
-                goto out;
+            if (qdict != prev) {
+                if (prev) {
+                    cb(prev_group, prev, opaque, errp);
+                    qobject_unref(prev);
+                    if (*errp) {
+                        goto out;
+                    }
+                }
+                strcpy(prev_group, group);
+                continue;
             }
-            opts = qemu_opts_create(list, NULL, 0, &error_abort);
-            count++;
-            continue;
         }
+        loc_set_file(fname, lno);
         value[0] = '\0';
         if (sscanf(line, " %63s = \"%1023[^\"]\"", arg, value) == 2 ||
             sscanf(line, " %63s = \"\"", arg) == 1) {
             /* arg = value */
-            if (opts == NULL) {
-                error_report("no group defined");
+            if (qdict == NULL) {
+                error_setg(errp, "no group defined");
                 goto out;
             }
-            qemu_opt_set(opts, arg, value, &local_err);
-            if (local_err) {
-                error_report_err(local_err);
-                goto out;
-            }
+            qdict_put_str(qdict, arg, value);
             continue;
         }
-        error_report("parse error");
+        error_setg(errp, "parse error");
         goto out;
     }
     if (ferror(fp)) {
-        error_report("error reading file");
-        goto out;
+        loc_pop(&loc);
+        error_setg_errno(errp, errno, "Cannot read config file");
+        goto out_no_loc;
     }
     res = count;
+    if (qdict) {
+        cb(group, qdict, opaque, errp);
+    }
 out:
     loc_pop(&loc);
+out_no_loc:
+    qobject_unref(qdict);
     return res;
 }
 
-int qemu_read_config_file(const char *filename)
+void qemu_config_do_parse(const char *group, QDict *qdict, void *opaque, Error **errp)
+{
+    QemuOptsList **lists = opaque;
+    QemuOptsList *list;
+
+    list = find_list(lists, group, errp);
+    if (!list) {
+        return;
+    }
+
+    qemu_opts_from_qdict(list, qdict, errp);
+}
+
+int qemu_config_parse(FILE *fp, QemuOptsList **lists, const char *fname, Error **errp)
+{
+    return qemu_config_foreach(fp, qemu_config_do_parse, lists, fname, errp);
+}
+
+int qemu_read_config_file(const char *filename, QEMUConfigCB *cb, Error **errp)
 {
     FILE *f = fopen(filename, "r");
     int ret;
 
     if (f == NULL) {
+        error_setg_file_open(errp, errno, filename);
         return -errno;
     }
 
-    ret = qemu_config_parse(f, vm_config_groups, filename);
+    ret = qemu_config_foreach(f, cb, vm_config_groups, filename, errp);
     fclose(f);
     return ret;
 }
 
-static void config_parse_qdict_section(QDict *options, QemuOptsList *opts,
+static bool config_parse_qdict_section(QDict *options, QemuOptsList *opts,
                                        Error **errp)
 {
     QemuOpts *subopts;
-    QDict *subqdict;
-    QList *list = NULL;
-    Error *local_err = NULL;
+    g_autoptr(QDict) subqdict = NULL;
+    g_autoptr(QList) list = NULL;
     size_t orig_size, enum_size;
     char *prefix;
 
@@ -490,26 +212,23 @@ static void config_parse_qdict_section(QDict *options, QemuOptsList *opts,
     g_free(prefix);
     orig_size = qdict_size(subqdict);
     if (!orig_size) {
-        goto out;
+        return true;
     }
 
-    subopts = qemu_opts_create(opts, NULL, 0, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
-        goto out;
+    subopts = qemu_opts_create(opts, NULL, 0, errp);
+    if (!subopts) {
+        return false;
     }
 
-    qemu_opts_absorb_qdict(subopts, subqdict, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
-        goto out;
+    if (!qemu_opts_absorb_qdict(subopts, subqdict, errp)) {
+        return false;
     }
 
     enum_size = qdict_size(subqdict);
     if (enum_size < orig_size && enum_size) {
         error_setg(errp, "Unknown option '%s' for [%s]",
                    qdict_first(subqdict)->key, opts->name);
-        goto out;
+        return false;
     }
 
     if (enum_size) {
@@ -524,7 +243,7 @@ static void config_parse_qdict_section(QDict *options, QemuOptsList *opts,
         if (qdict_size(subqdict)) {
             error_setg(errp, "Unused option '%s' for [%s]",
                        qdict_first(subqdict)->key, opts->name);
-            goto out;
+            return false;
         }
 
         QLIST_FOREACH_ENTRY(list, list_entry) {
@@ -534,49 +253,43 @@ static void config_parse_qdict_section(QDict *options, QemuOptsList *opts,
             if (!section) {
                 error_setg(errp, "[%s] section (index %u) does not consist of "
                            "keys", opts->name, i);
-                goto out;
+                return false;
             }
 
             opt_name = g_strdup_printf("%s.%u", opts->name, i++);
-            subopts = qemu_opts_create(opts, opt_name, 1, &local_err);
+            subopts = qemu_opts_create(opts, opt_name, 1, errp);
             g_free(opt_name);
-            if (local_err) {
-                error_propagate(errp, local_err);
-                goto out;
+            if (!subopts) {
+                return false;
             }
 
-            qemu_opts_absorb_qdict(subopts, section, &local_err);
-            if (local_err) {
-                error_propagate(errp, local_err);
+            if (!qemu_opts_absorb_qdict(subopts, section, errp)) {
                 qemu_opts_del(subopts);
-                goto out;
+                return false;
             }
 
             if (qdict_size(section)) {
                 error_setg(errp, "[%s] section doesn't support the option '%s'",
                            opts->name, qdict_first(section)->key);
                 qemu_opts_del(subopts);
-                goto out;
+                return false;
             }
         }
     }
 
-out:
-    qobject_unref(subqdict);
-    qobject_unref(list);
+    return true;
 }
 
-void qemu_config_parse_qdict(QDict *options, QemuOptsList **lists,
+bool qemu_config_parse_qdict(QDict *options, QemuOptsList **lists,
                              Error **errp)
 {
     int i;
-    Error *local_err = NULL;
 
     for (i = 0; lists[i]; i++) {
-        config_parse_qdict_section(options, lists[i], &local_err);
-        if (local_err) {
-            error_propagate(errp, local_err);
-            return;
+        if (!config_parse_qdict_section(options, lists[i], errp)) {
+            return false;
         }
     }
+
+    return true;
 }

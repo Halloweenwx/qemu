@@ -8,11 +8,12 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/irq.h"
-#include "hw/sysbus.h"
+#include "hw/core/irq.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qom/object.h"
 
 /* The number of virtual priority levels.  16 user vectors plus the
    unvectored IRQ.  Chained interrupts would require an additional level
@@ -21,9 +22,9 @@
 #define PL190_NUM_PRIO 17
 
 #define TYPE_PL190 "pl190"
-#define PL190(obj) OBJECT_CHECK(PL190State, (obj), TYPE_PL190)
+OBJECT_DECLARE_SIMPLE_TYPE(PL190State, PL190)
 
-typedef struct PL190State {
+struct PL190State {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
@@ -41,7 +42,7 @@ typedef struct PL190State {
     int prev_prio[PL190_NUM_PRIO];
     qemu_irq irq;
     qemu_irq fiq;
-} PL190State;
+};
 
 static const unsigned char pl190_id[] =
 { 0x90, 0x11, 0x04, 0x00, 0x0D, 0xf0, 0x05, 0xb1 };
@@ -257,7 +258,7 @@ static const VMStateDescription vmstate_pl190 = {
     .name = "pl190",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(level, PL190State),
         VMSTATE_UINT32(soft_level, PL190State),
         VMSTATE_UINT32(irq_enable, PL190State),
@@ -272,11 +273,11 @@ static const VMStateDescription vmstate_pl190 = {
     }
 };
 
-static void pl190_class_init(ObjectClass *klass, void *data)
+static void pl190_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = pl190_reset;
+    device_class_set_legacy_reset(dc, pl190_reset);
     dc->vmsd = &vmstate_pl190;
 }
 

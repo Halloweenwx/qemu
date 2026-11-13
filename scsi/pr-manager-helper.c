@@ -19,18 +19,18 @@
 #include "pr-helper.h"
 #include "qapi/qapi-events-block.h"
 #include "qemu/module.h"
+#include "qemu/bswap.h"
 
 #include <scsi/sg.h>
+#include "qom/object.h"
 
 #define PR_MAX_RECONNECT_ATTEMPTS 5
 
 #define TYPE_PR_MANAGER_HELPER "pr-manager-helper"
 
-#define PR_MANAGER_HELPER(obj) \
-     OBJECT_CHECK(PRManagerHelper, (obj), \
-                  TYPE_PR_MANAGER_HELPER)
+OBJECT_DECLARE_SIMPLE_TYPE(PRManagerHelper, PR_MANAGER_HELPER)
 
-typedef struct PRManagerHelper {
+struct PRManagerHelper {
     /* <private> */
     PRManager parent;
 
@@ -38,15 +38,16 @@ typedef struct PRManagerHelper {
 
     QemuMutex lock;
     QIOChannel *ioc;
-} PRManagerHelper;
+
+    uint32_t proto_flags; /* flags negotiated with pr-helper */
+};
 
 static void pr_manager_send_status_changed_event(PRManagerHelper *pr_mgr)
 {
-    char *id = object_get_canonical_path_component(OBJECT(pr_mgr));
+    const char *id = object_get_canonical_path_component(OBJECT(pr_mgr));
 
     if (id) {
         qapi_event_send_pr_manager_status_changed(id, !!pr_mgr->ioc);
-        g_free(id);
     }
 }
 
@@ -79,7 +80,7 @@ static int pr_manager_helper_write(PRManagerHelper *pr_mgr,
         iov.iov_base = (void *)buf;
         iov.iov_len = sz;
         n_written = qio_channel_writev_full(QIO_CHANNEL(pr_mgr->ioc), &iov, 1,
-                                            nfds ? &fd : NULL, nfds, errp);
+                                            nfds ? &fd : NULL, nfds, 0, errp);
 
         if (n_written <= 0) {
             assert(n_written != QIO_CHANNEL_ERR_BLOCK);
@@ -107,27 +108,22 @@ static int pr_manager_helper_initialize(PRManagerHelper *pr_mgr,
         .u.q_unix.path = path
     };
     QIOChannelSocket *sioc = qio_channel_socket_new();
-    Error *local_err = NULL;
-
     uint32_t flags;
     int r;
 
     assert(!pr_mgr->ioc);
     qio_channel_set_name(QIO_CHANNEL(sioc), "pr-manager-helper");
-    qio_channel_socket_connect_sync(sioc,
-                                    &saddr,
-                                    &local_err);
+    r = qio_channel_socket_connect_sync(sioc, &saddr, errp);
     g_free(path);
-    if (local_err) {
+    if (r < 0) {
         object_unref(OBJECT(sioc));
-        error_propagate(errp, local_err);
         return -ENOTCONN;
     }
 
     qio_channel_set_delay(QIO_CHANNEL(sioc), false);
     pr_mgr->ioc = QIO_CHANNEL(sioc);
 
-    /* A simple feature negotation protocol, even though there is
+    /* A simple feature negotiation protocol, even though there is
      * no optional feature right now.
      */
     r = pr_manager_helper_read(pr_mgr, &flags, sizeof(flags), errp);
@@ -135,7 +131,9 @@ static int pr_manager_helper_initialize(PRManagerHelper *pr_mgr,
         goto out_close;
     }
 
-    flags = 0;
+    pr_mgr->proto_flags = be32_to_cpu(flags) & PR_HELPER_FEATURE_CLEANUP;
+
+    flags = cpu_to_be32(pr_mgr->proto_flags);
     r = pr_manager_helper_write(pr_mgr, -1, &flags, sizeof(flags), errp);
     if (r < 0) {
         goto out_close;
@@ -167,9 +165,19 @@ static int pr_manager_helper_run(PRManager *p,
     }
 
     memcpy(cdb, io_hdr->cmdp, io_hdr->cmd_len);
-    assert(cdb[0] == PERSISTENT_RESERVE_OUT || cdb[0] == PERSISTENT_RESERVE_IN);
+    assert(cdb[0] == PERSISTENT_RESERVE_OUT ||
+           cdb[0] == PERSISTENT_RESERVE_IN ||
+           cdb[0] == PR_HELPER_CLEANUP);
+
+    /* The command is only available when pr-helper supports it */
+    if (cdb[0] == PR_HELPER_CLEANUP &&
+        !(pr_mgr->proto_flags & PR_HELPER_FEATURE_CLEANUP)) {
+        return -ENOTSUP;
+    }
+
     expected_dir =
-        (cdb[0] == PERSISTENT_RESERVE_OUT ? SG_DXFER_TO_DEV : SG_DXFER_FROM_DEV);
+        (cdb[0] == PERSISTENT_RESERVE_IN ?
+         SG_DXFER_FROM_DEV : SG_DXFER_TO_DEV);
     if (io_hdr->dxfer_direction != expected_dir) {
         return -EINVAL;
     }
@@ -240,10 +248,11 @@ static int pr_manager_helper_run(PRManager *p,
 
 out:
     if (ret < 0) {
-        int sense_len = scsi_build_sense(io_hdr->sbp,
+        int sense_len = scsi_build_sense(resp.sense,
                                          SENSE_CODE(LUN_COMM_FAILURE));
         io_hdr->driver_status = SG_ERR_DRIVER_SENSE;
         io_hdr->sb_len_wr = MIN(io_hdr->mx_sb_len, sense_len);
+        memcpy(io_hdr->sbp, resp.sense, io_hdr->sb_len_wr);
         io_hdr->status = CHECK_CONDITION;
     }
     qemu_mutex_unlock(&pr_mgr->lock);
@@ -290,6 +299,7 @@ static void pr_manager_helper_instance_finalize(Object *obj)
 {
     PRManagerHelper *pr_mgr = PR_MANAGER_HELPER(obj);
 
+    g_free(pr_mgr->path);
     object_unref(OBJECT(pr_mgr->ioc));
     qemu_mutex_destroy(&pr_mgr->lock);
 }
@@ -302,13 +312,12 @@ static void pr_manager_helper_instance_init(Object *obj)
 }
 
 static void pr_manager_helper_class_init(ObjectClass *klass,
-                                         void *class_data G_GNUC_UNUSED)
+                                         const void *class_data G_GNUC_UNUSED)
 {
     PRManagerClass *prmgr_klass = PR_MANAGER_CLASS(klass);
     UserCreatableClass *uc_klass = USER_CREATABLE_CLASS(klass);
 
-    object_class_property_add_str(klass, "path", get_path, set_path,
-                                  &error_abort);
+    object_class_property_add_str(klass, "path", get_path, set_path);
     uc_klass->complete = pr_manager_helper_complete;
     prmgr_klass->run = pr_manager_helper_run;
     prmgr_klass->is_connected = pr_manager_helper_is_connected;

@@ -7,7 +7,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -21,10 +21,12 @@
 #ifndef QEMU_APIC_INTERNAL_H
 #define QEMU_APIC_INTERNAL_H
 
-#include "cpu.h"
-#include "exec/memory.h"
+#include "target/i386/cpu.h"
+#include "hw/i386/apic.h"
+#include "system/memory.h"
 #include "qemu/timer.h"
 #include "target/i386/cpu-qom.h"
+#include "qom/object.h"
 
 /* APIC Local Vector Table */
 #define APIC_LVT_TIMER                  0
@@ -45,8 +47,10 @@
 #define APIC_DM_EXTINT                  7
 
 /* APIC destination mode */
-#define APIC_DESTMODE_FLAT              0xf
-#define APIC_DESTMODE_CLUSTER           1
+#define APIC_DESTMODE_PHYSICAL          0
+#define APIC_DESTMODE_LOGICAL           1
+#define APIC_DESTMODE_LOGICAL_FLAT      0xf
+#define APIC_DESTMODE_LOGICAL_CLUSTER   0
 
 #define APIC_TRIGGER_EDGE               0
 #define APIC_TRIGGER_LEVEL              1
@@ -122,23 +126,17 @@
 #define VAPIC_ENABLE_BIT                0
 #define VAPIC_ENABLE_MASK               (1 << VAPIC_ENABLE_BIT)
 
-typedef struct APICCommonState APICCommonState;
-
 #define TYPE_APIC_COMMON "apic-common"
-#define APIC_COMMON(obj) \
-     OBJECT_CHECK(APICCommonState, (obj), TYPE_APIC_COMMON)
-#define APIC_COMMON_CLASS(klass) \
-     OBJECT_CLASS_CHECK(APICCommonClass, (klass), TYPE_APIC_COMMON)
-#define APIC_COMMON_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(APICCommonClass, (obj), TYPE_APIC_COMMON)
+typedef struct APICCommonClass APICCommonClass;
+DECLARE_OBJ_CHECKERS(APICCommonState, APICCommonClass,
+                     APIC_COMMON, TYPE_APIC_COMMON)
 
-typedef struct APICCommonClass
-{
+struct APICCommonClass {
     DeviceClass parent_class;
 
     DeviceRealize realize;
     DeviceUnrealize unrealize;
-    void (*set_base)(APICCommonState *s, uint64_t val);
+    int (*set_base)(APICCommonState *s, uint64_t val);
     void (*set_tpr)(APICCommonState *s, uint8_t val);
     uint8_t (*get_tpr)(APICCommonState *s);
     void (*enable_tpr_reporting)(APICCommonState *s, bool enable);
@@ -151,7 +149,7 @@ typedef struct APICCommonClass
      * device, but it's convenient to have it here for now.
      */
     void (*send_msi)(MSIMessage *msi);
-} APICCommonClass;
+};
 
 struct APICCommonState {
     /*< private >*/
@@ -189,7 +187,7 @@ struct APICCommonState {
     uint32_t vapic_control;
     DeviceState *vapic;
     hwaddr vapic_paddr; /* note: persistence via kvmvapic */
-    bool legacy_instance_id;
+    uint32_t extended_log_dest;
 };
 
 typedef struct VAPICState {
@@ -202,15 +200,15 @@ typedef struct VAPICState {
 
 extern bool apic_report_tpr_access;
 
-void apic_report_irq_delivered(int delivered);
 bool apic_next_timer(APICCommonState *s, int64_t current_time);
-void apic_enable_tpr_access_reporting(DeviceState *d, bool enable);
-void apic_enable_vapic(DeviceState *d, hwaddr paddr);
+void apic_enable_tpr_access_reporting(APICCommonState *s, bool enable);
+void apic_enable_vapic(APICCommonState *s, hwaddr paddr);
 
 void vapic_report_tpr_access(DeviceState *dev, CPUState *cpu, target_ulong ip,
                              TPRAccess access);
 
 int apic_get_ppr(APICCommonState *s);
+uint32_t apic_get_current_count(APICCommonState *s);
 
 static inline void apic_set_bit(uint32_t *tab, int index)
 {
@@ -228,6 +226,6 @@ static inline int apic_get_bit(uint32_t *tab, int index)
     return !!(tab[i] & mask);
 }
 
-APICCommonClass *apic_get_class(void);
+APICCommonClass *apic_get_class(Error **errp);
 
 #endif /* QEMU_APIC_INTERNAL_H */

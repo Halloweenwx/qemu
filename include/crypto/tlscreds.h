@@ -24,20 +24,17 @@
 #include "qapi/qapi-types-crypto.h"
 #include "qom/object.h"
 
-#ifdef CONFIG_GNUTLS
-#include <gnutls/gnutls.h>
-#endif
-
 #define TYPE_QCRYPTO_TLS_CREDS "tls-creds"
-#define QCRYPTO_TLS_CREDS(obj)                  \
-    OBJECT_CHECK(QCryptoTLSCreds, (obj), TYPE_QCRYPTO_TLS_CREDS)
-
 typedef struct QCryptoTLSCreds QCryptoTLSCreds;
 typedef struct QCryptoTLSCredsClass QCryptoTLSCredsClass;
+DECLARE_OBJ_CHECKERS(QCryptoTLSCreds, QCryptoTLSCredsClass, QCRYPTO_TLS_CREDS,
+                     TYPE_QCRYPTO_TLS_CREDS)
+
 
 #define QCRYPTO_TLS_CREDS_DH_PARAMS "dh-params.pem"
 
 
+typedef bool (*CryptoTLSCredsReload)(QCryptoTLSCreds *, Error **);
 /**
  * QCryptoTLSCreds:
  *
@@ -47,21 +44,50 @@ typedef struct QCryptoTLSCredsClass QCryptoTLSCredsClass;
  * certificate credentials.
  */
 
-struct QCryptoTLSCreds {
-    Object parent_obj;
-    char *dir;
-    QCryptoTLSCredsEndpoint endpoint;
-#ifdef CONFIG_GNUTLS
-    gnutls_dh_params_t dh_params;
-#endif
-    bool verifyPeer;
-    char *priority;
-};
-
-
 struct QCryptoTLSCredsClass {
     ObjectClass parent_class;
+    CryptoTLSCredsReload reload;
+    const char *prioritySuffix;
 };
 
+/**
+ * qcrypto_tls_creds_check_endpoint:
+ * @creds: pointer to a TLS credentials object
+ * @endpoint: type of network endpoint that will be using the credentials
+ * @errp: pointer to a NULL-initialized error object
+ *
+ * Check whether the credentials is setup according to
+ * the type of @endpoint argument.
+ *
+ * Returns true if the credentials is setup for the endpoint, false otherwise
+ */
+bool qcrypto_tls_creds_check_endpoint(QCryptoTLSCreds *creds,
+                                      QCryptoTLSCredsEndpoint endpoint,
+                                      Error **errp);
+
+
+/**
+ * qcrypto_tls_creds_get_priority:
+ * @creds: pointer to a TLS credentials object
+ *
+ * Get the TLS credentials priority string. The caller
+ * must free the returned string when no longer required.
+ *
+ * Returns: a non-NULL priority string
+ */
+char *qcrypto_tls_creds_get_priority(QCryptoTLSCreds *creds);
+
+
+/**
+ * qcrypto_tls_creds_reload:
+ * @creds: pointer to a TLS credentials object
+ * @errp: pointer to a NULL-initialized error object
+ *
+ * Request a reload of the TLS credentials, if supported
+ *
+ * Returns: true on success, false on error or if not supported
+ */
+bool qcrypto_tls_creds_reload(QCryptoTLSCreds *creds,
+                              Error **errp);
 
 #endif /* QCRYPTO_TLSCREDS_H */

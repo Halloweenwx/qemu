@@ -24,15 +24,19 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/mips/mips.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
+#include "exec/cpu-common.h"
 #include "migration/vmstate.h"
+#include "qapi/error.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "exec/address-spaces.h"
+#include "system/address-spaces.h"
+#include "system/physmem.h"
 #include "trace.h"
+#include "qom/object.h"
 
 /********************************************************/
 /* rc4030 emulation                                     */
@@ -54,12 +58,11 @@ typedef struct dma_pagetable_entry {
 #define DMA_FLAG_ADDR_INTR  0x0400
 
 #define TYPE_RC4030 "rc4030"
-#define RC4030(obj) \
-    OBJECT_CHECK(rc4030State, (obj), TYPE_RC4030)
+OBJECT_DECLARE_SIMPLE_TYPE(rc4030State, RC4030)
 
 #define TYPE_RC4030_IOMMU_MEMORY_REGION "rc4030-iommu-memory-region"
 
-typedef struct rc4030State {
+struct rc4030State {
 
     SysBusDevice parent;
 
@@ -100,7 +103,7 @@ typedef struct rc4030State {
 
     MemoryRegion iomem_chipset;
     MemoryRegion iomem_jazzio;
-} rc4030State;
+};
 
 static void set_next_tick(rc4030State *s)
 {
@@ -301,7 +304,7 @@ static void rc4030_write(void *opaque, hwaddr addr, uint64_t data,
         if (s->cache_ltag == 0x80000001 && s->cache_bmask == 0xf0f0f0f) {
             hwaddr dest = s->cache_ptag & ~0x1;
             dest += (s->cache_maint & 0x3) << 3;
-            cpu_physical_memory_write(dest, &val, 4);
+            physical_memory_write(dest, &val, 4);
         }
         break;
     /* Remote Speed Registers */
@@ -567,7 +570,7 @@ static const VMStateDescription vmstate_rc4030 = {
     .name = "rc4030",
     .version_id = 3,
     .post_load = rc4030_post_load,
-    .fields = (VMStateField []) {
+    .fields = (const VMStateField []) {
         VMSTATE_UINT32(config, rc4030State),
         VMSTATE_UINT32(invalid_address_register, rc4030State),
         VMSTATE_UINT32_2DARRAY(dma_regs, rc4030State, 8, 4),
@@ -645,8 +648,8 @@ static rc4030_dma *rc4030_allocate_dmas(void *opaque, int n)
     struct rc4030DMAState *p;
     int i;
 
-    s = (rc4030_dma *)g_new0(rc4030_dma, n);
-    p = (struct rc4030DMAState *)g_new0(struct rc4030DMAState, n);
+    s = g_new0(rc4030_dma, n);
+    p = g_new0(struct rc4030DMAState, n);
     for (i = 0; i < n; i++) {
         p->opaque = opaque;
         p->n = i;
@@ -690,7 +693,7 @@ static void rc4030_realize(DeviceState *dev, Error **errp)
     address_space_init(&s->dma_as, MEMORY_REGION(&s->dma_mr), "rc4030-dma");
 }
 
-static void rc4030_unrealize(DeviceState *dev, Error **errp)
+static void rc4030_unrealize(DeviceState *dev)
 {
     rc4030State *s = RC4030(dev);
 
@@ -700,13 +703,13 @@ static void rc4030_unrealize(DeviceState *dev, Error **errp)
     object_unparent(OBJECT(&s->dma_mr));
 }
 
-static void rc4030_class_init(ObjectClass *klass, void *class_data)
+static void rc4030_class_init(ObjectClass *klass, const void *class_data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = rc4030_realize;
     dc->unrealize = rc4030_unrealize;
-    dc->reset = rc4030_reset;
+    device_class_set_legacy_reset(dc, rc4030_reset);
     dc->vmsd = &vmstate_rc4030;
 }
 
@@ -719,7 +722,7 @@ static const TypeInfo rc4030_info = {
 };
 
 static void rc4030_iommu_memory_region_class_init(ObjectClass *klass,
-                                                  void *data)
+                                                  const void *data)
 {
     IOMMUMemoryRegionClass *imrc = IOMMU_MEMORY_REGION_CLASS(klass);
 
@@ -744,8 +747,8 @@ DeviceState *rc4030_init(rc4030_dma **dmas, IOMMUMemoryRegion **dma_mr)
 {
     DeviceState *dev;
 
-    dev = qdev_create(NULL, TYPE_RC4030);
-    qdev_init_nofail(dev);
+    dev = qdev_new(TYPE_RC4030);
+    sysbus_realize_and_unref(SYS_BUS_DEVICE(dev), &error_fatal);
 
     *dmas = rc4030_allocate_dmas(dev, 4);
     *dma_mr = &RC4030(dev)->dma_mr;

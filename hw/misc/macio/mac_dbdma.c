@@ -38,13 +38,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/ppc/mac_dbdma.h"
 #include "migration/vmstate.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "qemu/log.h"
-#include "sysemu/dma.h"
+#include "system/dma.h"
 
 /* debug DBDMA */
 #define DEBUG_DBDMA 0
@@ -94,7 +94,7 @@ static void dbdma_cmdptr_load(DBDMA_channel *ch)
     DBDMA_DPRINTFCH(ch, "dbdma_cmdptr_load 0x%08x\n",
                     ch->regs[DBDMA_CMDPTR_LO]);
     dma_memory_read(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
-                    &ch->current, sizeof(dbdma_cmd));
+                    &ch->current, sizeof(dbdma_cmd), MEMTXATTRS_UNSPECIFIED);
 }
 
 static void dbdma_cmdptr_save(DBDMA_channel *ch)
@@ -104,7 +104,7 @@ static void dbdma_cmdptr_save(DBDMA_channel *ch)
                     le16_to_cpu(ch->current.xfer_status),
                     le16_to_cpu(ch->current.res_count));
     dma_memory_write(&address_space_memory, ch->regs[DBDMA_CMDPTR_LO],
-                     &ch->current, sizeof(dbdma_cmd));
+                     &ch->current, sizeof(dbdma_cmd), MEMTXATTRS_UNSPECIFIED);
 }
 
 static void kill_channel(DBDMA_channel *ch)
@@ -371,7 +371,8 @@ static void load_word(DBDMA_channel *ch, int key, uint32_t addr,
         return;
     }
 
-    dma_memory_read(&address_space_memory, addr, &current->cmd_dep, len);
+    dma_memory_read(&address_space_memory, addr, &current->cmd_dep, len,
+                    MEMTXATTRS_UNSPECIFIED);
 
     if (conditional_wait(ch))
         goto wait;
@@ -403,7 +404,8 @@ static void store_word(DBDMA_channel *ch, int key, uint32_t addr,
         return;
     }
 
-    dma_memory_write(&address_space_memory, addr, &current->cmd_dep, len);
+    dma_memory_write(&address_space_memory, addr, &current->cmd_dep, len,
+                     MEMTXATTRS_UNSPECIFIED);
 
     if (conditional_wait(ch))
         goto wait;
@@ -702,7 +704,7 @@ static void dbdma_write(void *opaque, hwaddr addr,
     DBDMA_channel *ch = &s->channels[channel];
     int reg = (addr - (channel << DBDMA_CHANNEL_SHIFT)) >> 2;
 
-    DBDMA_DPRINTFCH(ch, "writel 0x" TARGET_FMT_plx " <= 0x%08"PRIx64"\n",
+    DBDMA_DPRINTFCH(ch, "writel 0x" HWADDR_FMT_plx " <= 0x%08"PRIx64"\n",
                     addr, value);
     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",
                     (uint32_t)addr >> DBDMA_CHANNEL_SHIFT, reg);
@@ -713,22 +715,25 @@ static void dbdma_write(void *opaque, hwaddr addr,
         return;
     }
 
-    ch->regs[reg] = value;
-
     switch(reg) {
     case DBDMA_CONTROL:
+        ch->regs[DBDMA_CONTROL] = value;
         dbdma_control_write(ch);
         break;
     case DBDMA_CMDPTR_LO:
         /* 16-byte aligned */
-        ch->regs[DBDMA_CMDPTR_LO] &= ~0xf;
+        ch->regs[DBDMA_CMDPTR_LO] = value & ~0xf;
         dbdma_cmdptr_load(ch);
         break;
     case DBDMA_STATUS:
     case DBDMA_INTR_SEL:
     case DBDMA_BRANCH_SEL:
     case DBDMA_WAIT_SEL:
-        /* nothing to do */
+    case DBDMA_RES1:
+    case DBDMA_RES2:
+    case DBDMA_RES3:
+    case DBDMA_RES4:
+        ch->regs[reg] = value;
         break;
     case DBDMA_XFER_MODE:
     case DBDMA_CMDPTR_HI:
@@ -736,11 +741,10 @@ static void dbdma_write(void *opaque, hwaddr addr,
     case DBDMA_DATA2PTR_LO:
     case DBDMA_ADDRESS_HI:
     case DBDMA_BRANCH_ADDR_HI:
-    case DBDMA_RES1:
-    case DBDMA_RES2:
-    case DBDMA_RES3:
-    case DBDMA_RES4:
         /* unused */
+        break;
+    default:
+        /* do nothing */
         break;
     }
 }
@@ -754,8 +758,6 @@ static uint64_t dbdma_read(void *opaque, hwaddr addr,
     DBDMA_channel *ch = &s->channels[channel];
     int reg = (addr - (channel << DBDMA_CHANNEL_SHIFT)) >> 2;
 
-    value = ch->regs[reg];
-
     switch(reg) {
     case DBDMA_CONTROL:
         value = ch->regs[DBDMA_STATUS];
@@ -765,7 +767,11 @@ static uint64_t dbdma_read(void *opaque, hwaddr addr,
     case DBDMA_INTR_SEL:
     case DBDMA_BRANCH_SEL:
     case DBDMA_WAIT_SEL:
-        /* nothing to do */
+    case DBDMA_RES1:
+    case DBDMA_RES2:
+    case DBDMA_RES3:
+    case DBDMA_RES4:
+        value = ch->regs[reg];
         break;
     case DBDMA_XFER_MODE:
     case DBDMA_CMDPTR_HI:
@@ -776,15 +782,13 @@ static uint64_t dbdma_read(void *opaque, hwaddr addr,
         /* unused */
         value = 0;
         break;
-    case DBDMA_RES1:
-    case DBDMA_RES2:
-    case DBDMA_RES3:
-    case DBDMA_RES4:
-        /* reserved */
+    default:
+        /* unimplemented */
+        value = 0;
         break;
     }
 
-    DBDMA_DPRINTFCH(ch, "readl 0x" TARGET_FMT_plx " => 0x%08x\n", addr, value);
+    DBDMA_DPRINTFCH(ch, "readl 0x" HWADDR_FMT_plx " => 0x%08x\n", addr, value);
     DBDMA_DPRINTFCH(ch, "channel 0x%x reg 0x%x\n",
                     (uint32_t)addr >> DBDMA_CHANNEL_SHIFT, reg);
 
@@ -805,7 +809,7 @@ static const VMStateDescription vmstate_dbdma_io = {
     .name = "dbdma_io",
     .version_id = 0,
     .minimum_version_id = 0,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT64(addr, struct DBDMA_io),
         VMSTATE_INT32(len, struct DBDMA_io),
         VMSTATE_INT32(is_last, struct DBDMA_io),
@@ -819,7 +823,7 @@ static const VMStateDescription vmstate_dbdma_cmd = {
     .name = "dbdma_cmd",
     .version_id = 0,
     .minimum_version_id = 0,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT16(req_count, dbdma_cmd),
         VMSTATE_UINT16(command, dbdma_cmd),
         VMSTATE_UINT32(phy_addr, dbdma_cmd),
@@ -834,7 +838,7 @@ static const VMStateDescription vmstate_dbdma_channel = {
     .name = "dbdma_channel",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, struct DBDMA_channel, DBDMA_REGS),
         VMSTATE_STRUCT(io, struct DBDMA_channel, 0, vmstate_dbdma_io, DBDMA_io),
         VMSTATE_STRUCT(current, struct DBDMA_channel, 0, vmstate_dbdma_cmd,
@@ -847,7 +851,7 @@ static const VMStateDescription vmstate_dbdma = {
     .name = "dbdma",
     .version_id = 3,
     .minimum_version_id = 3,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(channels, DBDMAState, DBDMA_CHANNELS, 1,
                              vmstate_dbdma_channel, DBDMA_channel),
         VMSTATE_END_OF_LIST()
@@ -912,15 +916,15 @@ static void mac_dbdma_realize(DeviceState *dev, Error **errp)
 {
     DBDMAState *s = MAC_DBDMA(dev);
 
-    s->bh = qemu_bh_new(DBDMA_run_bh, s);
+    s->bh = qemu_bh_new_guarded(DBDMA_run_bh, s, &dev->mem_reentrancy_guard);
 }
 
-static void mac_dbdma_class_init(ObjectClass *oc, void *data)
+static void mac_dbdma_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     dc->realize = mac_dbdma_realize;
-    dc->reset = mac_dbdma_reset;
+    device_class_set_legacy_reset(dc, mac_dbdma_reset);
     dc->vmsd = &vmstate_dbdma;
 }
 

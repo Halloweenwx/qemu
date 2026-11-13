@@ -1,7 +1,6 @@
 /*
  * Raspberry Pi emulation (c) 2012 Gregory Estrade
  * Refactoring for Pi2 Copyright (c) 2015, Microsoft. Written by Andrew Baumann.
- * This code is licensed under the GNU GPLv2 and later.
  * Heavily based on pl190.c, copyright terms below:
  *
  * Arm PrimeCell PL190 Vector Interrupt Controller
@@ -9,15 +8,17 @@
  * Copyright (c) 2006 CodeSourcery.
  * Written by Paul Brook
  *
- * This code is licensed under the GPL.
+ * This work is licensed under the terms of the GNU GPL, version 2 or later.
+ * See the COPYING file in the top-level directory.
  */
 
 #include "qemu/osdep.h"
 #include "hw/intc/bcm2835_ic.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "trace.h"
 
 #define GPU_IRQS 64
 #define ARM_IRQS 8
@@ -51,7 +52,6 @@ static void bcm2835_ic_update(BCM2835ICState *s)
     set = (s->gpu_irq_level & s->gpu_irq_enable)
         || (s->arm_irq_level & s->arm_irq_enable);
     qemu_set_irq(s->irq, set);
-
 }
 
 static void bcm2835_ic_set_gpu_irq(void *opaque, int irq, int level)
@@ -59,6 +59,7 @@ static void bcm2835_ic_set_gpu_irq(void *opaque, int irq, int level)
     BCM2835ICState *s = opaque;
 
     assert(irq >= 0 && irq < 64);
+    trace_bcm2835_ic_set_gpu_irq(irq, level);
     s->gpu_irq_level = deposit64(s->gpu_irq_level, irq, 1, level != 0);
     bcm2835_ic_update(s);
 }
@@ -68,6 +69,7 @@ static void bcm2835_ic_set_arm_irq(void *opaque, int irq, int level)
     BCM2835ICState *s = opaque;
 
     assert(irq >= 0 && irq < 8);
+    trace_bcm2835_ic_set_cpu_irq(irq, level);
     s->arm_irq_level = deposit32(s->arm_irq_level, irq, 1, level != 0);
     bcm2835_ic_update(s);
 }
@@ -137,10 +139,19 @@ static void bcm2835_ic_write(void *opaque, hwaddr offset, uint64_t val,
     BCM2835ICState *s = opaque;
 
     switch (offset) {
-    case FIQ_CONTROL:
-        s->fiq_select = extract32(val, 0, 7);
+    case FIQ_CONTROL: {
+        unsigned fiq_select = extract32(val, 0, 7);
+
+        if (fiq_select >= GPU_IRQS + ARM_IRQS) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: FIQ select %u out of range\n",
+                          __func__, fiq_select);
+            return;
+        }
+        s->fiq_select = fiq_select;
         s->fiq_enable = extract32(val, 7, 1);
         break;
+    }
     case IRQ_ENABLE_1:
         s->gpu_irq_enable |= val;
         break;
@@ -206,7 +217,7 @@ static const VMStateDescription vmstate_bcm2835_ic = {
     .name = TYPE_BCM2835_IC,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT64(gpu_irq_level, BCM2835ICState),
         VMSTATE_UINT64(gpu_irq_enable, BCM2835ICState),
         VMSTATE_UINT8(arm_irq_level, BCM2835ICState),
@@ -217,15 +228,15 @@ static const VMStateDescription vmstate_bcm2835_ic = {
     }
 };
 
-static void bcm2835_ic_class_init(ObjectClass *klass, void *data)
+static void bcm2835_ic_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = bcm2835_ic_reset;
+    device_class_set_legacy_reset(dc, bcm2835_ic_reset);
     dc->vmsd = &vmstate_bcm2835_ic;
 }
 
-static TypeInfo bcm2835_ic_info = {
+static const TypeInfo bcm2835_ic_info = {
     .name          = TYPE_BCM2835_IC,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(BCM2835ICState),

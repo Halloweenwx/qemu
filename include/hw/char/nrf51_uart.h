@@ -11,15 +11,16 @@
 #ifndef NRF51_UART_H
 #define NRF51_UART_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "chardev/char-fe.h"
-#include "hw/registerfields.h"
+#include "hw/core/registerfields.h"
+#include "qom/object.h"
 
 #define UART_FIFO_LENGTH 6
 #define UART_SIZE 0x1000
 
 #define TYPE_NRF51_UART "nrf51_soc.uart"
-#define NRF51_UART(obj) OBJECT_CHECK(NRF51UARTState, (obj), TYPE_NRF51_UART)
+OBJECT_DECLARE_SIMPLE_TYPE(NRF51UARTState, NRF51_UART)
 
 REG32(UART_STARTRX, 0x000)
 REG32(UART_STOPRX, 0x004)
@@ -54,11 +55,11 @@ REG32(UART_TXD, 0x51C)
 REG32(UART_BAUDRATE, 0x524)
 REG32(UART_CONFIG, 0x56C)
 
-typedef struct NRF51UARTState {
+struct NRF51UARTState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
-    CharBackend chr;
+    CharFrontend chr;
     qemu_irq irq;
     guint watch_tag;
 
@@ -72,6 +73,6 @@ typedef struct NRF51UARTState {
     bool tx_started;
     bool pending_tx_byte;
     bool enabled;
-} NRF51UARTState;
+};
 
 #endif

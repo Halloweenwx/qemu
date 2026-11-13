@@ -11,11 +11,12 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "hw/ipack/ipack.h"
-#include "hw/irq.h"
-#include "hw/pci/pci.h"
+#include "hw/core/irq.h"
+#include "hw/pci/pci_device.h"
 #include "migration/vmstate.h"
 #include "qemu/bitops.h"
 #include "qemu/module.h"
+#include "qom/object.h"
 
 /* #define DEBUG_TPCI */
 
@@ -54,7 +55,7 @@
 #define REG_STATUS    0x0C
 #define IP_N_FROM_REG(REG) ((REG) / 2 - 1)
 
-typedef struct {
+struct TPCI200State {
     PCIDevice dev;
     IPackBus bus;
     MemoryRegion mmio;
@@ -67,12 +68,11 @@ typedef struct {
     uint8_t ctrl[N_MODULES];
     uint16_t status;
     uint8_t int_set;
-} TPCI200State;
+};
 
 #define TYPE_TPCI200 "tpci200"
 
-#define TPCI200(obj) \
-    OBJECT_CHECK(TPCI200State, (obj), TYPE_TPCI200)
+OBJECT_DECLARE_SIMPLE_TYPE(TPCI200State, TPCI200)
 
 static const uint8_t local_config_regs[] = {
     0x00, 0xFF, 0xFF, 0x0F, 0x00, 0xFC, 0xFF, 0x0F, 0x00, 0x00, 0x00,
@@ -275,11 +275,11 @@ static void tpci200_write_las0(void *opaque, hwaddr addr, uint64_t val,
                 if (ip != NULL) {
                     if (val & STATUS_INT(i, 0)) {
                         DPRINTF("Clear IP %c INT0# status\n", 'A' + i);
-                        qemu_irq_lower(ip->irq[0]);
+                        qemu_irq_lower(&ip->irq[0]);
                     }
                     if (val & STATUS_INT(i, 1)) {
                         DPRINTF("Clear IP %c INT1# status\n", 'A' + i);
-                        qemu_irq_lower(ip->irq[1]);
+                        qemu_irq_lower(&ip->irq[1]);
                     }
                 }
 
@@ -344,7 +344,7 @@ static uint64_t tpci200_read_las1(void *opaque, hwaddr addr, unsigned size)
                 bool int_set = s->status & STATUS_INT(ip_n, intno);
                 bool int_edge_sensitive = s->ctrl[ip_n] & CTRL_INT_EDGE(intno);
                 if (int_set && !int_edge_sensitive) {
-                    qemu_irq_lower(ip->irq[intno]);
+                    qemu_irq_lower(&ip->irq[intno]);
                 }
             }
 
@@ -611,15 +611,15 @@ static void tpci200_realize(PCIDevice *pci_dev, Error **errp)
     pci_register_bar(&s->dev, 4, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->las2);
     pci_register_bar(&s->dev, 5, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->las3);
 
-    ipack_bus_new_inplace(&s->bus, sizeof(s->bus), DEVICE(pci_dev), NULL,
-                          N_MODULES, tpci200_set_irq);
+    ipack_bus_init(&s->bus, sizeof(s->bus), DEVICE(pci_dev),
+                   N_MODULES, tpci200_set_irq);
 }
 
 static const VMStateDescription vmstate_tpci200 = {
     .name = "tpci200",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, TPCI200State),
         VMSTATE_BOOL_ARRAY(big_endian, TPCI200State, 3),
         VMSTATE_UINT8_ARRAY(ctrl, TPCI200State, N_MODULES),
@@ -629,7 +629,7 @@ static const VMStateDescription vmstate_tpci200 = {
     }
 };
 
-static void tpci200_class_init(ObjectClass *klass, void *data)
+static void tpci200_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -650,7 +650,7 @@ static const TypeInfo tpci200_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(TPCI200State),
     .class_init    = tpci200_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },

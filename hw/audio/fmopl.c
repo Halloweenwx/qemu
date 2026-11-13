@@ -355,7 +355,7 @@ static void set_algorithm( OPL_CH *CH)
 	CH->connect2 = carrier;
 }
 
-/* ---------- frequency counter for operater update ---------- */
+/* ---------- frequency counter for operator update ---------- */
 static inline void CALC_FCSLOT(OPL_CH *CH,OPL_SLOT *SLOT)
 {
 	int ksr;
@@ -607,26 +607,11 @@ static int OPLOpenTable( void )
 	double pom;
 
 	/* allocate dynamic tables */
-	if( (TL_TABLE = malloc(TL_MAX*2*sizeof(int32_t))) == NULL)
-		return 0;
-	if( (SIN_TABLE = malloc(SIN_ENT*4 *sizeof(int32_t *))) == NULL)
-	{
-		free(TL_TABLE);
-		return 0;
-	}
-	if( (AMS_TABLE = malloc(AMS_ENT*2 *sizeof(int32_t))) == NULL)
-	{
-		free(TL_TABLE);
-		free(SIN_TABLE);
-		return 0;
-	}
-	if( (VIB_TABLE = malloc(VIB_ENT*2 *sizeof(int32_t))) == NULL)
-	{
-		free(TL_TABLE);
-		free(SIN_TABLE);
-		free(AMS_TABLE);
-		return 0;
-	}
+    TL_TABLE = g_new(int32_t, TL_MAX * 2);
+    SIN_TABLE = g_new(int32_t *, SIN_ENT * 4);
+    AMS_TABLE = g_new(int32_t, AMS_ENT * 2);
+    VIB_TABLE = g_new(int32_t, VIB_ENT * 2);
+    ENV_CURVE = g_new(int32_t, 2 * EG_ENT + 1);
 	/* make total level table */
 	for (t = 0;t < EG_ENT-1 ;t++){
 		rate = ((1<<TL_BITS)-1)/pow(10,EG_STEP*t/20);	/* dB -> voltage */
@@ -639,7 +624,7 @@ static int OPLOpenTable( void )
 		TL_TABLE[t] = TL_TABLE[TL_MAX+t] = 0;
 	}
 
-	/* make sinwave table (total level offet) */
+	/* make sinwave table (total level offset) */
 	/* degree 0 = degree 180                   = off */
 	SIN_TABLE[0] = SIN_TABLE[SIN_ENT/2]         = &TL_TABLE[EG_ENT-1];
 	for (s = 1;s <= SIN_ENT/4;s++){
@@ -694,10 +679,11 @@ static int OPLOpenTable( void )
 
 static void OPLCloseTable( void )
 {
-	free(TL_TABLE);
-	free(SIN_TABLE);
-	free(AMS_TABLE);
-	free(VIB_TABLE);
+    g_clear_pointer(&ENV_CURVE, g_free);
+    g_clear_pointer(&TL_TABLE, g_free);
+    g_clear_pointer(&SIN_TABLE, g_free);
+    g_clear_pointer(&AMS_TABLE, g_free);
+    g_clear_pointer(&VIB_TABLE, g_free);
 }
 
 /* CSM Key Control */
@@ -1073,25 +1059,21 @@ FM_OPL *OPLCreate(int clock, int rate)
 	char *ptr;
 	FM_OPL *OPL;
 	int state_size;
-	int max_ch = 9; /* normaly 9 channels */
+	int max_ch = 9; /* normally 9 channels */
 
 	if( OPL_LockTable() ==-1) return NULL;
 	/* allocate OPL state space */
 	state_size  = sizeof(FM_OPL);
 	state_size += sizeof(OPL_CH)*max_ch;
-	/* allocate memory block */
-	ptr = malloc(state_size);
-	if(ptr==NULL) return NULL;
-	/* clear */
-	memset(ptr,0,state_size);
+    /* allocate memory block and zero-initialize */
+    ptr = g_malloc0(state_size);
 	OPL        = (FM_OPL *)ptr; ptr+=sizeof(FM_OPL);
 	OPL->P_CH  = (OPL_CH *)ptr; ptr+=sizeof(OPL_CH)*max_ch;
 	/* set channel state pointer */
 	OPL->clock = clock;
 	OPL->rate  = rate;
 	OPL->max_ch = max_ch;
-    ENV_CURVE = g_new(int32_t, 2 * EG_ENT + 1);
-	/* init grobal tables */
+	/* init global tables */
 	OPL_initialize(OPL);
 	/* reset chip */
 	OPLResetChip(OPL);
@@ -1127,8 +1109,7 @@ void OPLDestroy(FM_OPL *OPL)
 	}
 #endif
 	OPL_UnLockTable();
-	free(OPL);
-    g_free(ENV_CURVE);
+    g_free(OPL);
 }
 
 /* ----------  Option handlers ----------       */

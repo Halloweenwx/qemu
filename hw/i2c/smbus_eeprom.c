@@ -25,29 +25,29 @@
 #include "qemu/osdep.h"
 #include "qemu/units.h"
 #include "qapi/error.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
 #include "hw/i2c/i2c.h"
 #include "hw/i2c/smbus_slave.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/i2c/smbus_eeprom.h"
+#include "qom/object.h"
 
 //#define DEBUG
 
 #define TYPE_SMBUS_EEPROM "smbus-eeprom"
 
-#define SMBUS_EEPROM(obj) \
-    OBJECT_CHECK(SMBusEEPROMDevice, (obj), TYPE_SMBUS_EEPROM)
+OBJECT_DECLARE_SIMPLE_TYPE(SMBusEEPROMDevice, SMBUS_EEPROM)
 
 #define SMBUS_EEPROM_SIZE 256
 
-typedef struct SMBusEEPROMDevice {
+struct SMBusEEPROMDevice {
     SMBusDevice smbusdev;
     uint8_t data[SMBUS_EEPROM_SIZE];
     uint8_t *init_data;
     uint8_t offset;
     bool accessed;
-} SMBusEEPROMDevice;
+};
 
 static uint8_t eeprom_receive_byte(SMBusDevice *dev)
 {
@@ -88,11 +88,9 @@ static int eeprom_write_data(SMBusDevice *dev, uint8_t *buf, uint8_t len)
 
 static bool smbus_eeprom_vmstate_needed(void *opaque)
 {
-    MachineClass *mc = MACHINE_GET_CLASS(qdev_get_machine());
     SMBusEEPROMDevice *eeprom = opaque;
 
-    return (eeprom->accessed || smbus_vmstate_needed(&eeprom->smbusdev)) &&
-        !mc->smbus_no_migration_support;
+    return eeprom->accessed || smbus_vmstate_needed(&eeprom->smbusdev);
 }
 
 static const VMStateDescription vmstate_smbus_eeprom = {
@@ -100,7 +98,7 @@ static const VMStateDescription vmstate_smbus_eeprom = {
     .version_id = 1,
     .minimum_version_id = 1,
     .needed = smbus_eeprom_vmstate_needed,
-    .fields      = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_SMBUS_DEVICE(smbusdev, SMBusEEPROMDevice),
         VMSTATE_UINT8_ARRAY(data, SMBusEEPROMDevice, SMBUS_EEPROM_SIZE),
         VMSTATE_UINT8(offset, SMBusEEPROMDevice),
@@ -137,13 +135,13 @@ static void smbus_eeprom_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static void smbus_eeprom_class_initfn(ObjectClass *klass, void *data)
+static void smbus_eeprom_class_initfn(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SMBusDeviceClass *sc = SMBUS_DEVICE_CLASS(klass);
 
     dc->realize = smbus_eeprom_realize;
-    dc->reset = smbus_eeprom_reset;
+    device_class_set_legacy_reset(dc, smbus_eeprom_reset);
     sc->receive_byte = eeprom_receive_byte;
     sc->write_data = eeprom_write_data;
     dc->vmsd = &vmstate_smbus_eeprom;
@@ -151,29 +149,26 @@ static void smbus_eeprom_class_initfn(ObjectClass *klass, void *data)
     dc->user_creatable = false;
 }
 
-static const TypeInfo smbus_eeprom_info = {
-    .name          = TYPE_SMBUS_EEPROM,
-    .parent        = TYPE_SMBUS_DEVICE,
-    .instance_size = sizeof(SMBusEEPROMDevice),
-    .class_init    = smbus_eeprom_class_initfn,
+static const TypeInfo smbus_eeprom_types[] = {
+    {
+        .name          = TYPE_SMBUS_EEPROM,
+        .parent        = TYPE_SMBUS_DEVICE,
+        .instance_size = sizeof(SMBusEEPROMDevice),
+        .class_init    = smbus_eeprom_class_initfn,
+    },
 };
 
-static void smbus_eeprom_register_types(void)
-{
-    type_register_static(&smbus_eeprom_info);
-}
-
-type_init(smbus_eeprom_register_types)
+DEFINE_TYPES(smbus_eeprom_types)
 
 void smbus_eeprom_init_one(I2CBus *smbus, uint8_t address, uint8_t *eeprom_buf)
 {
     DeviceState *dev;
 
-    dev = qdev_create((BusState *) smbus, TYPE_SMBUS_EEPROM);
+    dev = qdev_new(TYPE_SMBUS_EEPROM);
     qdev_prop_set_uint8(dev, "address", address);
     /* FIXME: use an array of byte or block backend property? */
     SMBUS_EEPROM(dev)->init_data = eeprom_buf;
-    qdev_init_nofail(dev);
+    qdev_realize_and_unref(dev, (BusState *)smbus, &error_fatal);
 }
 
 void smbus_eeprom_init(I2CBus *smbus, int nb_eeprom,
@@ -195,8 +190,7 @@ void smbus_eeprom_init(I2CBus *smbus, int nb_eeprom,
 }
 
 /* Generate SDRAM SPD EEPROM data describing a module of type and size */
-uint8_t *spd_data_generate(enum sdram_type type, ram_addr_t ram_size,
-                           Error **errp)
+uint8_t *spd_data_generate(enum sdram_type type, ram_addr_t ram_size)
 {
     uint8_t *spd;
     uint8_t nbanks;
@@ -222,39 +216,18 @@ uint8_t *spd_data_generate(enum sdram_type type, ram_addr_t ram_size,
         g_assert_not_reached();
     }
     size = ram_size >> 20; /* work in terms of megabytes */
-    if (size < 4) {
-        error_setg(errp, "SDRAM size is too small");
-        return NULL;
-    }
     sz_log2 = 31 - clz32(size);
     size = 1U << sz_log2;
-    if (ram_size > size * MiB) {
-        error_setg(errp, "SDRAM size 0x"RAM_ADDR_FMT" is not a power of 2, "
-                   "truncating to %u MB", ram_size, size);
-    }
-    if (sz_log2 < min_log2) {
-        error_setg(errp,
-                   "Memory size is too small for SDRAM type, adjusting type");
-        if (size >= 32) {
-            type = DDR;
-            min_log2 = 5;
-            max_log2 = 12;
-        } else {
-            type = SDR;
-            min_log2 = 2;
-            max_log2 = 9;
-        }
-    }
+    assert(ram_size == size * MiB);
+    assert(sz_log2 >= min_log2);
 
     nbanks = 1;
     while (sz_log2 > max_log2 && nbanks < 8) {
         sz_log2--;
-        nbanks++;
+        nbanks *= 2;
     }
 
-    if (size > (1ULL << sz_log2) * nbanks) {
-        error_setg(errp, "Memory size is too big for SDRAM, truncating");
-    }
+    assert(size == (1ULL << sz_log2) * nbanks);
 
     /* split to 2 banks if possible to avoid a bug in MIPS Malta firmware */
     if (nbanks == 1 && sz_log2 > min_log2) {
@@ -298,7 +271,7 @@ uint8_t *spd_data_generate(enum sdram_type type, ram_addr_t ram_size,
     spd[18] = 12;   /* ~CAS latencies supported */
     spd[19] = (type == DDR2 ? 0 : 1); /* reserved / ~CS latencies supported */
     spd[20] = 2;    /* DIMM type / ~WE latencies */
-                    /* module features */
+    spd[21] = (type < DDR2 ? 0x20 : 0); /* module features */
                     /* memory chip features */
     spd[23] = 0x12; /* clock cycle time @ medium CAS latency */
                     /* data access time */
@@ -313,6 +286,7 @@ uint8_t *spd_data_generate(enum sdram_type type, ram_addr_t ram_size,
     spd[33] = 8;    /* addr/cmd hold time */
     spd[34] = 20;   /* data input setup time */
     spd[35] = 8;    /* data input hold time */
+    spd[36] = (type == DDR2 ? 13 << 2 : 0); /* min. write recovery time */
 
     /* checksum */
     for (i = 0; i < 63; i++) {

@@ -35,16 +35,15 @@
 #ifndef HW_SPLIT_IRQ_H
 #define HW_SPLIT_IRQ_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qom/object.h"
 
 #define TYPE_SPLIT_IRQ "split-irq"
 
 #define MAX_SPLIT_LINES 16
 
-typedef struct SplitIRQ SplitIRQ;
 
-#define SPLIT_IRQ(obj) OBJECT_CHECK(SplitIRQ, (obj), TYPE_SPLIT_IRQ)
+OBJECT_DECLARE_SIMPLE_TYPE(SplitIRQ, SPLIT_IRQ)
 
 struct SplitIRQ {
     DeviceState parent_obj;

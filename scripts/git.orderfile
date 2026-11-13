@@ -9,15 +9,18 @@
 #   git config diff.orderFile scripts/git.orderfile
 #
 
+MAINTAINERS
+
 # Documentation
 docs/*
 *.rst
-*.texi
+*.rst.inc
 
 # build system
 configure
 Makefile*
 *.mak
+meson.build
 
 # qapi schema
 qapi/*.json
@@ -28,9 +31,15 @@ qga/*.json
 
 # headers
 *.h
+*.h.inc
 
 # decoding tree specification
 *.decode
 
 # code
 *.c
+*.c.inc
+
+# Generated Dockerfiles
+tests/lcitool/refresh
+tests/docker/dockerfiles/*

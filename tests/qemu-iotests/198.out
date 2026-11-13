@@ -1,12 +1,12 @@
 QA output created by 198
 == create base ==
-Formatting 'TEST_DIR/t.IMGFMT.base', fmt=IMGFMT size=16777216 encrypt.format=luks encrypt.key-secret=sec0 encrypt.iter-time=10
+Formatting 'TEST_DIR/t.IMGFMT.base', fmt=IMGFMT size=16777216
 
 == writing whole image base ==
 wrote 16777216/16777216 bytes at offset 0
 16 MiB, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
 == create overlay ==
-Formatting 'TEST_DIR/t.IMGFMT', fmt=IMGFMT size=16777216 backing_file=TEST_DIR/t.IMGFMT.base encrypt.format=luks encrypt.key-secret=sec1 encrypt.iter-time=10
+Formatting 'TEST_DIR/t.IMGFMT', fmt=IMGFMT size=16777216 backing_file=TEST_DIR/t.IMGFMT.base backing_fmt=IMGFMT
 
 == writing whole image layer ==
 wrote 16777216/16777216 bytes at offset 0
@@ -36,8 +36,10 @@ image: json:{ /* filtered */ }
 file format: IMGFMT
 virtual size: 16 MiB (16777216 bytes)
 Format specific information:
+    compression type: COMPRESSION_TYPE
     encrypt:
         ivgen alg: plain64
+        detached header: false
         hash alg: sha256
         cipher alg: aes-256
         uuid: 00000000-0000-0000-0000-000000000000
@@ -78,9 +80,12 @@ image: json:{ /* filtered */ }
 file format: IMGFMT
 virtual size: 16 MiB (16777216 bytes)
 backing file: TEST_DIR/t.IMGFMT.base
+backing file format: IMGFMT
 Format specific information:
+    compression type: COMPRESSION_TYPE
     encrypt:
         ivgen alg: plain64
+        detached header: false
         hash alg: sha256
         cipher alg: aes-256
         uuid: 00000000-0000-0000-0000-000000000000

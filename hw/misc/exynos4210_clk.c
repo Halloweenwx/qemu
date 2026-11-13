@@ -18,14 +18,14 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
+#include "qom/object.h"
 
 #define TYPE_EXYNOS4210_CLK             "exynos4210.clk"
-#define EXYNOS4210_CLK(obj) \
-    OBJECT_CHECK(Exynos4210ClkState, (obj), TYPE_EXYNOS4210_CLK)
+OBJECT_DECLARE_SIMPLE_TYPE(Exynos4210ClkState, EXYNOS4210_CLK)
 
 #define CLK_PLL_LOCKED                  BIT(29)
 
@@ -55,12 +55,12 @@ static const Exynos4210Reg exynos4210_clk_regs[] = {
 
 #define EXYNOS4210_REGS_NUM       ARRAY_SIZE(exynos4210_clk_regs)
 
-typedef struct Exynos4210ClkState {
+struct Exynos4210ClkState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     uint32_t reg[EXYNOS4210_REGS_NUM];
-} Exynos4210ClkState;
+};
 
 static uint64_t exynos4210_clk_read(void *opaque, hwaddr offset,
                                     unsigned size)
@@ -135,17 +135,17 @@ static const VMStateDescription exynos4210_clk_vmstate = {
     .name = TYPE_EXYNOS4210_CLK,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(reg, Exynos4210ClkState, EXYNOS4210_REGS_NUM),
         VMSTATE_END_OF_LIST()
     }
 };
 
-static void exynos4210_clk_class_init(ObjectClass *klass, void *data)
+static void exynos4210_clk_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = exynos4210_clk_reset;
+    device_class_set_legacy_reset(dc, exynos4210_clk_reset);
     dc->vmsd = &exynos4210_clk_vmstate;
 }
 

@@ -12,7 +12,6 @@
 #include "qemu/osdep.h"
 #include "hw/usb/hcd-ehci.h"
 #include "hw/usb/chipidea.h"
-#include "qemu/log.h"
 #include "qemu/module.h"
 
 enum {
@@ -145,7 +144,7 @@ static void chipidea_init(Object *obj)
     }
 }
 
-static void chipidea_class_init(ObjectClass *klass, void *data)
+static void chipidea_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SysBusEHCIClass *sec = SYS_BUS_EHCI_CLASS(klass);

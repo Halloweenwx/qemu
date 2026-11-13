@@ -8,7 +8,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -20,15 +20,15 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/irq.h"
-#include "hw/sysbus.h"
+#include "hw/core/irq.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
-#include "qemu/module.h"
+#include "qom/object.h"
 
 #define TYPE_MPC8XXX_GPIO "mpc8xxx_gpio"
-#define MPC8XXX_GPIO(obj) OBJECT_CHECK(MPC8XXXGPIOState, (obj), TYPE_MPC8XXX_GPIO)
+OBJECT_DECLARE_SIMPLE_TYPE(MPC8XXXGPIOState, MPC8XXX_GPIO)
 
-typedef struct MPC8XXXGPIOState {
+struct MPC8XXXGPIOState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
@@ -41,13 +41,13 @@ typedef struct MPC8XXXGPIOState {
     uint32_t ier;
     uint32_t imr;
     uint32_t icr;
-} MPC8XXXGPIOState;
+};
 
 static const VMStateDescription vmstate_mpc8xxx_gpio = {
     .name = "mpc8xxx_gpio",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(dir, MPC8XXXGPIOState),
         VMSTATE_UINT32(odr, MPC8XXXGPIOState),
         VMSTATE_UINT32(dat, MPC8XXXGPIOState),
@@ -199,25 +199,22 @@ static void mpc8xxx_gpio_initfn(Object *obj)
     qdev_init_gpio_out(dev, s->out, 32);
 }
 
-static void mpc8xxx_gpio_class_init(ObjectClass *klass, void *data)
+static void mpc8xxx_gpio_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->vmsd = &vmstate_mpc8xxx_gpio;
-    dc->reset = mpc8xxx_gpio_reset;
+    device_class_set_legacy_reset(dc, mpc8xxx_gpio_reset);
 }
 
-static const TypeInfo mpc8xxx_gpio_info = {
-    .name          = TYPE_MPC8XXX_GPIO,
-    .parent        = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(MPC8XXXGPIOState),
-    .instance_init = mpc8xxx_gpio_initfn,
-    .class_init    = mpc8xxx_gpio_class_init,
+static const TypeInfo mpc8xxx_gpio_types[] = {
+    {
+        .name          = TYPE_MPC8XXX_GPIO,
+        .parent        = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(MPC8XXXGPIOState),
+        .instance_init = mpc8xxx_gpio_initfn,
+        .class_init    = mpc8xxx_gpio_class_init,
+    },
 };
 
-static void mpc8xxx_gpio_register_types(void)
-{
-    type_register_static(&mpc8xxx_gpio_info);
-}
-
-type_init(mpc8xxx_gpio_register_types)
+DEFINE_TYPES(mpc8xxx_gpio_types)

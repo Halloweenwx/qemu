@@ -8,9 +8,9 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/ssi/pl022.h"
 #include "hw/ssi/ssi.h"
 #include "qemu/log.h"
@@ -174,7 +174,7 @@ static void pl022_write(void *opaque, hwaddr offset,
         s->cr1 = value;
         if ((s->cr1 & (PL022_CR1_MS | PL022_CR1_SSE))
                    == (PL022_CR1_MS | PL022_CR1_SSE)) {
-            BADF("SPI slave mode not implemented\n");
+            BADF("SPI peripheral mode not implemented\n");
         }
         pl022_xfer(s);
         break;
@@ -249,7 +249,7 @@ static const VMStateDescription vmstate_pl022 = {
     .version_id = 1,
     .minimum_version_id = 1,
     .post_load = pl022_post_load,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cr0, PL022State),
         VMSTATE_UINT32(cr1, PL022State),
         VMSTATE_UINT32(bitmask, PL022State),
@@ -292,11 +292,11 @@ static void pl022_realize(DeviceState *dev, Error **errp)
     s->ssi = ssi_create_bus(dev, "ssi");
 }
 
-static void pl022_class_init(ObjectClass *klass, void *data)
+static void pl022_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = pl022_reset;
+    device_class_set_legacy_reset(dc, pl022_reset);
     dc->vmsd = &vmstate_pl022;
     dc->realize = pl022_realize;
 }

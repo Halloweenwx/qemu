@@ -430,6 +430,12 @@ Hard disks
   you may corrupt your host data (use the ``-snapshot`` command
   line option or modify the device permissions accordingly).
 
+Zoned block devices
+  Zoned block devices can be passed through to the guest if the emulated storage
+  controller supports zoned storage. Use ``--blockdev host_device,
+  node-name=drive0,filename=/dev/nullb0,cache.direct=on`` to pass through
+  ``/dev/nullb0`` as ``drive0``.
+
 Windows
 ^^^^^^^
 
@@ -511,13 +517,13 @@ of an inet socket:
 
   |qemu_system| linux.img -hdb nbd+unix://?socket=/tmp/my_socket
 
-In this case, the block device must be exported using qemu-nbd:
+In this case, the block device must be exported using ``qemu-nbd``:
 
 .. parsed-literal::
 
   qemu-nbd --socket=/tmp/my_socket my_disk.qcow2
 
-The use of qemu-nbd allows sharing of a disk between several guests:
+The use of ``qemu-nbd`` allows sharing of a disk between several guests:
 
 .. parsed-literal::
 
@@ -530,7 +536,7 @@ and then you can use it with two guests:
   |qemu_system| linux1.img -hdb nbd+unix://?socket=/tmp/my_socket
   |qemu_system| linux2.img -hdb nbd+unix://?socket=/tmp/my_socket
 
-If the nbd-server uses named exports (supported since NBD 2.9.18, or with QEMU's
+If the ``nbd-server`` uses named exports (supported since NBD 2.9.18, or with QEMU's
 own embedded NBD server), you must specify an export name in the URI:
 
 .. parsed-literal::
@@ -546,75 +552,6 @@ also available.  Here are some example of the older syntax:
   |qemu_system| linux.img -hdb nbd:my_nbd_server.mydomain.org:1024
   |qemu_system| linux2.img -hdb nbd:unix:/tmp/my_socket
   |qemu_system| -cdrom nbd:localhost:10809:exportname=debian-500-ppc-netinst
-
-
-
-Sheepdog disk images
-~~~~~~~~~~~~~~~~~~~~
-
-Sheepdog is a distributed storage system for QEMU.  It provides highly
-available block level storage volumes that can be attached to
-QEMU-based virtual machines.
-
-You can create a Sheepdog disk image with the command:
-
-.. parsed-literal::
-
-  qemu-img create sheepdog:///IMAGE SIZE
-
-where *IMAGE* is the Sheepdog image name and *SIZE* is its
-size.
-
-To import the existing *FILENAME* to Sheepdog, you can use a
-convert command.
-
-.. parsed-literal::
-
-  qemu-img convert FILENAME sheepdog:///IMAGE
-
-You can boot from the Sheepdog disk image with the command:
-
-.. parsed-literal::
-
-  |qemu_system| sheepdog:///IMAGE
-
-You can also create a snapshot of the Sheepdog image like qcow2.
-
-.. parsed-literal::
-
-  qemu-img snapshot -c TAG sheepdog:///IMAGE
-
-where *TAG* is a tag name of the newly created snapshot.
-
-To boot from the Sheepdog snapshot, specify the tag name of the
-snapshot.
-
-.. parsed-literal::
-
-  |qemu_system| sheepdog:///IMAGE#TAG
-
-You can create a cloned image from the existing snapshot.
-
-.. parsed-literal::
-
-  qemu-img create -b sheepdog:///BASE#TAG sheepdog:///IMAGE
-
-where *BASE* is an image name of the source snapshot and *TAG*
-is its tag name.
-
-You can use an unix socket instead of an inet socket:
-
-.. parsed-literal::
-
-  |qemu_system| sheepdog+unix:///IMAGE?socket=PATH
-
-If the Sheepdog daemon doesn't run on the local host, you need to
-specify one of the Sheepdog servers to connect to.
-
-.. parsed-literal::
-
-  qemu-img create sheepdog://HOSTNAME:PORT/IMAGE SIZE
-  |qemu_system| sheepdog://HOSTNAME:PORT/IMAGE
 
 iSCSI LUNs
 ~~~~~~~~~~
@@ -728,91 +665,6 @@ systems as the package 'scsi-target-utils'.
     -boot d -drive file=iscsi://127.0.0.1/iqn.qemu.test/1 \\
     -cdrom iscsi://127.0.0.1/iqn.qemu.test/2
 
-GlusterFS disk images
-~~~~~~~~~~~~~~~~~~~~~
-
-GlusterFS is a user space distributed file system.
-
-You can boot from the GlusterFS disk image with the command:
-
-URI:
-
-.. parsed-literal::
-
-  |qemu_system| -drive file=gluster[+TYPE]://[HOST}[:PORT]]/VOLUME/PATH
-                               [?socket=...][,file.debug=9][,file.logfile=...]
-
-JSON:
-
-.. parsed-literal::
-
-  |qemu_system| 'json:{"driver":"qcow2",
-                           "file":{"driver":"gluster",
-                                    "volume":"testvol","path":"a.img","debug":9,"logfile":"...",
-                                    "server":[{"type":"tcp","host":"...","port":"..."},
-                                              {"type":"unix","socket":"..."}]}}'
-
-*gluster* is the protocol.
-
-*TYPE* specifies the transport type used to connect to gluster
-management daemon (glusterd). Valid transport types are
-tcp and unix. In the URI form, if a transport type isn't specified,
-then tcp type is assumed.
-
-*HOST* specifies the server where the volume file specification for
-the given volume resides. This can be either a hostname or an ipv4 address.
-If transport type is unix, then *HOST* field should not be specified.
-Instead *socket* field needs to be populated with the path to unix domain
-socket.
-
-*PORT* is the port number on which glusterd is listening. This is optional
-and if not specified, it defaults to port 24007. If the transport type is unix,
-then *PORT* should not be specified.
-
-*VOLUME* is the name of the gluster volume which contains the disk image.
-
-*PATH* is the path to the actual disk image that resides on gluster volume.
-
-*debug* is the logging level of the gluster protocol driver. Debug levels
-are 0-9, with 9 being the most verbose, and 0 representing no debugging output.
-The default level is 4. The current logging levels defined in the gluster source
-are 0 - None, 1 - Emergency, 2 - Alert, 3 - Critical, 4 - Error, 5 - Warning,
-6 - Notice, 7 - Info, 8 - Debug, 9 - Trace
-
-*logfile* is a commandline option to mention log file path which helps in
-logging to the specified file and also help in persisting the gfapi logs. The
-default is stderr.
-
-You can create a GlusterFS disk image with the command:
-
-.. parsed-literal::
-
-  qemu-img create gluster://HOST/VOLUME/PATH SIZE
-
-Examples
-
-.. parsed-literal::
-
-  |qemu_system| -drive file=gluster://1.2.3.4/testvol/a.img
-  |qemu_system| -drive file=gluster+tcp://1.2.3.4/testvol/a.img
-  |qemu_system| -drive file=gluster+tcp://1.2.3.4:24007/testvol/dir/a.img
-  |qemu_system| -drive file=gluster+tcp://[1:2:3:4:5:6:7:8]/testvol/dir/a.img
-  |qemu_system| -drive file=gluster+tcp://[1:2:3:4:5:6:7:8]:24007/testvol/dir/a.img
-  |qemu_system| -drive file=gluster+tcp://server.domain.com:24007/testvol/dir/a.img
-  |qemu_system| -drive file=gluster+unix:///testvol/dir/a.img?socket=/tmp/glusterd.socket
-  |qemu_system| -drive file=gluster+rdma://1.2.3.4:24007/testvol/a.img
-  |qemu_system| -drive file=gluster://1.2.3.4/testvol/a.img,file.debug=9,file.logfile=/var/log/qemu-gluster.log
-  |qemu_system| 'json:{"driver":"qcow2",
-                           "file":{"driver":"gluster",
-                                    "volume":"testvol","path":"a.img",
-                                    "debug":9,"logfile":"/var/log/qemu-gluster.log",
-                                    "server":[{"type":"tcp","host":"1.2.3.4","port":24007},
-                                              {"type":"unix","socket":"/var/run/glusterd.socket"}]}}'
-  |qemu_system| -drive driver=qcow2,file.driver=gluster,file.volume=testvol,file.path=/path/a.img,
-                                       file.debug=9,file.logfile=/var/log/qemu-gluster.log,
-                                       file.server.0.type=tcp,file.server.0.host=1.2.3.4,file.server.0.port=24007,
-                                       file.server.1.type=unix,file.server.1.socket=/var/run/glusterd.socket
-
 Secure Shell (ssh) disk images
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -847,10 +699,32 @@ The optional *HOST_KEY_CHECK* parameter controls how the remote
 host's key is checked.  The default is ``yes`` which means to use
 the local ``.ssh/known_hosts`` file.  Setting this to ``no``
 turns off known-hosts checking.  Or you can check that the host key
-matches a specific fingerprint:
-``host_key_check=md5:78:45:8e:14:57:4f:d5:45:83:0a:0e:f3:49:82:c9:c8``
-(``sha1:`` can also be used as a prefix, but note that OpenSSH
-tools only use MD5 to print fingerprints).
+matches a specific fingerprint. The fingerprint can be provided in
+``md5``, ``sha1``, or ``sha256`` format, however, it is strongly
+recommended to only use ``sha256``, since the other options are
+considered insecure by modern standards. The fingerprint value
+must be given as a hex encoded string::
+
+  host_key_check=sha256:04ce2ae89ff4295a6b9c4111640bdcb3297858ee55cb434d9dd88796e93aa795
+
+The key string may optionally contain ":" separators between
+each pair of hex digits.
+
+The ``$HOME/.ssh/known_hosts`` file contains the base64 encoded
+host keys. These can be converted into the format needed for
+QEMU using a command such as::
+
+   $ for key in `grep 10.33.8.112 known_hosts | awk '{print $3}'`
+     do
+       echo $key | base64 -d | sha256sum
+     done
+     6c3aa525beda9dc83eadfbd7e5ba7d976ecb59575d1633c87cd06ed2ed6e366f  -
+     12214fd9ea5b408086f98ecccd9958609bd9ac7c0ea316734006bc7818b45dc8  -
+     d36420137bcbd101209ef70c3b15dc07362fbe0fa53c5b135eba6e6afa82f0ce  -
+
+Note that there can be multiple keys present per host, each with
+different key ciphers. Care is needed to pick the key fingerprint
+that matches the cipher QEMU will negotiate with the remote server.
 
 Currently authentication must be done using ssh-agent.  Other
 authentication methods may be supported in future.
@@ -952,3 +826,29 @@ on host and see if there are locks held by the QEMU process on the image file.
 More than one byte could be locked by the QEMU instance, each byte of which
 reflects a particular permission that is acquired or protected by the running
 block driver.
+
+Filter drivers
+~~~~~~~~~~~~~~
+
+QEMU supports several filter drivers, which don't store any data, but perform
+some additional tasks, hooking io requests.
+
+.. program:: filter-drivers
+.. option:: preallocate
+
+  The preallocate filter driver is intended to be inserted between format
+  and protocol nodes and preallocates some additional space
+  (expanding the protocol file) when writing past the file’s end. This can be
+  useful for file-systems with slow allocation.
+
+  Supported options:
+
+  .. program:: preallocate
+  .. option:: prealloc-align
+
+    On preallocation, align the file length to this value (in bytes), default 1M.
+
+  .. program:: preallocate
+  .. option:: prealloc-size
+
+    How much to preallocate (in bytes), default 128M.

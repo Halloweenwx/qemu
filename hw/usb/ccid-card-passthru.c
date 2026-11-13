@@ -9,17 +9,19 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
+#include "qemu/cutils.h"
 #include "qemu/units.h"
 #include <libcacard.h>
 #include "chardev/char-fe.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "migration/vmstate.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/sockets.h"
 #include "ccid.h"
 #include "qapi/error.h"
+#include "qom/object.h"
 
 #define DPRINTF(card, lvl, fmt, ...)                    \
 do {                                                    \
@@ -54,7 +56,7 @@ typedef struct PassthruState PassthruState;
 
 struct PassthruState {
     CCIDCardState base;
-    CharBackend cs;
+    CharFrontend cs;
     uint8_t  vscard_in_data[VSCARD_IN_SIZE];
     uint32_t vscard_in_pos;
     uint32_t vscard_in_hdr;
@@ -64,8 +66,8 @@ struct PassthruState {
 };
 
 #define TYPE_CCID_PASSTHRU "ccid-card-passthru"
-#define PASSTHRU_CCID_CARD(obj) \
-    OBJECT_CHECK(PassthruState, (obj), TYPE_CCID_PASSTHRU)
+DECLARE_INSTANCE_CHECKER(PassthruState, PASSTHRU_CCID_CARD,
+                         TYPE_CCID_PASSTHRU)
 
 /*
  * VSCard protocol over chardev
@@ -321,6 +323,7 @@ static void ccid_card_vscard_event(void *opaque, QEMUChrEvent event)
     case CHR_EVENT_MUX_IN:
     case CHR_EVENT_MUX_OUT:
     case CHR_EVENT_CLOSED:
+    case CHR_EVENT_RESIZE:
         /* Ignore */
         break;
     }
@@ -334,7 +337,7 @@ static void passthru_apdu_from_guest(
     PassthruState *card = PASSTHRU_CCID_CARD(base);
 
     if (!qemu_chr_fe_backend_connected(&card->cs)) {
-        printf("ccid-passthru: no chardev, discarding apdu length %d\n", len);
+        printf("ccid-passthru: no chardev, discarding apdu length %u\n", len);
         return;
     }
     ccid_card_vscard_send_apdu(card, apdu, len);
@@ -372,11 +375,11 @@ static void passthru_realize(CCIDCardState *base, Error **errp)
     card->atr_length = sizeof(DEFAULT_ATR);
 }
 
-static VMStateDescription passthru_vmstate = {
+static const VMStateDescription passthru_vmstate = {
     .name = "ccid-card-passthru",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_BUFFER(vscard_in_data, PassthruState),
         VMSTATE_UINT32(vscard_in_pos, PassthruState),
         VMSTATE_UINT32(vscard_in_hdr, PassthruState),
@@ -386,13 +389,12 @@ static VMStateDescription passthru_vmstate = {
     }
 };
 
-static Property passthru_card_properties[] = {
+static const Property passthru_card_properties[] = {
     DEFINE_PROP_CHR("chardev", PassthruState, cs),
     DEFINE_PROP_UINT8("debug", PassthruState, debug, 0),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void passthru_class_initfn(ObjectClass *klass, void *data)
+static void passthru_class_initfn(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     CCIDCardClass *cc = CCID_CARD_CLASS(klass);
@@ -412,6 +414,8 @@ static const TypeInfo passthru_card_info = {
     .instance_size = sizeof(PassthruState),
     .class_init    = passthru_class_initfn,
 };
+module_obj(TYPE_CCID_PASSTHRU);
+module_kconfig(USB);
 
 static void ccid_card_passthru_register_types(void)
 {

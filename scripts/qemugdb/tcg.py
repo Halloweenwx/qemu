@@ -1,6 +1,3 @@
-#!/usr/bin/python
-# -*- coding: utf-8 -*-
-#
 # GDB debugging support, TCG status
 #
 # Copyright 2016 Linaro Ltd

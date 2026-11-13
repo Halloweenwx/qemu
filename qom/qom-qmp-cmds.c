@@ -15,26 +15,40 @@
 
 #include "qemu/osdep.h"
 #include "block/qdict.h"
-#include "hw/qdev-core.h"
+#include "hw/core/qdev.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-qdev.h"
 #include "qapi/qapi-commands-qom.h"
-#include "qapi/qmp/qdict.h"
+#include "qapi/qapi-visit-qom.h"
+#include "qobject/qdict.h"
 #include "qapi/qmp/qerror.h"
 #include "qapi/qobject-input-visitor.h"
+#include "qapi/qobject-output-visitor.h"
 #include "qemu/cutils.h"
+#include "qapi/qapi-type-info.h"
 #include "qom/object_interfaces.h"
 #include "qom/qom-qobject.h"
 
-ObjectPropertyInfoList *qmp_qom_list(const char *path, Error **errp)
+static ObjectPropertyInfo *qom_property_info(ObjectProperty *prop)
 {
-    Object *obj;
-    bool ambiguous = false;
-    ObjectPropertyInfoList *props = NULL;
-    ObjectProperty *prop;
-    ObjectPropertyIterator iter;
+    ObjectPropertyInfo *info = g_new0(ObjectPropertyInfo, 1);
 
-    obj = object_resolve_path(path, &ambiguous);
+    info->name = g_strdup(prop->name);
+    info->type = g_strdup(prop->type);
+    info->description = g_strdup(prop->description);
+    info->default_value = qobject_ref(prop->defval);
+    if (prop->qapi_type) {
+        assert(prop->qapi_type->masked_name);
+        info->qapi_type = g_strdup(prop->qapi_type->masked_name);
+    }
+    return info;
+}
+
+static Object *qom_resolve_path(const char *path, Error **errp)
+{
+    bool ambiguous = false;
+    Object *obj = object_resolve_path(path, &ambiguous);
+
     if (obj == NULL) {
         if (ambiguous) {
             error_setg(errp, "Path '%s' is ambiguous", path);
@@ -42,22 +56,85 @@ ObjectPropertyInfoList *qmp_qom_list(const char *path, Error **errp)
             error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
                       "Device '%s' not found", path);
         }
+    }
+    return obj;
+}
+
+ObjectPropertyInfoList *qmp_qom_list(const char *path, Error **errp)
+{
+    Object *obj;
+    ObjectPropertyInfoList *props = NULL;
+    ObjectProperty *prop;
+    ObjectPropertyIterator iter;
+
+    obj = qom_resolve_path(path, errp);
+    if (obj == NULL) {
         return NULL;
     }
 
     object_property_iter_init(&iter, obj);
     while ((prop = object_property_iter_next(&iter))) {
-        ObjectPropertyInfoList *entry = g_malloc0(sizeof(*entry));
-
-        entry->value = g_malloc0(sizeof(ObjectPropertyInfo));
-        entry->next = props;
-        props = entry;
-
-        entry->value->name = g_strdup(prop->name);
-        entry->value->type = g_strdup(prop->type);
+        QAPI_LIST_PREPEND(props, qom_property_info(prop));
     }
 
     return props;
+}
+
+static void qom_list_add_property_value(Object *obj, ObjectProperty *prop,
+                                        ObjectPropertyValueList **props)
+{
+    ObjectPropertyValue *item = g_new0(ObjectPropertyValue, 1);
+
+    QAPI_LIST_PREPEND(*props, item);
+
+    item->name = g_strdup(prop->name);
+    item->type = g_strdup(prop->type);
+    if (prop->qapi_type) {
+        assert(prop->qapi_type->masked_name);
+        item->qapi_type = g_strdup(prop->qapi_type->masked_name);
+    }
+    item->value = object_property_get_qobject(obj, prop->name, NULL);
+}
+
+static ObjectPropertyValueList *qom_get_property_value_list(const char *path,
+                                                            Error **errp)
+{
+    Object *obj;
+    ObjectProperty *prop;
+    ObjectPropertyIterator iter;
+    ObjectPropertyValueList *props = NULL;
+
+    obj = qom_resolve_path(path, errp);
+    if (obj == NULL) {
+        return NULL;
+    }
+
+    object_property_iter_init(&iter, obj);
+    while ((prop = object_property_iter_next(&iter))) {
+        qom_list_add_property_value(obj, prop, &props);
+    }
+
+    return props;
+}
+
+ObjectPropertiesValuesList *qmp_qom_list_get(strList *paths, Error **errp)
+{
+    ObjectPropertiesValuesList *head = NULL, **tail = &head;
+    strList *path;
+
+    for (path = paths; path; path = path->next) {
+        ObjectPropertiesValues *item = g_new0(ObjectPropertiesValues, 1);
+
+        QAPI_LIST_APPEND(tail, item);
+
+        item->properties = qom_get_property_value_list(path->value, errp);
+        if (!item->properties) {
+            qapi_free_ObjectPropertiesValuesList(head);
+            return NULL;
+        }
+    }
+
+    return head;
 }
 
 void qmp_qom_set(const char *path, const char *property, QObject *value,
@@ -72,7 +149,7 @@ void qmp_qom_set(const char *path, const char *property, QObject *value,
         return;
     }
 
-    object_property_set_qobject(obj, value, property, errp);
+    object_property_set_qobject(obj, property, value, errp);
 }
 
 QObject *qmp_qom_get(const char *path, const char *property, Error **errp)
@@ -89,37 +166,56 @@ QObject *qmp_qom_get(const char *path, const char *property, Error **errp)
     return object_property_get_qobject(obj, property, errp);
 }
 
-static void qom_list_types_tramp(ObjectClass *klass, void *data)
+typedef struct {
+    ObjectTypeInfoList *list;
+    bool has_secure;
+    bool secure;
+} ObjectTypeInfoData;
+
+static void qom_list_types_tramp(ObjectClass *klass, void *opaque)
 {
-    ObjectTypeInfoList *e, **pret = data;
+    ObjectTypeInfoData *data = opaque;
     ObjectTypeInfo *info;
     ObjectClass *parent = object_class_get_parent(klass);
+    bool secure = object_class_is_secure(klass);
+
+    if (data->has_secure &&
+        data->secure != secure) {
+        return;
+    }
 
     info = g_malloc0(sizeof(*info));
     info->name = g_strdup(object_class_get_name(klass));
     info->has_abstract = info->abstract = object_class_is_abstract(klass);
+    /*
+     * Set has_secure such that we omit the 'secure' attribute
+     * from the QMP response for insecure types
+     */
+    info->has_secure = info->secure = secure;
     if (parent) {
-        info->has_parent = true;
         info->parent = g_strdup(object_class_get_name(parent));
     }
 
-    e = g_malloc0(sizeof(*e));
-    e->value = info;
-    e->next = *pret;
-    *pret = e;
+    QAPI_LIST_PREPEND(data->list, info);
 }
 
-ObjectTypeInfoList *qmp_qom_list_types(bool has_implements,
-                                       const char *implements,
+ObjectTypeInfoList *qmp_qom_list_types(const char *implements,
                                        bool has_abstract,
                                        bool abstract,
+                                       bool has_secure,
+                                       bool secure,
                                        Error **errp)
 {
-    ObjectTypeInfoList *ret = NULL;
+    ObjectTypeInfoData data = {
+        .list = NULL,
+        .has_secure = has_secure,
+        .secure = secure,
+    };
 
-    object_class_foreach(qom_list_types_tramp, implements, abstract, &ret);
+    module_load_qom_all();
+    object_class_foreach(qom_list_types_tramp, implements, abstract, &data);
 
-    return ret;
+    return data.list;
 }
 
 ObjectPropertyInfoList *qmp_device_list_properties(const char *typename,
@@ -131,32 +227,24 @@ ObjectPropertyInfoList *qmp_device_list_properties(const char *typename,
     ObjectPropertyIterator iter;
     ObjectPropertyInfoList *prop_list = NULL;
 
-    klass = object_class_by_name(typename);
+    klass = module_object_class_by_name(typename);
     if (klass == NULL) {
         error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
                   "Device '%s' not found", typename);
         return NULL;
     }
 
-    klass = object_class_dynamic_cast(klass, TYPE_DEVICE);
-    if (klass == NULL) {
-        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "typename", TYPE_DEVICE);
-        return NULL;
-    }
-
-    if (object_class_is_abstract(klass)) {
+    if (!object_class_dynamic_cast(klass, TYPE_DEVICE)
+        || object_class_is_abstract(klass)) {
         error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "typename",
-                   "non-abstract device type");
+                   "a non-abstract device type");
         return NULL;
     }
 
-    obj = object_new(typename);
+    obj = object_new_with_class(klass);
 
     object_property_iter_init(&iter, obj);
     while ((prop = object_property_iter_next(&iter))) {
-        ObjectPropertyInfo *info;
-        ObjectPropertyInfoList *entry;
-
         /* Skip Object and DeviceState properties */
         if (strcmp(prop->name, "type") == 0 ||
             strcmp(prop->name, "realized") == 0 ||
@@ -166,25 +254,7 @@ ObjectPropertyInfoList *qmp_device_list_properties(const char *typename,
             continue;
         }
 
-        /* Skip legacy properties since they are just string versions of
-         * properties that we already list.
-         */
-        if (strstart(prop->name, "legacy-", NULL)) {
-            continue;
-        }
-
-        info = g_new0(ObjectPropertyInfo, 1);
-        info->name = g_strdup(prop->name);
-        info->type = g_strdup(prop->type);
-        info->has_description = !!prop->description;
-        info->description = g_strdup(prop->description);
-        info->default_value = qobject_ref(prop->defval);
-        info->has_default_value = !!info->default_value;
-
-        entry = g_malloc0(sizeof(*entry));
-        entry->value = info;
-        entry->next = prop_list;
-        prop_list = entry;
+        QAPI_LIST_PREPEND(prop_list, qom_property_info(prop));
     }
 
     object_unref(obj);
@@ -201,16 +271,16 @@ ObjectPropertyInfoList *qmp_qom_list_properties(const char *typename,
     ObjectPropertyIterator iter;
     ObjectPropertyInfoList *prop_list = NULL;
 
-    klass = object_class_by_name(typename);
+    klass = module_object_class_by_name(typename);
     if (klass == NULL) {
         error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
                   "Class '%s' not found", typename);
         return NULL;
     }
 
-    klass = object_class_dynamic_cast(klass, TYPE_OBJECT);
-    if (klass == NULL) {
-        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "typename", TYPE_OBJECT);
+    if (!object_class_dynamic_cast(klass, TYPE_OBJECT)) {
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "typename",
+                   "a QOM type");
         return NULL;
     }
 
@@ -221,19 +291,7 @@ ObjectPropertyInfoList *qmp_qom_list_properties(const char *typename,
         object_property_iter_init(&iter, obj);
     }
     while ((prop = object_property_iter_next(&iter))) {
-        ObjectPropertyInfo *info;
-        ObjectPropertyInfoList *entry;
-
-        info = g_malloc0(sizeof(*info));
-        info->name = g_strdup(prop->name);
-        info->type = g_strdup(prop->type);
-        info->has_description = !!prop->description;
-        info->description = g_strdup(prop->description);
-
-        entry = g_malloc0(sizeof(*entry));
-        entry->value = info;
-        entry->next = prop_list;
-        prop_list = entry;
+        QAPI_LIST_PREPEND(prop_list, qom_property_info(prop));
     }
 
     object_unref(obj);
@@ -241,54 +299,9 @@ ObjectPropertyInfoList *qmp_qom_list_properties(const char *typename,
     return prop_list;
 }
 
-void qmp_object_add(QDict *qdict, QObject **ret_data, Error **errp)
+void qmp_object_add(ObjectOptions *options, Error **errp)
 {
-    QObject *props;
-    QDict *pdict;
-    Visitor *v;
-    Object *obj;
-    g_autofree char *type = NULL;
-    g_autofree char *id = NULL;
-
-    type = g_strdup(qdict_get_try_str(qdict, "qom-type"));
-    if (!type) {
-        error_setg(errp, QERR_MISSING_PARAMETER, "qom-type");
-        return;
-    }
-    qdict_del(qdict, "qom-type");
-
-    id = g_strdup(qdict_get_try_str(qdict, "id"));
-    if (!id) {
-        error_setg(errp, QERR_MISSING_PARAMETER, "id");
-        return;
-    }
-    qdict_del(qdict, "id");
-
-    props = qdict_get(qdict, "props");
-    if (props) {
-        pdict = qobject_to(QDict, props);
-        if (!pdict) {
-            error_setg(errp, QERR_INVALID_PARAMETER_TYPE, "props", "dict");
-            return;
-        }
-        qobject_ref(pdict);
-        qdict_del(qdict, "props");
-        qdict_join(qdict, pdict, false);
-        if (qdict_size(pdict) != 0) {
-            error_setg(errp, "Option in 'props' conflicts with top level");
-            qobject_unref(pdict);
-            return;
-        }
-        qobject_unref(pdict);
-    }
-
-    v = qobject_input_visitor_new(QOBJECT(qdict));
-    obj = user_creatable_add_type(type, id, qdict, v, errp);
-    visit_free(v);
-    if (obj) {
-        object_unref(obj);
-    }
-    *ret_data = QOBJECT(qdict_new());
+    user_creatable_add_qapi(options, errp);
 }
 
 void qmp_object_del(const char *id, Error **errp)

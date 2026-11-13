@@ -20,16 +20,16 @@
 #ifndef HW_CPU_A15MPCORE_H
 #define HW_CPU_A15MPCORE_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "hw/intc/arm_gic.h"
+#include "qom/object.h"
 
 /* A15MP private memory region.  */
 
 #define TYPE_A15MPCORE_PRIV "a15mpcore_priv"
-#define A15MPCORE_PRIV(obj) \
-    OBJECT_CHECK(A15MPPrivState, (obj), TYPE_A15MPCORE_PRIV)
+OBJECT_DECLARE_SIMPLE_TYPE(A15MPPrivState, A15MPCORE_PRIV)
 
-typedef struct A15MPPrivState {
+struct A15MPPrivState {
     /*< private >*/
     SysBusDevice parent_obj;
     /*< public >*/
@@ -39,6 +39,6 @@ typedef struct A15MPPrivState {
     MemoryRegion container;
 
     GICState gic;
-} A15MPPrivState;
+};
 
 #endif

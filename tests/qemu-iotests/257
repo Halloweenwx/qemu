@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# group: rw
 #
 # Test bitmap-sync backups (incremental, differential, and partials)
 #
@@ -17,7 +18,6 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
-# owner=jsnow@redhat.com
 
 import math
 import os
@@ -159,26 +159,26 @@ class Drive:
         file_node_name = "file_{}".format(basename)
         vm = self.vm
 
-        log(vm.command('blockdev-create', job_id='bdc-file-job',
-                       options={
-                           'driver': 'file',
-                           'filename': self.path,
-                           'size': 0,
-                       }))
+        log(vm.cmd('blockdev-create', job_id='bdc-file-job',
+                   options={
+                       'driver': 'file',
+                       'filename': self.path,
+                       'size': 0,
+                   }))
         vm.run_job('bdc-file-job')
-        log(vm.command('blockdev-add', driver='file',
-                       node_name=file_node_name, filename=self.path))
+        log(vm.cmd('blockdev-add', driver='file',
+                   node_name=file_node_name, filename=self.path))
 
-        log(vm.command('blockdev-create', job_id='bdc-fmt-job',
-                       options={
-                           'driver': fmt,
-                           'file': file_node_name,
-                           'size': size,
-                       }))
+        log(vm.cmd('blockdev-create', job_id='bdc-fmt-job',
+                   options={
+                       'driver': fmt,
+                       'file': file_node_name,
+                       'size': size,
+                   }))
         vm.run_job('bdc-fmt-job')
-        log(vm.command('blockdev-add', driver=fmt,
-                       node_name=name,
-                       file=file_node_name))
+        log(vm.cmd('blockdev-add', driver=fmt,
+                   node_name=name,
+                   file=file_node_name))
         self.fmt = fmt
         self.size = size
         self.node = name
@@ -191,6 +191,7 @@ def blockdev_backup(vm, device, target, sync, **kwargs):
                         target=target,
                         sync=sync,
                         filter_node_name='backup-top',
+                        x_perf={'max-workers': 1},
                         **kwargs)
     return result
 
@@ -238,12 +239,14 @@ def compare_images(image, reference, baseimg=None, expected_match=True):
     """
     expected_ret = 0 if expected_match else 1
     if baseimg:
-        assert qemu_img("rebase", "-u", "-b", baseimg, image) == 0
-    ret = qemu_img("compare", image, reference)
+        qemu_img("rebase", "-u", "-b", baseimg, '-F', iotests.imgfmt, image)
+
+    sub = qemu_img("compare", image, reference, check=False)
+
     log('qemu_img compare "{:s}" "{:s}" ==> {:s}, {:s}'.format(
         image, reference,
-        "Identical" if ret == 0 else "Mismatch",
-        "OK!" if ret == expected_ret else "ERROR!"),
+        "Identical" if sub.returncode == 0 else "Mismatch",
+        "OK!" if sub.returncode == expected_ret else "ERROR!"),
         filters=[iotests.filter_testfiles])
 
 def test_bitmap_sync(bsync_mode, msync_mode='bitmap', failure=None):
@@ -274,10 +277,9 @@ def test_bitmap_sync(bsync_mode, msync_mode='bitmap', failure=None):
                         an incomplete backup. Testing limitations prevent
                         testing competing writes.
     """
-    with iotests.FilePaths(['img', 'bsync1', 'bsync2',
-                            'fbackup0', 'fbackup1', 'fbackup2']) as \
-                            (img_path, bsync1, bsync2,
-                             fbackup0, fbackup1, fbackup2), \
+    with iotests.FilePath(
+            'img', 'bsync1', 'bsync2', 'fbackup0', 'fbackup1', 'fbackup2') as \
+            (img_path, bsync1, bsync2, fbackup0, fbackup1, fbackup2), \
          iotests.VM() as vm:
 
         mode = "Mode {:s}; Bitmap Sync {:s}".format(msync_mode, bsync_mode)
@@ -290,7 +292,7 @@ def test_bitmap_sync(bsync_mode, msync_mode='bitmap', failure=None):
         log('--- Preparing image & VM ---\n')
         drive0 = Drive(img_path, vm=vm)
         drive0.img_create(iotests.imgfmt, SIZE)
-        vm.add_device("{},id=scsi0".format(iotests.get_virtio_scsi_device()))
+        vm.add_device("{},id=scsi0".format('virtio-scsi'))
         vm.launch()
 
         file_config = {
@@ -307,14 +309,18 @@ def test_bitmap_sync(bsync_mode, msync_mode='bitmap', failure=None):
                     'state': 1,
                     'new_state': 2
                 }, {
-                    'event': 'read_aio',
+                    'event': 'flush_to_disk',
                     'state': 2,
                     'new_state': 3
+                }, {
+                    'event': "read_aio",
+                    'state': 3,
+                    'new_state': 4
                 }],
                 'inject-error': [{
                     'event': 'read_aio',
                     'errno': 5,
-                    'state': 3,
+                    'state': 4,
                     'immediately': False,
                     'once': True
                 }]
@@ -440,15 +446,14 @@ def test_backup_api():
     """
     Test malformed and prohibited invocations of the backup API.
     """
-    with iotests.FilePaths(['img', 'bsync1']) as \
-         (img_path, backup_path), \
+    with iotests.FilePath('img', 'bsync1') as (img_path, backup_path), \
          iotests.VM() as vm:
 
         log("\n=== API failure tests ===\n")
         log('--- Preparing image & VM ---\n')
         drive0 = Drive(img_path, vm=vm)
         drive0.img_create(iotests.imgfmt, SIZE)
-        vm.add_device("{},id=scsi0".format(iotests.get_virtio_scsi_device()))
+        vm.add_device("{},id=scsi0".format('virtio-scsi'))
         vm.launch()
 
         file_config = {
@@ -527,4 +532,5 @@ def main():
 
 if __name__ == '__main__':
     iotests.script_main(main, supported_fmts=['qcow2'],
-                        supported_protocols=['file'])
+                        supported_protocols=['file'],
+                        require_hmp=True)

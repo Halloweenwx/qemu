@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -18,14 +18,15 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
+#include "qemu/cutils.h"
 #include "cpu.h"
 #include "trace.h"
+#include "accel/tcg/cpu-ldst.h"
 #include "exec/log.h"
-#include "sysemu/runstate.h"
+#include "system/runstate.h"
+#include "qemu/plugin.h"
 
-#define DEBUG_PCALL
-
-#ifdef DEBUG_PCALL
 static const char * const excp_names[0x80] = {
     [TT_TFAULT] = "Instruction Access Fault",
     [TT_ILL_INSN] = "Illegal Instruction",
@@ -52,69 +53,104 @@ static const char * const excp_names[0x80] = {
     [TT_EXTINT | 0xd] = "External Interrupt 13",
     [TT_EXTINT | 0xe] = "External Interrupt 14",
     [TT_EXTINT | 0xf] = "External Interrupt 15",
-    [TT_TOVF] = "Tag Overflow",
     [TT_CODE_ACCESS] = "Instruction Access Error",
     [TT_DATA_ACCESS] = "Data Access Error",
     [TT_DIV_ZERO] = "Division By Zero",
     [TT_NCP_INSN] = "Coprocessor Disabled",
 };
+
+const char *sparc_exception_name(int excp)
+{
+    if (excp >= 0x80 && excp < 0x100) {
+        return "Trap Instruction";
+    }
+    return STR_ARRAY_ELEM_OR_NULL(excp_names, excp) ?: "unknown";
+}
+
+#if !defined(CONFIG_USER_ONLY)
+void cpu_check_irqs(CPUSPARCState *env)
+{
+    CPUState *cs;
+
+    /* We should be holding the BQL before we mess with IRQs */
+    g_assert(bql_locked());
+
+    if (env->pil_in && (env->interrupt_index == 0 ||
+                        (env->interrupt_index & ~15) == TT_EXTINT)) {
+        unsigned int i;
+
+        for (i = 15; i > 0; i--) {
+            if (env->pil_in & (1 << i)) {
+                int old_interrupt = env->interrupt_index;
+
+                env->interrupt_index = TT_EXTINT | i;
+                if (old_interrupt != env->interrupt_index) {
+                    cs = env_cpu(env);
+                    trace_sun4m_cpu_interrupt(i);
+                    cpu_interrupt(cs, CPU_INTERRUPT_HARD);
+                }
+                break;
+            }
+        }
+    } else if (!env->pil_in && (env->interrupt_index & ~15) == TT_EXTINT) {
+        cs = env_cpu(env);
+        trace_sun4m_cpu_reset_interrupt(env->interrupt_index & 15);
+        env->interrupt_index = 0;
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+    }
+}
 #endif
 
 void sparc_cpu_do_interrupt(CPUState *cs)
 {
-    SPARCCPU *cpu = SPARC_CPU(cs);
-    CPUSPARCState *env = &cpu->env;
+    CPUSPARCState *env = cpu_env(cs);
     int cwp, intno = cs->exception_index;
 
-    /* Compute PSR before exposing state.  */
-    if (env->cc_op != CC_OP_FLAGS) {
-        cpu_get_psr(env);
-    }
-
-#ifdef DEBUG_PCALL
     if (qemu_loglevel_mask(CPU_LOG_INT)) {
         static int count;
-        const char *name;
-
-        if (intno < 0 || intno >= 0x100) {
-            name = "Unknown";
-        } else if (intno >= 0x80) {
-            name = "Trap Instruction";
-        } else {
-            name = excp_names[intno];
-            if (!name) {
-                name = "Unknown";
-            }
-        }
+        const char *name = sparc_exception_name(intno);
 
         qemu_log("%6d: %s (v=%02x)\n", count, name, intno);
         log_cpu_state(cs, 0);
-#if 0
-        {
-            int i;
-            uint8_t *ptr;
-
-            qemu_log("       code=");
-            ptr = (uint8_t *)env->pc;
-            for (i = 0; i < 16; i++) {
-                qemu_log(" %02x", ldub(ptr + i));
-            }
-            qemu_log("\n");
-        }
-#endif
         count++;
     }
-#endif
-#if !defined(CONFIG_USER_ONLY)
+#ifndef CONFIG_USER_ONLY
     if (env->psret == 0) {
         if (cs->exception_index == 0x80 &&
             env->def.features & CPU_FEATURE_TA0_SHUTDOWN) {
             qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
         } else {
-            cpu_abort(cs, "Trap 0x%02x while interrupts disabled, Error state",
-                      cs->exception_index);
+            cpu_abort(cs, "Trap 0x%02x (%s) while interrupts disabled, "
+                          "Error state",
+                      cs->exception_index,
+                      sparc_exception_name(cs->exception_index));
         }
         return;
+    }
+    if (intno == TT_FP_EXCP) {
+        /*
+         * The sparc32 fpu has three states related to exception handling.
+         * The FPop that signals an exception transitions from fp_execute
+         * to fp_exception_pending.  A subsequent FPop transitions from
+         * fp_exception_pending to fp_exception, which forces the trap.
+         *
+         * If the queue is not empty, this trap is due to execution of an
+         * illegal FPop while in fp_exception state.  Here we are to
+         * re-enter fp_exception_pending state without queuing the insn.
+         *
+         * We do not model the fp_exception_pending state, but instead
+         * skip directly to fp_exception state.  We advance pc/npc to
+         * mimic delayed trap delivery as if by the subsequent insn.
+         */
+        if (!env->fsr_qne) {
+            MemOpIdx oi = make_memop_idx(MO_BEUL, cpu_mmu_index(cs, true));
+
+            env->fsr_qne = FSR_QNE;
+            env->fq.s.addr = env->pc;
+            env->fq.s.insn = cpu_ldl_code_mmu(env, env->pc, oi, 0);
+        }
+        env->pc = env->npc;
+        env->npc = env->npc + 4;
     }
 #endif
     env->psret = 0;
@@ -132,44 +168,13 @@ void sparc_cpu_do_interrupt(CPUState *cs)
 #if !defined(CONFIG_USER_ONLY)
     /* IRQ acknowledgment */
     if ((intno & ~15) == TT_EXTINT && env->qemu_irq_ack != NULL) {
-        env->qemu_irq_ack(env, env->irq_manager, intno);
+        env->qemu_irq_ack(env, intno);
     }
 #endif
-}
 
-#if !defined(CONFIG_USER_ONLY)
-static void leon3_cache_control_int(CPUSPARCState *env)
-{
-    uint32_t state = 0;
-
-    if (env->cache_control & CACHE_CTRL_IF) {
-        /* Instruction cache state */
-        state = env->cache_control & CACHE_STATE_MASK;
-        if (state == CACHE_ENABLED) {
-            state = CACHE_FROZEN;
-            trace_int_helper_icache_freeze();
-        }
-
-        env->cache_control &= ~CACHE_STATE_MASK;
-        env->cache_control |= state;
-    }
-
-    if (env->cache_control & CACHE_CTRL_DF) {
-        /* Data cache state */
-        state = (env->cache_control >> 2) & CACHE_STATE_MASK;
-        if (state == CACHE_ENABLED) {
-            state = CACHE_FROZEN;
-            trace_int_helper_dcache_freeze();
-        }
-
-        env->cache_control &= ~(CACHE_STATE_MASK << 2);
-        env->cache_control |= (state << 2);
+    if (intno == TT_EXTINT) {
+        qemu_plugin_vcpu_interrupt_cb(cs, env->regwptr[9]);
+    } else {
+        qemu_plugin_vcpu_exception_cb(cs, env->regwptr[9]);
     }
 }
-
-void leon3_irq_manager(CPUSPARCState *env, void *irq_manager, int intno)
-{
-    leon3_irq_ack(irq_manager, intno);
-    leon3_cache_control_int(env);
-}
-#endif

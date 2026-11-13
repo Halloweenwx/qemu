@@ -1,21 +1,21 @@
 #ifndef QEMU_9P_MARSHAL_H
 #define QEMU_9P_MARSHAL_H
 
-typedef struct V9fsString
-{
+#include "p9array.h"
+
+typedef struct V9fsString {
     uint16_t size;
     char *data;
 } V9fsString;
+P9ARRAY_DECLARE_TYPE(V9fsString);
 
-typedef struct V9fsQID
-{
+typedef struct V9fsQID {
     uint8_t type;
     uint32_t version;
     uint64_t path;
 } V9fsQID;
 
-typedef struct V9fsStat
-{
+typedef struct V9fsStat {
     int16_t size;
     int16_t type;
     int32_t dev;
@@ -35,8 +35,7 @@ typedef struct V9fsStat
     int32_t n_muid;
 } V9fsStat;
 
-typedef struct V9fsIattr
-{
+typedef struct V9fsIattr {
     int32_t valid;
     int32_t mode;
     int32_t uid;
@@ -77,7 +76,8 @@ static inline void v9fs_string_init(V9fsString *str)
     str->size = 0;
 }
 void v9fs_string_free(V9fsString *str);
-void v9fs_string_sprintf(V9fsString *str, const char *fmt, ...);
+void G_GNUC_PRINTF(2, 3) v9fs_string_sprintf(V9fsString *str, const char *fmt,
+                                             ...);
 void v9fs_string_copy(V9fsString *lhs, V9fsString *rhs);
 
 #endif

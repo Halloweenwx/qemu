@@ -19,18 +19,17 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
-#include "cpu.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
-#include "sysemu/device_tree.h"
-#include "sysemu/rng.h"
+#include "system/device_tree.h"
+#include "system/rng.h"
 #include "hw/ppc/spapr.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "kvm_ppc.h"
+#include "qom/object.h"
 
-#define SPAPR_RNG(obj) \
-    OBJECT_CHECK(SpaprRngState, (obj), TYPE_SPAPR_RNG)
+OBJECT_DECLARE_SIMPLE_TYPE(SpaprRngState, SPAPR_RNG)
 
 struct SpaprRngState {
     /*< private >*/
@@ -38,7 +37,6 @@ struct SpaprRngState {
     RngBackend *backend;
     bool use_kvm;
 };
-typedef struct SpaprRngState SpaprRngState;
 
 struct HRandomData {
     QemuSemaphore sem;
@@ -84,9 +82,9 @@ static target_ulong h_random(PowerPCCPU *cpu, SpaprMachineState *spapr,
     while (hrdata.received < 8) {
         rng_backend_request_entropy(rngstate->backend, 8 - hrdata.received,
                                     random_recv, &hrdata);
-        qemu_mutex_unlock_iothread();
+        bql_unlock();
         qemu_sem_wait(&hrdata.sem);
-        qemu_mutex_lock_iothread();
+        bql_lock();
     }
 
     qemu_sem_destroy(&hrdata.sem);
@@ -103,8 +101,7 @@ static void spapr_rng_instance_init(Object *obj)
     }
 
     object_property_set_description(obj, "rng",
-                                    "ID of the random number generator backend",
-                                    NULL);
+                                    "ID of the random number generator backend");
 }
 
 static void spapr_rng_realize(DeviceState *dev, Error **errp)
@@ -133,14 +130,13 @@ static void spapr_rng_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static Property spapr_rng_properties[] = {
+static const Property spapr_rng_properties[] = {
     DEFINE_PROP_BOOL("use-kvm", SpaprRngState, use_kvm, false),
     DEFINE_PROP_LINK("rng", SpaprRngState, backend, TYPE_RNG_BACKEND,
                      RngBackend *),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void spapr_rng_class_init(ObjectClass *oc, void *data)
+static void spapr_rng_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 

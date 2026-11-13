@@ -29,8 +29,7 @@
 //#include <asm/system.h>
 
 
-FPA11* qemufpa = NULL;
-CPUARMState* user_registers;
+__thread FPA11* qemufpa = NULL;
 
 /* Reset the FPA11 chip.  Called to initialize and reset the emulator. */
 void resetFPA11(void)
@@ -51,6 +50,29 @@ void resetFPA11(void)
 #ifdef MAINTAIN_FPCR
   fpa11->fpcr = MASK_RESET;
 #endif
+
+  /*
+   * Real FPA11 hardware does not handle NaNs, but always takes an
+   * exception for them to be software-emulated (ARM7500FE datasheet
+   * section 10.4). There is no documented architectural requirement
+   * for NaN propagation rules and it will depend on how the OS
+   * level software emulation opted to do it. We here use prop_s_ab
+   * which matches the later VFP hardware choice and how QEMU's
+   * fpa11 emulation has worked in the past. The real Linux kernel
+   * does something slightly different: arch/arm/nwfpe/softfloat-specialize
+   * propagateFloat64NaN() has the curious behaviour that it prefers
+   * the QNaN over the SNaN, but if both are QNaN it picks A and
+   * if both are SNaN it picks B. In theory we could add this as
+   * a NaN propagation rule, but in practice FPA11 emulation is so
+   * close to totally dead that it's not worth trying to match it at
+   * this late date.
+   */
+  set_float_2nan_prop_rule(float_2nan_prop_s_ab, &fpa11->fp_status);
+  /*
+   * Use the same default NaN value as Arm VFP. This doesn't match
+   * the Linux kernel's nwfpe emulation, which uses an all-1s value.
+   */
+  set_float_default_nan_pattern(0b01000000, &fpa11->fp_status);
 }
 
 void SetRoundingMode(const unsigned int opcode)
@@ -97,42 +119,42 @@ void SetRoundingMode(const unsigned int opcode)
 
 void SetRoundingPrecision(const unsigned int opcode)
 {
-    int rounding_precision;
-   FPA11 *fpa11 = GET_FPA11();
+    FloatX80RoundPrec rounding_precision;
+    FPA11 *fpa11 = GET_FPA11();
 #ifdef MAINTAIN_FPCR
-   fpa11->fpcr &= ~MASK_ROUNDING_PRECISION;
+    fpa11->fpcr &= ~MASK_ROUNDING_PRECISION;
 #endif
-   switch (opcode & MASK_ROUNDING_PRECISION)
-   {
-      case ROUND_SINGLE:
-         rounding_precision = 32;
+    switch (opcode & MASK_ROUNDING_PRECISION) {
+    case ROUND_SINGLE:
+        rounding_precision = floatx80_precision_s;
 #ifdef MAINTAIN_FPCR
-         fpa11->fpcr |= ROUND_SINGLE;
+        fpa11->fpcr |= ROUND_SINGLE;
 #endif
-      break;
+        break;
 
-      case ROUND_DOUBLE:
-         rounding_precision = 64;
+    case ROUND_DOUBLE:
+        rounding_precision = floatx80_precision_d;
 #ifdef MAINTAIN_FPCR
-         fpa11->fpcr |= ROUND_DOUBLE;
+        fpa11->fpcr |= ROUND_DOUBLE;
 #endif
-      break;
+        break;
 
-      case ROUND_EXTENDED:
-         rounding_precision = 80;
+    case ROUND_EXTENDED:
+        rounding_precision = floatx80_precision_x;
 #ifdef MAINTAIN_FPCR
-         fpa11->fpcr |= ROUND_EXTENDED;
+        fpa11->fpcr |= ROUND_EXTENDED;
 #endif
-      break;
+        break;
 
-      default: rounding_precision = 80;
-  }
-   set_floatx80_rounding_precision(rounding_precision, &fpa11->fp_status);
+    default:
+        rounding_precision = floatx80_precision_x;
+        break;
+    }
+    set_floatx80_rounding_precision(rounding_precision, &fpa11->fp_status);
 }
 
 /* Emulate the instruction in the opcode. */
-/* ??? This is not thread safe.  */
-unsigned int EmulateAll(unsigned int opcode, FPA11* qfpa, CPUARMState* qregs)
+unsigned int EmulateAll(unsigned int opcode, FPA11* qfpa)
 {
   unsigned int nRc = 0;
 //  unsigned long flags;
@@ -149,12 +171,6 @@ unsigned int EmulateAll(unsigned int opcode, FPA11* qfpa, CPUARMState* qregs)
   }
 
   qemufpa=qfpa;
-  user_registers=qregs;
-
-#if 0
-  fprintf(stderr,"emulating FP insn 0x%08x, PC=0x%08x\n",
-          opcode, qregs[ARM_REG_PC]);
-#endif
   fpa11 = GET_FPA11();
 
   if (fpa11->initflag == 0)		/* good place for __builtin_expect */

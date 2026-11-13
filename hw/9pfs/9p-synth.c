@@ -12,6 +12,11 @@
  *
  */
 
+/*
+ * Not so fast! You might want to read the 9p developer docs first:
+ * https://wiki.qemu.org/Documentation/9p
+ */
+
 #include "qemu/osdep.h"
 #include "9p.h"
 #include "fsdev/qemu-fsdev.h"
@@ -19,7 +24,9 @@
 #include "qemu/rcu.h"
 #include "qemu/rcu_queue.h"
 #include "qemu/cutils.h"
-#include "sysemu/qtest.h"
+#include "system/qtest.h"
+#include "qapi/error.h"
+#include "qemu/option.h"
 
 /* Root node for synth file system */
 static V9fsSynthNode synth_root = {
@@ -44,7 +51,7 @@ static V9fsSynthNode *v9fs_add_dir_node(V9fsSynthNode *parent, int mode,
 
     /* Add directory type and remove write bits */
     mode = ((mode & 0777) | S_IFDIR) & ~(S_IWUSR | S_IWGRP | S_IWOTH);
-    node = g_malloc0(sizeof(V9fsSynthNode));
+    node = g_new0(V9fsSynthNode, 1);
     if (attr) {
         /* We are adding .. or . entries */
         node->attr = attr;
@@ -67,67 +74,60 @@ static V9fsSynthNode *v9fs_add_dir_node(V9fsSynthNode *parent, int mode,
 int qemu_v9fs_synth_mkdir(V9fsSynthNode *parent, int mode,
                           const char *name, V9fsSynthNode **result)
 {
-    int ret;
     V9fsSynthNode *node, *tmp;
 
     if (!synth_fs) {
-        return EAGAIN;
+        return -EAGAIN;
     }
     if (!name || (strlen(name) >= NAME_MAX)) {
-        return EINVAL;
+        return -EINVAL;
     }
     if (!parent) {
         parent = &synth_root;
     }
-    qemu_mutex_lock(&synth_mutex);
+    QEMU_LOCK_GUARD(&synth_mutex);
     QLIST_FOREACH(tmp, &parent->child, sibling) {
         if (!strcmp(tmp->name, name)) {
-            ret = EEXIST;
-            goto err_out;
+            return -EEXIST;
         }
     }
     /* Add the name */
-    node = v9fs_add_dir_node(parent, mode, name, NULL, synth_node_count++);
+    node = v9fs_add_dir_node(parent, mode, name, NULL, ++synth_node_count);
     v9fs_add_dir_node(node, parent->attr->mode, "..",
                       parent->attr, parent->attr->inode);
     v9fs_add_dir_node(node, node->attr->mode, ".",
                       node->attr, node->attr->inode);
     *result = node;
-    ret = 0;
-err_out:
-    qemu_mutex_unlock(&synth_mutex);
-    return ret;
+    return 0;
 }
 
 int qemu_v9fs_synth_add_file(V9fsSynthNode *parent, int mode,
                              const char *name, v9fs_synth_read read,
                              v9fs_synth_write write, void *arg)
 {
-    int ret;
     V9fsSynthNode *node, *tmp;
 
     if (!synth_fs) {
-        return EAGAIN;
+        return -EAGAIN;
     }
     if (!name || (strlen(name) >= NAME_MAX)) {
-        return EINVAL;
+        return -EINVAL;
     }
     if (!parent) {
         parent = &synth_root;
     }
 
-    qemu_mutex_lock(&synth_mutex);
+    QEMU_LOCK_GUARD(&synth_mutex);
     QLIST_FOREACH(tmp, &parent->child, sibling) {
         if (!strcmp(tmp->name, name)) {
-            ret = EEXIST;
-            goto err_out;
+            return -EEXIST;
         }
     }
     /* Add file type and remove write bits */
     mode = ((mode & 0777) | S_IFREG);
-    node = g_malloc0(sizeof(V9fsSynthNode));
+    node = g_new0(V9fsSynthNode, 1);
     node->attr         = &node->actual_attr;
-    node->attr->inode  = synth_node_count++;
+    node->attr->inode  = ++synth_node_count;
     node->attr->nlink  = 1;
     node->attr->read   = read;
     node->attr->write  = write;
@@ -135,10 +135,7 @@ int qemu_v9fs_synth_add_file(V9fsSynthNode *parent, int mode,
     node->private      = arg;
     pstrcpy(node->name, sizeof(node->name), name);
     QLIST_INSERT_HEAD_RCU(&parent->child, node, sibling);
-    ret = 0;
-err_out:
-    qemu_mutex_unlock(&synth_mutex);
-    return ret;
+    return 0;
 }
 
 static void synth_fill_statbuf(V9fsSynthNode *node, struct stat *stbuf)
@@ -181,7 +178,12 @@ static int synth_opendir(FsContext *ctx,
     V9fsSynthOpenState *synth_open;
     V9fsSynthNode *node = *(V9fsSynthNode **)fs_path->data;
 
-    synth_open = g_malloc(sizeof(*synth_open));
+    /*
+     * V9fsSynthOpenState contains 'struct dirent' which have OS-specific
+     * properties, thus it's zero cleared on allocation here and below
+     * in synth_open.
+     */
+    synth_open = g_new0(V9fsSynthOpenState, 1);
     synth_open->node = node;
     node->open_count++;
     fs->private = synth_open;
@@ -219,9 +221,20 @@ static void synth_rewinddir(FsContext *ctx, V9fsFidOpenState *fs)
 static void synth_direntry(V9fsSynthNode *node,
                                 struct dirent *entry, off_t off)
 {
-    strcpy(entry->d_name, node->name);
+    size_t sz = strlen(node->name) + 1;
+    /*
+     * 'entry' is always inside of V9fsSynthOpenState which have NAME_MAX
+     * back padding. Ensure we do not overflow it.
+     */
+    g_assert(sizeof(struct dirent) + NAME_MAX >=
+             offsetof(struct dirent, d_name) + sz);
+    memcpy(entry->d_name, node->name, sz);
     entry->d_ino = node->attr->inode;
+#ifdef CONFIG_DARWIN
+    entry->d_seekoff = off + 1;
+#else
     entry->d_off = off + 1;
+#endif
 }
 
 static struct dirent *synth_get_dentry(V9fsSynthNode *dir,
@@ -265,7 +278,7 @@ static int synth_open(FsContext *ctx, V9fsPath *fs_path,
     V9fsSynthOpenState *synth_open;
     V9fsSynthNode *node = *(V9fsSynthNode **)fs_path->data;
 
-    synth_open = g_malloc(sizeof(*synth_open));
+    synth_open = g_new0(V9fsSynthOpenState, 1);
     synth_open->node = node;
     node->open_count++;
     fs->private = synth_open;
@@ -345,6 +358,13 @@ static int synth_truncate(FsContext *ctx, V9fsPath *path, off_t offset)
     return -1;
 }
 
+static int synth_ftruncate(FsContext *ctx, int fid_type, V9fsFidOpenState *fs,
+                           off_t size)
+{
+    errno = ENOSYS;
+    return -1;
+}
+
 static int synth_chmod(FsContext *fs_ctx, V9fsPath *path, FsCred *credp)
 {
     errno = EPERM;
@@ -406,6 +426,13 @@ static int synth_utimensat(FsContext *fs_ctx, V9fsPath *path,
     return 0;
 }
 
+static int synth_futimens(FsContext *fs_ctx, int fid_type, V9fsFidOpenState *fs,
+                          const struct timespec *buf)
+{
+    errno = ENOSYS;
+    return -1;
+}
+
 static int synth_remove(FsContext *ctx, const char *path)
 {
     errno = EPERM;
@@ -426,7 +453,9 @@ static int synth_statfs(FsContext *s, V9fsPath *fs_path,
     stbuf->f_bsize = 512;
     stbuf->f_blocks = 0;
     stbuf->f_files = synth_node_count;
+#if !defined(CONFIG_DARWIN) && !defined(CONFIG_FREEBSD)
     stbuf->f_namelen = NAME_MAX;
+#endif
     return 0;
 }
 
@@ -448,15 +477,15 @@ static int synth_lsetxattr(FsContext *ctx, V9fsPath *path,
                                 const char *name, void *value,
                                 size_t size, int flags)
 {
-    errno = ENOTSUP;
-    return -1;
+    /* pretend it worked */
+    return 0;
 }
 
 static int synth_lremovexattr(FsContext *ctx,
                                    V9fsPath *path, const char *name)
 {
-    errno = ENOTSUP;
-    return -1;
+    /* pretend it worked */
+    return 0;
 }
 
 static int synth_name_to_path(FsContext *ctx, V9fsPath *dir_path,
@@ -480,7 +509,7 @@ static int synth_name_to_path(FsContext *ctx, V9fsPath *dir_path,
         node = dir_node;
         goto out;
     }
-    /* search for the name in the childern */
+    /* search for the name in the children */
     rcu_read_lock();
     QLIST_FOREACH(node, &dir_node->child, sibling) {
         if (!strcmp(node->name, name)) {
@@ -534,6 +563,19 @@ static ssize_t v9fs_synth_qtest_flush_write(void *buf, int len, off_t offset,
     }
 
     return 1;
+}
+
+/* transmits internal xattr counter to client */
+static ssize_t v9fs_synth_read_xattr_count(void *buf, int len, off_t offset,
+                                           void *arg)
+{
+    FsContext *ctx = arg;
+    size_t local_count = ctx->xattr_fid_count;
+    if (len < (int)sizeof(size_t)) {
+        return -ENOSPC;
+    }
+    memcpy(buf, &local_count, sizeof(size_t));
+    return sizeof(size_t);
 }
 
 static int synth_init(FsContext *ctx, Error **errp)
@@ -597,12 +639,45 @@ static int synth_init(FsContext *ctx, Error **errp)
                 g_free(name);
             }
         }
+
+        /* Directory for internal statistic queries */
+        {
+            V9fsSynthNode *stat_dir = NULL;
+            ret = qemu_v9fs_synth_mkdir(NULL, 0755, "stat", &stat_dir);
+            assert(!ret);
+
+            /* File for internal xattr count query */
+            ret = qemu_v9fs_synth_add_file(stat_dir, 0444, "xattr_count",
+                                           v9fs_synth_read_xattr_count,
+                                           NULL, ctx);
+            assert(!ret);
+        }
     }
 
     return 0;
 }
 
+static int synth_parse_opts(QemuOpts *opts, FsDriverEntry *fse, Error **errp)
+{
+    uint64_t val = qemu_opt_get_number(opts, "max_xattr",
+                                       V9FS_MAX_XATTR_DEFAULT);
+    if (val > UINT32_MAX) {
+        error_setg(errp, "max_xattr value '%s' too large",
+                   qemu_opt_get(opts, "max_xattr"));
+        return -1;
+    }
+    fse->max_xattr = val;
+
+    return 0;
+}
+
+static bool synth_has_valid_file_handle(int fid_type, V9fsFidOpenState *fs)
+{
+    return false;
+}
+
 FileOperations synth_ops = {
+    .parse_opts   = synth_parse_opts,
     .init         = synth_init,
     .lstat        = synth_lstat,
     .readlink     = synth_readlink,
@@ -637,4 +712,7 @@ FileOperations synth_ops = {
     .name_to_path = synth_name_to_path,
     .renameat     = synth_renameat,
     .unlinkat     = synth_unlinkat,
+    .has_valid_file_handle = synth_has_valid_file_handle,
+    .ftruncate    = synth_ftruncate,
+    .futimens     = synth_futimens,
 };

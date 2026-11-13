@@ -13,7 +13,9 @@
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
-#include "sysemu/kvm.h"
+#include "system/kvm.h"
+#include "system/tcg.h"
+#include "system/qtest.h"
 #include "migration/qemu-file-types.h"
 #include "migration/register.h"
 
@@ -23,13 +25,18 @@ void s390_init_tod(void)
 
     if (kvm_enabled()) {
         obj = object_new(TYPE_KVM_S390_TOD);
-    } else {
+    } else if (tcg_enabled()) {
         obj = object_new(TYPE_QEMU_S390_TOD);
+    } else if (qtest_enabled()) {
+        return;
+    } else {
+        error_report("current accelerator not handled in s390_init_tod!");
+        abort();
     }
-    object_property_add_child(qdev_get_machine(), TYPE_S390_TOD, obj, NULL);
+    object_property_add_child(qdev_get_machine(), TYPE_S390_TOD, obj);
     object_unref(obj);
 
-    qdev_init_nofail(DEVICE(obj));
+    qdev_realize(DEVICE(obj), NULL, &error_fatal);
 }
 
 S390TODState *s390_get_todstate(void)
@@ -65,6 +72,11 @@ static void s390_tod_save(QEMUFile *f, void *opaque)
     qemu_put_byte(f, S390_TOD_CLOCK_VALUE_PRESENT);
     qemu_put_byte(f, tod.high);
     qemu_put_be64(f, tod.low);
+
+    tdc->set(td, &tod, &err);
+    if (err) {
+        warn_report_err(err);
+    }
 }
 
 static int s390_tod_load(QEMUFile *f, void *opaque, int version_id)
@@ -104,7 +116,7 @@ static void s390_tod_realize(DeviceState *dev, Error **errp)
     register_savevm_live("todclock", 0, 1, &savevm_tod, td);
 }
 
-static void s390_tod_class_init(ObjectClass *oc, void *data)
+static void s390_tod_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
@@ -116,7 +128,7 @@ static void s390_tod_class_init(ObjectClass *oc, void *data)
     dc->user_creatable = false;
 }
 
-static TypeInfo s390_tod_info = {
+static const TypeInfo s390_tod_info = {
     .name = TYPE_S390_TOD,
     .parent = TYPE_DEVICE,
     .instance_size = sizeof(S390TODState),

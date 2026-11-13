@@ -32,12 +32,12 @@ X86IOMMUState *x86_iommu_get_default(void)
     return NULL;
 }
 
+X86IOMMUState *x86_iommu_device_get(PCIDevice *dev)
+{
+    return NULL;
+}
+
 bool x86_iommu_ir_supported(X86IOMMUState *s)
 {
     return false;
-}
-
-IommuType x86_iommu_get_type(void)
-{
-    abort();
 }

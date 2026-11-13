@@ -45,9 +45,9 @@
 /* this struct defines a stack used during syscall handling */
 
 typedef struct target_sigaltstack {
-	abi_long ss_sp;
-	abi_ulong ss_size;
-	abi_long ss_flags;
+    abi_ulong ss_sp;
+    abi_ulong ss_size;
+    abi_int ss_flags;
 } target_stack_t;
 
 
@@ -64,13 +64,18 @@ typedef struct target_sigaltstack {
 #define TARGET_SA_NODEFER       0x40000000
 #define TARGET_SA_RESTART       0x10000000
 #define TARGET_SA_RESETHAND     0x80000000
-#define TARGET_SA_RESTORER      0x04000000      /* Only for O32 */
 
 #define TARGET_MINSIGSTKSZ    2048
-#define TARGET_SIGSTKSZ       8192
 
 #if defined(TARGET_ABI_MIPSO32)
 /* compare linux/arch/mips/kernel/signal.c:setup_frame() */
 #define TARGET_ARCH_HAS_SETUP_FRAME
 #endif
+#define TARGET_ARCH_HAS_SIGTRAMP_PAGE 1
+
+/* bit-flags */
+#define TARGET_SS_AUTODISARM (1U << 31) /* disable sas during sighandling */
+/* mask for all SS_xxx flags */
+#define TARGET_SS_FLAG_BITS  TARGET_SS_AUTODISARM
+
 #endif /* MIPS_TARGET_SIGNAL_H */

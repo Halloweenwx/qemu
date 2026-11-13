@@ -14,7 +14,6 @@
 
 import os
 import sys
-import socket
 import subprocess
 import basevm
 
@@ -22,39 +21,9 @@ class OpenBSDVM(basevm.BaseVM):
     name = "openbsd"
     arch = "x86_64"
 
-    link = "https://cdn.openbsd.org/pub/OpenBSD/6.6/amd64/install66.iso"
-    csum = "b22e63df56e6266de6bbeed8e9be0fbe9ee2291551c5bc03f3cc2e4ab9436ee3"
+    link = "https://cdn.openbsd.org/pub/OpenBSD/7.8/amd64/install78.iso"
+    csum = "a228d0a1ef558b4d9ec84c698f0d3ffd13cd38c64149487cba0f1ad873be07b2"
     size = "20G"
-    pkgs = [
-        # tools
-        "git",
-        "pkgconf",
-        "bzip2", "xz",
-
-        # gnu tools
-        "bash",
-        "gmake",
-        "gsed",
-        "bison",
-
-        # libs: usb
-        "libusb1",
-
-        # libs: crypto
-        "gnutls",
-
-        # libs: images
-        "jpeg",
-        "png",
-
-	# libs: ui
-        "sdl2",
-        "gtk+3",
-        "libxkbcommon",
-
-        # libs: migration
-        "zstd",
-    ]
 
     BUILD_SCRIPT = """
         set -e;
@@ -62,8 +31,9 @@ class OpenBSDVM(basevm.BaseVM):
         cd $(mktemp -d /home/qemu/qemu-test.XXXXXX);
         mkdir src build; cd src;
         tar -xf /dev/rsd1c;
-        cd ../build
-        ../src/configure --cc=cc --python=python3 {configure_opts};
+        cd ../build;
+        ../src/configure --cc=cc  --extra-cflags=-I/usr/local/include \
+                         --extra-ldflags=-L/usr/local/lib {configure_opts};
         gmake --output-sync -j{jobs} {target} {verbose};
     """
     poweroff = "halt -p"
@@ -80,8 +50,8 @@ class OpenBSDVM(basevm.BaseVM):
 
         self.print_step("Booting installer")
         self.boot(img_tmp, extra_args = [
-            "-bios", "pc-bios/bios-256k.bin",
             "-machine", "graphics=off",
+            "-device", "VGA",
             "-cdrom", iso
         ])
         self.console_init()
@@ -92,35 +62,59 @@ class OpenBSDVM(basevm.BaseVM):
         self.console_wait_send("(I)nstall",               "i\n")
         self.console_wait_send("Terminal type",           "xterm\n")
         self.console_wait_send("System hostname",         "openbsd\n")
-        self.console_wait_send("Which network interface", "vio0\n")
-        self.console_wait_send("IPv4 address",            "dhcp\n")
+        self.console_wait_send("Network interface to configure", "vio0\n")
+        self.console_wait_send("IPv4 address",            "autoconf\n")
         self.console_wait_send("IPv6 address",            "none\n")
-        self.console_wait_send("Which network interface", "done\n")
-        self.console_wait_send("DNS domain name",         "localnet\n")
+        self.console_wait_send("Network interface to configure", "done\n")
         self.console_wait("Password for root account")
-        self.console_send("%s\n" % self.ROOT_PASS)
+        self.console_send("%s\n" % self._config["root_pass"])
         self.console_wait("Password for root account")
-        self.console_send("%s\n" % self.ROOT_PASS)
+        self.console_send("%s\n" % self._config["root_pass"])
         self.console_wait_send("Start sshd(8)",           "yes\n")
-        self.console_wait_send("X Window System",         "\n")
-        self.console_wait_send("xenodm",                  "\n")
+        self.console_wait_send("X Window System",         "no\n")
         self.console_wait_send("console to com0",         "\n")
         self.console_wait_send("Which speed",             "\n")
 
         self.console_wait("Setup a user")
-        self.console_send("%s\n" % self.GUEST_USER)
+        self.console_send("%s\n" % self._config["guest_user"])
         self.console_wait("Full name")
-        self.console_send("%s\n" % self.GUEST_USER)
+        self.console_send("%s\n" % self._config["guest_user"])
         self.console_wait("Password")
-        self.console_send("%s\n" % self.GUEST_PASS)
+        self.console_send("%s\n" % self._config["guest_pass"])
         self.console_wait("Password")
-        self.console_send("%s\n" % self.GUEST_PASS)
+        self.console_send("%s\n" % self._config["guest_pass"])
 
         self.console_wait_send("Allow root ssh login",    "yes\n")
         self.console_wait_send("timezone",                "UTC\n")
         self.console_wait_send("root disk",               "\n")
+        self.console_wait_send("Encrypt the root disk with a (p)assphrase", "no\n")
         self.console_wait_send("(W)hole disk",            "\n")
-        self.console_wait_send("(A)uto layout",           "\n")
+        self.console_wait_send("(A)uto layout",           "c\n")
+
+        # 4000 MB / as /dev/sd0a, at start of disk
+        self.console_wait_send("sd0>", "a a\n")
+        self.console_wait_send("offset:", "\n")
+        self.console_wait_send("size:", "4000M\n")
+        self.console_wait_send("FS type", "4.2BSD\n")
+        self.console_wait_send("mount point:", "/\n")
+
+        # 256 MB swap as /dev/sd0b
+        self.console_wait_send("sd0*>", "a b\n")
+        self.console_wait_send("offset:", "\n")
+        self.console_wait_send("size:", "256M\n")
+        self.console_wait_send("FS type", "swap\n")
+
+        # All remaining space for /home as /dev/sd0d
+        # NB, 'c' isn't allowed to be used.
+        self.console_wait_send("sd0*>", "a d\n")
+        self.console_wait_send("offset:", "\n")
+        self.console_wait_send("size:", "\n")
+        self.console_wait_send("FS type", "4.2BSD\n")
+        self.console_wait_send("mount point:", "/home\n")
+
+        self.console_wait_send("sd0*>", "q\n")
+        self.console_wait_send("Write new label?:", "y\n")
+
         self.console_wait_send("Location of sets",        "cd0\n")
         self.console_wait_send("Pathname to the sets",    "\n")
         self.console_wait_send("Set name(s)",             "\n")
@@ -135,12 +129,13 @@ class OpenBSDVM(basevm.BaseVM):
 
         # setup qemu user
         prompt = "$"
-        self.console_ssh_init(prompt, self.GUEST_USER, self.GUEST_PASS)
+        self.console_ssh_init(prompt, self._config["guest_user"],
+                                      self._config["guest_pass"])
         self.console_wait_send(prompt, "exit\n")
 
         # setup root user
         prompt = "openbsd#"
-        self.console_ssh_init(prompt, "root", self.ROOT_PASS)
+        self.console_ssh_init(prompt, "root", self._config["root_pass"])
         self.console_sshd_config(prompt)
 
         # setup virtio-blk #1 (tarfile)
@@ -164,8 +159,9 @@ class OpenBSDVM(basevm.BaseVM):
         self.console_wait("login:")
         self.wait_ssh()
 
+        pkgs = self.get_qemu_packages_from_lcitool_json()
         self.print_step("Installing packages")
-        self.ssh_root_check("pkg_add %s\n" % " ".join(self.pkgs))
+        self.ssh_root_check("pkg_add %s\n" % " ".join(pkgs))
 
         # shutdown
         self.ssh_root(self.poweroff)

@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -28,8 +28,8 @@ static inline void cpu_clone_regs_child(CPUHPPAState *env, target_ulong newsp,
     /* Indicate child in return value.  */
     env->gr[28] = 0;
     /* Return from the syscall.  */
-    env->iaoq_f = env->gr[31];
-    env->iaoq_b = env->gr[31] + 4;
+    env->iaoq_f = env->gr[31] | PRIV_USER;
+    env->iaoq_b = env->iaoq_f + 4;
 }
 
 static inline void cpu_clone_regs_parent(CPUHPPAState *env, unsigned flags)

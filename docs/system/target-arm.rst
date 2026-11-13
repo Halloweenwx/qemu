@@ -63,23 +63,55 @@ large amounts of RAM. It also supports 64-bit CPUs.
 Board-specific documentation
 ============================
 
-Unfortunately many of the Arm boards QEMU supports are currently
-undocumented; you can get a complete list by running
-``qemu-system-aarch64 --machine help``.
+..
+   This table of contents should be kept sorted alphabetically
+   by the title text of each file, which isn't the same ordering
+   as an alphabetical sort by filename.
 
 .. toctree::
    :maxdepth: 1
 
+   arm/max78000
    arm/integratorcp
-   arm/versatile
+   arm/mps2
+   arm/musca
    arm/realview
-   arm/xscale
-   arm/palm
-   arm/nseries
-   arm/stellaris
-   arm/musicpal
-   arm/sx1
+   arm/sbsa
+   arm/versatile
+   arm/vexpress
+   arm/aspeed
+   arm/bananapi_m2u.rst
+   arm/b-l475e-iot01a.rst
+   arm/sabrelite
+   arm/digic
+   arm/cubieboard
+   arm/emcraft-sf2
+   arm/exynos
+   arm/kzm
+   arm/nrf
+   arm/nuvoton
+   arm/imx25-pdk
+   arm/mcimx6ul-evk
+   arm/mcimx7d-sabre
+   arm/imx8m
    arm/orangepi
+   arm/raspi
+   arm/collie
+   arm/sx1
+   arm/stellaris
+   arm/stm32
+   arm/virt
+   arm/vmapple
+   arm/xenpvh
+   arm/xlnx-versal-virt
+   arm/xlnx-zynq
+   arm/xlnx-zcu102
+
+Emulated CPU architecture support
+=================================
+
+.. toctree::
+   arm/emulation
 
 Arm CPU features
 ================

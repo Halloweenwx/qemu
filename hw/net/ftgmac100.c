@@ -12,20 +12,19 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/net/ftgmac100.h"
-#include "sysemu/dma.h"
+#include "system/dma.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "net/checksum.h"
 #include "net/eth.h"
 #include "hw/net/mii.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 
-/* For crc32 */
-#include <zlib.h>
+#include <zlib.h> /* for crc32 */
 
 /*
  * FTGMAC100 registers
@@ -57,6 +56,16 @@
 #define FTGMAC100_FCR             0x68
 
 /*
+ * FTGMAC100 registers high
+ *
+ * values below are offset by - FTGMAC100_REG_HIGH_OFFSET from datasheet
+ * because its memory region is start at FTGMAC100_REG_HIGH_OFFSET
+ */
+#define FTGMAC100_NPTXR_BADR_HIGH   (0x17C - FTGMAC100_REG_HIGH_OFFSET)
+#define FTGMAC100_HPTXR_BADR_HIGH   (0x184 - FTGMAC100_REG_HIGH_OFFSET)
+#define FTGMAC100_RXR_BADR_HIGH     (0x18C - FTGMAC100_REG_HIGH_OFFSET)
+
+/*
  * Interrupt status register & interrupt enable register
  */
 #define FTGMAC100_INT_RPKT_BUF    (1 << 0)
@@ -78,6 +87,16 @@
 #define FTGMAC100_APTC_RXPOLL_TIME_SEL      (1 << 4)
 #define FTGMAC100_APTC_TXPOLL_CNT(x)        (((x) >> 8) & 0xf)
 #define FTGMAC100_APTC_TXPOLL_TIME_SEL      (1 << 12)
+
+/*
+ * DMA burst length and arbitration control register
+ */
+#define FTGMAC100_DBLAC_RXBURST_SIZE(x)     (((x) >> 8) & 0x3)
+#define FTGMAC100_DBLAC_TXBURST_SIZE(x)     (((x) >> 10) & 0x3)
+#define FTGMAC100_DBLAC_RXDES_SIZE(x)       ((((x) >> 12) & 0xf) * 8)
+#define FTGMAC100_DBLAC_TXDES_SIZE(x)       ((((x) >> 16) & 0xf) * 8)
+#define FTGMAC100_DBLAC_IFG_CNT(x)          (((x) >> 20) & 0x7)
+#define FTGMAC100_DBLAC_IFG_INC             (1 << 23)
 
 /*
  * PHY control register
@@ -155,6 +174,8 @@
 #define FTGMAC100_TXDES1_TX2FIC          (1 << 30)
 #define FTGMAC100_TXDES1_TXIC            (1 << 31)
 
+#define FTGMAC100_TXDES2_TXBUF_BADR_HI(x)   (((x) >> 16) & 0x7)
+
 /*
  * Receive descriptor
  */
@@ -188,13 +209,15 @@
 #define FTGMAC100_RXDES1_UDP_CHKSUM_ERR  (1 << 26)
 #define FTGMAC100_RXDES1_IP_CHKSUM_ERR   (1 << 27)
 
+#define FTGMAC100_RXDES2_RXBUF_BADR_HI(x)   (((x) >> 16) & 0x7)
+
 /*
  * Receive and transmit Buffer Descriptor
  */
 typedef struct {
     uint32_t        des0;
     uint32_t        des1;
-    uint32_t        des2;        /* not used by HW */
+    uint32_t        des2;        /* used by HW 64 bits DMA */
     uint32_t        des3;
 } FTGMAC100Desc;
 
@@ -228,7 +251,8 @@ typedef struct {
  */
 #define FTGMAC100_MAX_FRAME_SIZE    9220
 
-/* Limits depending on the type of the frame
+/*
+ * Limits depending on the type of the frame
  *
  *   9216 for Jumbo frames (+ 4 for VLAN)
  *   1518 for other frames (+ 4 for VLAN)
@@ -443,7 +467,8 @@ static void do_phy_ctl(FTGMAC100State *s)
 
 static int ftgmac100_read_bd(FTGMAC100Desc *bd, dma_addr_t addr)
 {
-    if (dma_memory_read(&address_space_memory, addr, bd, sizeof(*bd))) {
+    if (dma_memory_read(&address_space_memory, addr,
+                        bd, sizeof(*bd), MEMTXATTRS_UNSPECIFIED)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to read descriptor @ 0x%"
                       HWADDR_PRIx "\n", __func__, addr);
         return -1;
@@ -463,7 +488,8 @@ static int ftgmac100_write_bd(FTGMAC100Desc *bd, dma_addr_t addr)
     lebd.des1 = cpu_to_le32(bd->des1);
     lebd.des2 = cpu_to_le32(bd->des2);
     lebd.des3 = cpu_to_le32(bd->des3);
-    if (dma_memory_write(&address_space_memory, addr, &lebd, sizeof(lebd))) {
+    if (dma_memory_write(&address_space_memory, addr,
+                         &lebd, sizeof(lebd), MEMTXATTRS_UNSPECIFIED)) {
         qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to write descriptor @ 0x%"
                       HWADDR_PRIx "\n", __func__, addr);
         return -1;
@@ -471,12 +497,44 @@ static int ftgmac100_write_bd(FTGMAC100Desc *bd, dma_addr_t addr)
     return 0;
 }
 
-static void ftgmac100_do_tx(FTGMAC100State *s, uint32_t tx_ring,
-                            uint32_t tx_descriptor)
+static int ftgmac100_insert_vlan(FTGMAC100State *s, int frame_size,
+                                 uint16_t vlan_tci)
+{
+    uint8_t *vlan_hdr = s->frame + (ETH_ALEN * 2);
+    uint8_t *payload = vlan_hdr + sizeof(struct vlan_header);
+
+    if (frame_size < sizeof(struct eth_header)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: frame too small for VLAN insertion : %d bytes\n",
+                      __func__, frame_size);
+        s->isr |= FTGMAC100_INT_XPKT_LOST;
+        goto out;
+    }
+
+    if (frame_size + sizeof(struct vlan_header) > sizeof(s->frame)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "%s: frame too big : %d bytes\n",
+                      __func__, frame_size);
+        s->isr |= FTGMAC100_INT_XPKT_LOST;
+        frame_size -= sizeof(struct vlan_header);
+    }
+
+    memmove(payload, vlan_hdr, frame_size - (ETH_ALEN * 2));
+    stw_be_p(vlan_hdr, ETH_P_VLAN);
+    stw_be_p(vlan_hdr + 2, vlan_tci);
+    frame_size += sizeof(struct vlan_header);
+
+out:
+    return frame_size;
+}
+
+static void ftgmac100_do_tx(FTGMAC100State *s, uint64_t tx_ring,
+                            uint64_t tx_descriptor)
 {
     int frame_size = 0;
     uint8_t *ptr = s->frame;
-    uint32_t addr = tx_descriptor;
+    uint64_t addr = tx_descriptor;
+    uint64_t buf_addr = 0;
     uint32_t flags = 0;
 
     while (1) {
@@ -490,13 +548,24 @@ static void ftgmac100_do_tx(FTGMAC100State *s, uint32_t tx_ring,
             break;
         }
 
-        /* record transmit flags as they are valid only on the first
-         * segment */
+        /*
+         * record transmit flags as they are valid only on the first
+         * segment
+         */
         if (bd.des0 & FTGMAC100_TXDES0_FTS) {
             flags = bd.des1;
         }
 
         len = FTGMAC100_TXDES0_TXBUF_SIZE(bd.des0);
+        if (!len) {
+            /*
+             * 0 is an invalid size, however the HW does not raise any
+             * interrupt. Flag an error because the guest is buggy.
+             */
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: invalid segment size\n",
+                          __func__);
+        }
+
         if (frame_size + len > sizeof(s->frame)) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: frame too big : %d bytes\n",
                           __func__, len);
@@ -504,42 +573,49 @@ static void ftgmac100_do_tx(FTGMAC100State *s, uint32_t tx_ring,
             len =  sizeof(s->frame) - frame_size;
         }
 
-        if (dma_memory_read(&address_space_memory, bd.des3, ptr, len)) {
+        buf_addr = bd.des3;
+        if (s->dma64) {
+            buf_addr = deposit64(buf_addr, 32, 32,
+                                 FTGMAC100_TXDES2_TXBUF_BADR_HI(bd.des2));
+        }
+        if (dma_memory_read(&address_space_memory, buf_addr,
+                            ptr, len, MEMTXATTRS_UNSPECIFIED)) {
             qemu_log_mask(LOG_GUEST_ERROR, "%s: failed to read packet @ 0x%x\n",
                           __func__, bd.des3);
-            s->isr |= FTGMAC100_INT_NO_NPTXBUF;
+            s->isr |= FTGMAC100_INT_AHB_ERR;
             break;
-        }
-
-        /* Check for VLAN */
-        if (bd.des0 & FTGMAC100_TXDES0_FTS &&
-            bd.des1 & FTGMAC100_TXDES1_INS_VLANTAG &&
-            be16_to_cpu(PKT_GET_ETH_HDR(ptr)->h_proto) != ETH_P_VLAN) {
-            if (frame_size + len + 4 > sizeof(s->frame)) {
-                qemu_log_mask(LOG_GUEST_ERROR, "%s: frame too big : %d bytes\n",
-                              __func__, len);
-                s->isr |= FTGMAC100_INT_XPKT_LOST;
-                len =  sizeof(s->frame) - frame_size - 4;
-            }
-            memmove(ptr + 16, ptr + 12, len - 12);
-            stw_be_p(ptr + 12, ETH_P_VLAN);
-            stw_be_p(ptr + 14, bd.des1);
-            len += 4;
         }
 
         ptr += len;
         frame_size += len;
         if (bd.des0 & FTGMAC100_TXDES0_LTS) {
-            if (flags & FTGMAC100_TXDES1_IP_CHKSUM) {
-                net_checksum_calculate(s->frame, frame_size);
+            int csum = 0;
+
+            /* Check for VLAN */
+            if (flags & FTGMAC100_TXDES1_INS_VLANTAG &&
+                be16_to_cpu(PKT_GET_ETH_HDR(s->frame)->h_proto) != ETH_P_VLAN) {
+                frame_size = ftgmac100_insert_vlan(s, frame_size,
+                                            FTGMAC100_TXDES1_VLANTAG_CI(flags));
             }
+
+            if (flags & FTGMAC100_TXDES1_IP_CHKSUM) {
+                csum |= CSUM_IP;
+            }
+            if (flags & FTGMAC100_TXDES1_TCP_CHKSUM) {
+                csum |= CSUM_TCP;
+            }
+            if (flags & FTGMAC100_TXDES1_UDP_CHKSUM) {
+                csum |= CSUM_UDP;
+            }
+            if (csum) {
+                net_checksum_calculate(s->frame, frame_size, csum);
+            }
+
             /* Last buffer in frame.  */
             qemu_send_packet(qemu_get_queue(s->nic), s->frame, frame_size);
             ptr = s->frame;
             frame_size = 0;
-            if (flags & FTGMAC100_TXDES1_TXIC) {
-                s->isr |= FTGMAC100_INT_XPKT_ETH;
-            }
+            s->isr |= FTGMAC100_INT_XPKT_ETH;
         }
 
         if (flags & FTGMAC100_TXDES1_TX2FIC) {
@@ -548,12 +624,15 @@ static void ftgmac100_do_tx(FTGMAC100State *s, uint32_t tx_ring,
         bd.des0 &= ~FTGMAC100_TXDES0_TXDMA_OWN;
 
         /* Write back the modified descriptor.  */
-        ftgmac100_write_bd(&bd, addr);
+        if (ftgmac100_write_bd(&bd, addr)) {
+            s->isr |= FTGMAC100_INT_AHB_ERR;
+            break;
+        }
         /* Advance to the next descriptor.  */
         if (bd.des0 & s->txdes0_edotr) {
             addr = tx_ring;
         } else {
-            addr += sizeof(FTGMAC100Desc);
+            addr += FTGMAC100_DBLAC_TXDES_SIZE(s->dblac);
         }
     }
 
@@ -562,18 +641,18 @@ static void ftgmac100_do_tx(FTGMAC100State *s, uint32_t tx_ring,
     ftgmac100_update_irq(s);
 }
 
-static int ftgmac100_can_receive(NetClientState *nc)
+static bool ftgmac100_can_receive(NetClientState *nc)
 {
     FTGMAC100State *s = FTGMAC100(qemu_get_nic_opaque(nc));
     FTGMAC100Desc bd;
 
     if ((s->maccr & (FTGMAC100_MACCR_RXDMA_EN | FTGMAC100_MACCR_RXMAC_EN))
          != (FTGMAC100_MACCR_RXDMA_EN | FTGMAC100_MACCR_RXMAC_EN)) {
-        return 0;
+        return false;
     }
 
     if (ftgmac100_read_bd(&bd, s->rx_descriptor)) {
-        return 0;
+        return false;
     }
     return !(bd.des0 & FTGMAC100_RXDES0_RXPKT_RDY);
 }
@@ -585,7 +664,8 @@ static int ftgmac100_can_receive(NetClientState *nc)
  */
 static uint32_t ftgmac100_rxpoll(FTGMAC100State *s)
 {
-    /* Polling times :
+    /*
+     * Polling times :
      *
      * Speed      TIME_SEL=0    TIME_SEL=1
      *
@@ -609,10 +689,8 @@ static uint32_t ftgmac100_rxpoll(FTGMAC100State *s)
     return cnt / div[speed];
 }
 
-static void ftgmac100_reset(DeviceState *d)
+static void ftgmac100_do_reset(FTGMAC100State *s, bool sw_reset)
 {
-    FTGMAC100State *s = FTGMAC100(d);
-
     /* Reset the FTGMAC100 */
     s->isr = 0;
     s->ier = 0;
@@ -631,13 +709,23 @@ static void ftgmac100_reset(DeviceState *d)
     s->fear1 = 0;
     s->tpafcr = 0xf1;
 
-    s->maccr = 0;
+    if (sw_reset) {
+        s->maccr &= FTGMAC100_MACCR_GIGA_MODE | FTGMAC100_MACCR_FAST_MODE;
+    } else {
+        s->maccr = 0;
+    }
+
     s->phycr = 0;
     s->phydata = 0;
     s->fcr = 0x400;
 
     /* and the PHY */
     phy_reset(s);
+}
+
+static void ftgmac100_reset_hold(Object *obj, ResetType type)
+{
+    ftgmac100_do_reset(FTGMAC100(obj), false);
 }
 
 static uint64_t ftgmac100_read(void *opaque, hwaddr addr, unsigned size)
@@ -659,6 +747,10 @@ static uint64_t ftgmac100_read(void *opaque, hwaddr addr, unsigned size)
         return s->math[0];
     case FTGMAC100_MATH1:
         return s->math[1];
+    case FTGMAC100_RXR_BADR:
+        return extract64(s->rx_ring, 0, 32);
+    case FTGMAC100_NPTXR_BADR:
+        return extract64(s->tx_ring, 0, 32);
     case FTGMAC100_ITC:
         return s->itc;
     case FTGMAC100_DBLAC:
@@ -729,9 +821,8 @@ static void ftgmac100_write(void *opaque, hwaddr addr,
                           HWADDR_PRIx "\n", __func__, value);
             return;
         }
-
-        s->rx_ring = value;
-        s->rx_descriptor = s->rx_ring;
+        s->rx_ring = deposit64(s->rx_ring, 0, 32, value);
+        s->rx_descriptor = deposit64(s->rx_descriptor, 0, 32, value);
         break;
 
     case FTGMAC100_RBSR: /* DMA buffer size */
@@ -744,8 +835,8 @@ static void ftgmac100_write(void *opaque, hwaddr addr,
                           HWADDR_PRIx "\n", __func__, value);
             return;
         }
-        s->tx_ring = value;
-        s->tx_descriptor = s->tx_ring;
+        s->tx_ring = deposit64(s->tx_ring, 0, 32, value);
+        s->tx_descriptor = deposit64(s->tx_descriptor, 0, 32, value);
         break;
 
     case FTGMAC100_NPTXPD: /* Trigger transmit */
@@ -780,7 +871,7 @@ static void ftgmac100_write(void *opaque, hwaddr addr,
     case FTGMAC100_MACCR: /* MAC Device control */
         s->maccr = value;
         if (value & FTGMAC100_MACCR_SW_RST) {
-            ftgmac100_reset(DEVICE(s));
+            ftgmac100_do_reset(s, true);
         }
 
         if (ftgmac100_can_receive(qemu_get_queue(s->nic))) {
@@ -800,6 +891,20 @@ static void ftgmac100_write(void *opaque, hwaddr addr,
         s->phydata = value & 0xffff;
         break;
     case FTGMAC100_DBLAC: /* DMA Burst Length and Arbitration Control */
+        if (FTGMAC100_DBLAC_TXDES_SIZE(value) < sizeof(FTGMAC100Desc)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: transmit descriptor too small: %" PRIx64
+                          " bytes\n", __func__,
+                          FTGMAC100_DBLAC_TXDES_SIZE(value));
+            break;
+        }
+        if (FTGMAC100_DBLAC_RXDES_SIZE(value) < sizeof(FTGMAC100Desc)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "%s: receive descriptor too small : %" PRIx64
+                          " bytes\n", __func__,
+                          FTGMAC100_DBLAC_RXDES_SIZE(value));
+            break;
+        }
         s->dblac = value;
         break;
     case FTGMAC100_REVR:  /* Feature Register */
@@ -820,6 +925,60 @@ static void ftgmac100_write(void *opaque, hwaddr addr,
     case FTGMAC100_MACSR: /* MAC Status Register (MACSR) */
         qemu_log_mask(LOG_UNIMP, "%s: write to unimplemented register 0x%"
                       HWADDR_PRIx "\n", __func__, addr);
+        break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad address at offset 0x%"
+                      HWADDR_PRIx "\n", __func__, addr);
+        break;
+    }
+
+    ftgmac100_update_irq(s);
+}
+
+static uint64_t ftgmac100_high_read(void *opaque, hwaddr addr, unsigned size)
+{
+    FTGMAC100State *s = FTGMAC100(opaque);
+    uint64_t val = 0;
+
+    switch (addr) {
+    case FTGMAC100_NPTXR_BADR_HIGH:
+        val = extract64(s->tx_ring, 32, 32);
+        break;
+    case FTGMAC100_HPTXR_BADR_HIGH:
+        /* High Priority Transmit Ring Base High Address */
+        qemu_log_mask(LOG_UNIMP, "%s: read to unimplemented register 0x%"
+                      HWADDR_PRIx "\n", __func__, addr);
+        break;
+    case FTGMAC100_RXR_BADR_HIGH:
+        val = extract64(s->rx_ring, 32, 32);
+        break;
+    default:
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad address at offset 0x%"
+                      HWADDR_PRIx "\n", __func__, addr);
+        break;
+    }
+
+    return val;
+}
+
+static void ftgmac100_high_write(void *opaque, hwaddr addr,
+                          uint64_t value, unsigned size)
+{
+    FTGMAC100State *s = FTGMAC100(opaque);
+
+    switch (addr) {
+    case FTGMAC100_NPTXR_BADR_HIGH:
+        s->tx_ring = deposit64(s->tx_ring, 32, 32, value);
+        s->tx_descriptor = deposit64(s->tx_descriptor, 32, 32, value);
+        break;
+    case FTGMAC100_HPTXR_BADR_HIGH:
+        /* High Priority Transmit Ring Base High Address */
+        qemu_log_mask(LOG_UNIMP, "%s: write to unimplemented register 0x%"
+                      HWADDR_PRIx "\n", __func__, addr);
+        break;
+    case FTGMAC100_RXR_BADR_HIGH:
+        s->rx_ring = deposit64(s->rx_ring, 32, 32, value);
+        s->rx_descriptor = deposit64(s->rx_descriptor, 32, 32, value);
         break;
     default:
         qemu_log_mask(LOG_GUEST_ERROR, "%s: Bad address at offset 0x%"
@@ -873,9 +1032,9 @@ static ssize_t ftgmac100_receive(NetClientState *nc, const uint8_t *buf,
     FTGMAC100State *s = FTGMAC100(qemu_get_nic_opaque(nc));
     FTGMAC100Desc bd;
     uint32_t flags = 0;
-    uint32_t addr;
+    uint64_t addr;
     uint32_t crc;
-    uint32_t buf_addr;
+    uint64_t buf_addr = 0;
     uint8_t *crc_ptr;
     uint32_t buf_len;
     size_t size = len;
@@ -888,21 +1047,13 @@ static ssize_t ftgmac100_receive(NetClientState *nc, const uint8_t *buf,
         return -1;
     }
 
-    /* TODO : Pad to minimum Ethernet frame length */
-    /* handle small packets.  */
-    if (size < 10) {
-        qemu_log_mask(LOG_GUEST_ERROR, "%s: dropped frame of %zd bytes\n",
-                      __func__, size);
-        return size;
-    }
-
     if (!ftgmac100_filter(s, buf, size)) {
         return size;
     }
 
-    /* 4 bytes for the CRC.  */
-    size += 4;
     crc = cpu_to_be32(crc32(~0, buf, size));
+    /* Increase size by 4, loop below reads the last 4 bytes from crc_ptr. */
+    size += 4;
     crc_ptr = (uint8_t *) &crc;
 
     /* Huge frames are truncated.  */
@@ -924,6 +1075,7 @@ static ssize_t ftgmac100_receive(NetClientState *nc, const uint8_t *buf,
         break;
     }
 
+    s->isr |= FTGMAC100_INT_RPKT_FIFO;
     addr = s->rx_descriptor;
     while (size > 0) {
         if (!ftgmac100_can_receive(nc)) {
@@ -947,25 +1099,34 @@ static ssize_t ftgmac100_receive(NetClientState *nc, const uint8_t *buf,
         if (size < 4) {
             buf_len += size - 4;
         }
+
         buf_addr = bd.des3;
+        if (s->dma64) {
+            buf_addr = deposit64(buf_addr, 32, 32,
+                                 FTGMAC100_RXDES2_RXBUF_BADR_HI(bd.des2));
+        }
         if (first && proto == ETH_P_VLAN && buf_len >= 18) {
             bd.des1 = lduw_be_p(buf + 14) | FTGMAC100_RXDES1_VLANTAG_AVAIL;
 
             if (s->maccr & FTGMAC100_MACCR_RM_VLAN) {
-                dma_memory_write(&address_space_memory, buf_addr, buf, 12);
-                dma_memory_write(&address_space_memory, buf_addr + 12, buf + 16,
-                                 buf_len - 16);
+                dma_memory_write(&address_space_memory, buf_addr, buf, 12,
+                                 MEMTXATTRS_UNSPECIFIED);
+                dma_memory_write(&address_space_memory, buf_addr + 12,
+                                 buf + 16, buf_len - 16,
+                                 MEMTXATTRS_UNSPECIFIED);
             } else {
-                dma_memory_write(&address_space_memory, buf_addr, buf, buf_len);
+                dma_memory_write(&address_space_memory, buf_addr, buf,
+                                 buf_len, MEMTXATTRS_UNSPECIFIED);
             }
         } else {
             bd.des1 = 0;
-            dma_memory_write(&address_space_memory, buf_addr, buf, buf_len);
+            dma_memory_write(&address_space_memory, buf_addr, buf, buf_len,
+                             MEMTXATTRS_UNSPECIFIED);
         }
         buf += buf_len;
         if (size < 4) {
             dma_memory_write(&address_space_memory, buf_addr + buf_len,
-                             crc_ptr, 4 - size);
+                             crc_ptr, 4 - size, MEMTXATTRS_UNSPECIFIED);
             crc_ptr += 4 - size;
         }
 
@@ -975,14 +1136,15 @@ static ssize_t ftgmac100_receive(NetClientState *nc, const uint8_t *buf,
             /* Last buffer in frame.  */
             bd.des0 |= flags | FTGMAC100_RXDES0_LRS;
             s->isr |= FTGMAC100_INT_RPKT_BUF;
-        } else {
-            s->isr |= FTGMAC100_INT_RPKT_FIFO;
         }
-        ftgmac100_write_bd(&bd, addr);
+        if (ftgmac100_write_bd(&bd, addr)) {
+            s->isr |= FTGMAC100_INT_AHB_ERR;
+            break;
+        }
         if (bd.des0 & s->rxdes0_edorr) {
             addr = s->rx_ring;
         } else {
-            addr += sizeof(FTGMAC100Desc);
+            addr += FTGMAC100_DBLAC_RXDES_SIZE(s->dblac);
         }
     }
     s->rx_descriptor = addr;
@@ -994,6 +1156,14 @@ static ssize_t ftgmac100_receive(NetClientState *nc, const uint8_t *buf,
 static const MemoryRegionOps ftgmac100_ops = {
     .read = ftgmac100_read,
     .write = ftgmac100_write,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static const MemoryRegionOps ftgmac100_high_ops = {
+    .read = ftgmac100_high_read,
+    .write = ftgmac100_high_write,
     .valid.min_access_size = 4,
     .valid.max_access_size = 4,
     .endianness = DEVICE_LITTLE_ENDIAN,
@@ -1028,32 +1198,42 @@ static void ftgmac100_realize(DeviceState *dev, Error **errp)
         s->rxdes0_edorr = FTGMAC100_RXDES0_EDORR;
     }
 
-    memory_region_init_io(&s->iomem, OBJECT(dev), &ftgmac100_ops, s,
-                          TYPE_FTGMAC100, 0x2000);
-    sysbus_init_mmio(sbd, &s->iomem);
+    memory_region_init(&s->iomem_container, OBJECT(s),
+                       TYPE_FTGMAC100 ".container", FTGMAC100_MEM_SIZE);
+    sysbus_init_mmio(sbd, &s->iomem_container);
+
+    memory_region_init_io(&s->iomem, OBJECT(s), &ftgmac100_ops, s,
+                          TYPE_FTGMAC100 ".regs", FTGMAC100_REG_MEM_SIZE);
+    memory_region_add_subregion(&s->iomem_container, 0x0, &s->iomem);
+
+    if (s->dma64) {
+        memory_region_init_io(&s->iomem_high, OBJECT(s), &ftgmac100_high_ops,
+                              s, TYPE_FTGMAC100 ".regs.high",
+                              FTGMAC100_REG_HIGH_MEM_SIZE);
+        memory_region_add_subregion(&s->iomem_container,
+                                    FTGMAC100_REG_HIGH_OFFSET,
+                                    &s->iomem_high);
+    }
+
     sysbus_init_irq(sbd, &s->irq);
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
 
     s->nic = qemu_new_nic(&net_ftgmac100_info, &s->conf,
-                          object_get_typename(OBJECT(dev)), DEVICE(dev)->id,
-                          s);
+                          object_get_typename(OBJECT(dev)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
 }
 
 static const VMStateDescription vmstate_ftgmac100 = {
     .name = TYPE_FTGMAC100,
-    .version_id = 1,
-    .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .version_id = 2,
+    .minimum_version_id = 2,
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(irq_state, FTGMAC100State),
         VMSTATE_UINT32(isr, FTGMAC100State),
         VMSTATE_UINT32(ier, FTGMAC100State),
         VMSTATE_UINT32(rx_enabled, FTGMAC100State),
-        VMSTATE_UINT32(rx_ring, FTGMAC100State),
         VMSTATE_UINT32(rbsr, FTGMAC100State),
-        VMSTATE_UINT32(tx_ring, FTGMAC100State),
-        VMSTATE_UINT32(rx_descriptor, FTGMAC100State),
-        VMSTATE_UINT32(tx_descriptor, FTGMAC100State),
         VMSTATE_UINT32_ARRAY(math, FTGMAC100State, 2),
         VMSTATE_UINT32(itc, FTGMAC100State),
         VMSTATE_UINT32(aptcr, FTGMAC100State),
@@ -1072,34 +1252,33 @@ static const VMStateDescription vmstate_ftgmac100 = {
         VMSTATE_UINT32(phy_int_mask, FTGMAC100State),
         VMSTATE_UINT32(txdes0_edotr, FTGMAC100State),
         VMSTATE_UINT32(rxdes0_edorr, FTGMAC100State),
+        VMSTATE_UINT64(rx_ring, FTGMAC100State),
+        VMSTATE_UINT64(tx_ring, FTGMAC100State),
+        VMSTATE_UINT64(rx_descriptor, FTGMAC100State),
+        VMSTATE_UINT64(tx_descriptor, FTGMAC100State),
         VMSTATE_END_OF_LIST()
     }
 };
 
-static Property ftgmac100_properties[] = {
+static const Property ftgmac100_properties[] = {
     DEFINE_PROP_BOOL("aspeed", FTGMAC100State, aspeed, false),
     DEFINE_NIC_PROPERTIES(FTGMAC100State, conf),
-    DEFINE_PROP_END_OF_LIST(),
+    DEFINE_PROP_BOOL("dma64", FTGMAC100State, dma64, false),
 };
 
-static void ftgmac100_class_init(ObjectClass *klass, void *data)
+static void ftgmac100_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->vmsd = &vmstate_ftgmac100;
-    dc->reset = ftgmac100_reset;
+    rc->phases.hold = ftgmac100_reset_hold;
     device_class_set_props(dc, ftgmac100_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
     dc->realize = ftgmac100_realize;
     dc->desc = "Faraday FTGMAC100 Gigabit Ethernet emulation";
 }
 
-static const TypeInfo ftgmac100_info = {
-    .name = TYPE_FTGMAC100,
-    .parent = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(FTGMAC100State),
-    .class_init = ftgmac100_class_init,
-};
 
 /*
  * AST2600 MII controller
@@ -1203,9 +1382,9 @@ static const MemoryRegionOps aspeed_mii_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
 };
 
-static void aspeed_mii_reset(DeviceState *dev)
+static void aspeed_mii_reset_hold(Object *obj, ResetType type)
 {
-    AspeedMiiState *s = ASPEED_MII(dev);
+    AspeedMiiState *s = ASPEED_MII(obj);
 
     s->phycr = 0;
     s->phydata = 0;
@@ -1229,41 +1408,43 @@ static const VMStateDescription vmstate_aspeed_mii = {
     .name = TYPE_ASPEED_MII,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(phycr, FTGMAC100State),
         VMSTATE_UINT32(phydata, FTGMAC100State),
         VMSTATE_END_OF_LIST()
     }
 };
 
-static Property aspeed_mii_properties[] = {
+static const Property aspeed_mii_properties[] = {
     DEFINE_PROP_LINK("nic", AspeedMiiState, nic, TYPE_FTGMAC100,
                      FTGMAC100State *),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void aspeed_mii_class_init(ObjectClass *klass, void *data)
+static void aspeed_mii_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
+    ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     dc->vmsd = &vmstate_aspeed_mii;
-    dc->reset = aspeed_mii_reset;
+    rc->phases.hold = aspeed_mii_reset_hold;
     dc->realize = aspeed_mii_realize;
     dc->desc = "Aspeed MII controller";
     device_class_set_props(dc, aspeed_mii_properties);
 }
 
-static const TypeInfo aspeed_mii_info = {
-    .name = TYPE_ASPEED_MII,
-    .parent = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(AspeedMiiState),
-    .class_init = aspeed_mii_class_init,
+static const TypeInfo ftgmac100_types[] = {
+    {
+        .name          = TYPE_FTGMAC100,
+        .parent        = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(FTGMAC100State),
+        .class_init    = ftgmac100_class_init,
+    },
+    {
+        .name          = TYPE_ASPEED_MII,
+        .parent        = TYPE_SYS_BUS_DEVICE,
+        .instance_size = sizeof(AspeedMiiState),
+        .class_init    = aspeed_mii_class_init,
+    }
 };
 
-static void ftgmac100_register_types(void)
-{
-    type_register_static(&ftgmac100_info);
-    type_register_static(&aspeed_mii_info);
-}
-
-type_init(ftgmac100_register_types)
+DEFINE_TYPES(ftgmac100_types)

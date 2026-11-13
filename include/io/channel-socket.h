@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -24,12 +24,11 @@
 #include "io/channel.h"
 #include "io/task.h"
 #include "qemu/sockets.h"
+#include "qom/object.h"
 
 #define TYPE_QIO_CHANNEL_SOCKET "qio-channel-socket"
-#define QIO_CHANNEL_SOCKET(obj)                                     \
-    OBJECT_CHECK(QIOChannelSocket, (obj), TYPE_QIO_CHANNEL_SOCKET)
+OBJECT_DECLARE_SIMPLE_TYPE(QIOChannelSocket, QIO_CHANNEL_SOCKET)
 
-typedef struct QIOChannelSocket QIOChannelSocket;
 
 /**
  * QIOChannelSocket:
@@ -48,6 +47,10 @@ struct QIOChannelSocket {
     socklen_t localAddrLen;
     struct sockaddr_storage remoteAddr;
     socklen_t remoteAddrLen;
+    ssize_t zero_copy_queued;
+    ssize_t zero_copy_sent;
+    bool blocking;
+    bool zero_copy_fallback;
 };
 
 
@@ -123,7 +126,7 @@ void qio_channel_socket_connect_async(QIOChannelSocket *ioc,
  * qio_channel_socket_listen_sync:
  * @ioc: the socket channel object
  * @addr: the address to listen to
- * @num: the expected ammount of connections
+ * @num: the expected amount of connections
  * @errp: pointer to a NULL-initialized error object
  *
  * Attempt to listen to the address @addr. This method
@@ -140,7 +143,7 @@ int qio_channel_socket_listen_sync(QIOChannelSocket *ioc,
  * qio_channel_socket_listen_async:
  * @ioc: the socket channel object
  * @addr: the address to listen to
- * @num: the expected ammount of connections
+ * @num: the expected amount of connections
  * @callback: the function to invoke on completion
  * @opaque: user data to pass to @callback
  * @destroy: the function to free @opaque
@@ -221,7 +224,7 @@ void qio_channel_socket_dgram_async(QIOChannelSocket *ioc,
  * release with a call qapi_free_SocketAddress() when no
  * longer required.
  *
- * Returns: 0 on success, -1 on error
+ * Returns: the socket address struct, or NULL on error
  */
 SocketAddress *
 qio_channel_socket_get_local_address(QIOChannelSocket *ioc,
@@ -260,5 +263,18 @@ QIOChannelSocket *
 qio_channel_socket_accept(QIOChannelSocket *ioc,
                           Error **errp);
 
+/**
+ * qio_channel_socket_set_send_buffer:
+ * @ioc: the socket channel object
+ * @size: buffer size
+ * @errp: pointer to a NULL-initialized error object
+ *
+ * Set the underlying socket send buffer size.
+ *
+ * Retruns: 0 on success, or -1 on error.
+ */
+int qio_channel_socket_set_send_buffer(QIOChannelSocket *ioc,
+                                       size_t size,
+                                       Error **errp);
 
 #endif /* QIO_CHANNEL_SOCKET_H */

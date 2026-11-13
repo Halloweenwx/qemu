@@ -10,12 +10,11 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
 #include <wchar.h>
 #include <dirent.h>
-
+#include <glib/gstdio.h>
 #include <sys/statvfs.h>
 
 
@@ -23,11 +22,12 @@
 #include "qemu/module.h"
 #include "qemu/filemonitor.h"
 #include "trace.h"
-#include "hw/qdev-properties.h"
-#include "hw/usb.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/usb/usb.h"
 #include "migration/vmstate.h"
 #include "desc.h"
 #include "qemu/units.h"
+#include "qom/object.h"
 
 /* ----------------------------------------------------------------------- */
 
@@ -123,10 +123,12 @@ typedef struct {
 
 /* ----------------------------------------------------------------------- */
 
-typedef struct MTPState MTPState;
 typedef struct MTPControl MTPControl;
 typedef struct MTPData MTPData;
 typedef struct MTPObject MTPObject;
+
+#define TYPE_USB_MTP "usb-mtp"
+OBJECT_DECLARE_SIMPLE_TYPE(MTPState, USB_MTP)
 
 enum {
     EP_DATA_IN = 1,
@@ -235,9 +237,6 @@ typedef struct {
     char keywords[0]; /*unused*/
     /* string and other data follows */
 } QEMU_PACKED ObjectInfo;
-
-#define TYPE_USB_MTP "usb-mtp"
-#define USB_MTP(obj) OBJECT_CHECK(MTPState, (obj), TYPE_USB_MTP)
 
 #define QEMU_STORAGE_ID 0x00010001
 
@@ -631,9 +630,9 @@ static void usb_mtp_object_readdir(MTPState *s, MTPObject *o)
         int64_t id = qemu_file_monitor_add_watch(s->file_monitor, o->path, NULL,
                                                  file_monitor_event, s, &err);
         if (id == -1) {
-            error_report("usb-mtp: failed to add watch for %s: %s", o->path,
-                         error_get_pretty(err));
-            error_free(err);
+            error_reportf_err(err,
+                              "usb-mtp: failed to add watch for %s: ",
+                              o->path);
         } else {
             trace_usb_mtp_file_monitor_event(s->dev.addr, o->path,
                                              "Watch Added");
@@ -771,12 +770,9 @@ static void usb_mtp_add_str(MTPData *data, const char *str)
 
 static void usb_mtp_add_time(MTPData *data, time_t time)
 {
-    char buf[16];
-    struct tm tm;
-
-    gmtime_r(&time, &tm);
-    strftime(buf, sizeof(buf), "%Y%m%dT%H%M%S", &tm);
-    usb_mtp_add_str(data, buf);
+    g_autoptr(GDateTime) then = g_date_time_new_from_unix_utc(time);
+    g_autofree char *thenstr = g_date_time_format(then, "%Y%m%dT%H%M%S");
+    usb_mtp_add_str(data, thenstr);
 }
 
 /* ----------------------------------------------------------------------- */
@@ -889,7 +885,7 @@ static MTPData *usb_mtp_get_storage_info(MTPState *s, MTPControl *c)
     rc = statvfs(s->root, &buf);
     if (rc == 0) {
         usb_mtp_add_u64(d, (uint64_t)buf.f_frsize * buf.f_blocks);
-        usb_mtp_add_u64(d, (uint64_t)buf.f_bavail * buf.f_blocks);
+        usb_mtp_add_u64(d, (uint64_t)buf.f_frsize * buf.f_bavail);
         usb_mtp_add_u32(d, buf.f_ffree);
     } else {
         usb_mtp_add_u64(d, 0xffffffff);
@@ -906,7 +902,8 @@ static MTPData *usb_mtp_get_object_handles(MTPState *s, MTPControl *c,
                                            MTPObject *o)
 {
     MTPData *d = usb_mtp_data_alloc(c);
-    uint32_t i = 0, handles[o->nchildren];
+    uint32_t i = 0;
+    g_autofree uint32_t *handles = g_new(uint32_t, o->nchildren);
     MTPObject *iter;
 
     trace_usb_mtp_op_get_object_handles(s->dev.addr, o->handle, o->path);
@@ -1155,7 +1152,7 @@ enum {
 
 static int usb_mtp_deletefn(MTPState *s, MTPObject *o, uint32_t trans)
 {
-    MTPObject *iter, *iter2;
+    MTPObject *iter, *iter2, *iter2_next;
     int ret = 0;
 
     /*
@@ -1164,7 +1161,7 @@ static int usb_mtp_deletefn(MTPState *s, MTPObject *o, uint32_t trans)
 
     QLIST_FOREACH(iter, &o->children, list) {
         if (iter->format == FMT_ASSOCIATION) {
-            QLIST_FOREACH(iter2, &iter->children, list) {
+            QLIST_FOREACH_SAFE(iter2, &iter->children, list, iter2_next) {
                 ret |= usb_mtp_deletefn(s, iter2, trans);
             }
         }
@@ -1236,8 +1233,6 @@ static void usb_mtp_object_delete(MTPState *s, uint32_t handle,
     default:
         g_assert_not_reached();
     }
-
-    return;
 }
 
 static void usb_mtp_command(MTPState *s, MTPControl *c)
@@ -1276,9 +1271,8 @@ static void usb_mtp_command(MTPState *s, MTPControl *c)
 
         s->file_monitor = qemu_file_monitor_new(&err);
         if (err) {
-            error_report("usb-mtp: file monitoring init failed: %s",
-                         error_get_pretty(err));
-            error_free(err);
+            error_reportf_err(err,
+                              "usb-mtp: file monitoring init failed: ");
         } else {
             QTAILQ_INIT(&s->events);
         }
@@ -1609,7 +1603,7 @@ static void usb_mtp_write_data(MTPState *s, uint32_t handle)
         usb_mtp_object_lookup(s, s->dataset.parent_handle);
     char *path = NULL;
     uint64_t rc;
-    mode_t mask = 0644;
+    mode_t mask = 0755;
     int ret = 0;
 
     assert(d != NULL);
@@ -1625,7 +1619,7 @@ static void usb_mtp_write_data(MTPState *s, uint32_t handle)
         if (s->dataset.filename) {
             path = g_strdup_printf("%s/%s", parent->path, s->dataset.filename);
             if (s->dataset.format == FMT_ASSOCIATION) {
-                ret = mkdir(path, mask);
+                ret = g_mkdir(path, mask);
                 if (!ret) {
                     usb_mtp_queue_result(s, RES_OK, d->trans, 3,
                                          QEMU_STORAGE_ID,
@@ -1637,7 +1631,7 @@ static void usb_mtp_write_data(MTPState *s, uint32_t handle)
             }
 
             d->fd = open(path, O_CREAT | O_WRONLY |
-                         O_CLOEXEC | O_NOFOLLOW, mask);
+                         O_CLOEXEC | O_NOFOLLOW, mask & 0666);
             if (d->fd == -1) {
                 ret = 1;
                 goto done;
@@ -1702,7 +1696,7 @@ close:
     s->write_pending = false;
 }
 
-static void usb_mtp_write_metadata(MTPState *s, uint64_t dlen)
+static void usb_mtp_write_metadata(MTPState *s)
 {
     MTPData *d = s->data_out;
     ObjectInfo *dataset = (ObjectInfo *)d->data;
@@ -1710,7 +1704,15 @@ static void usb_mtp_write_metadata(MTPState *s, uint64_t dlen)
     MTPObject *o;
     MTPObject *p = usb_mtp_object_lookup(s, s->dataset.parent_handle);
     uint32_t next_handle = s->next_handle;
-    size_t filename_chars = dlen - offsetof(ObjectInfo, filename);
+    size_t filename_chars;
+
+    if (d->length <= offsetof(ObjectInfo, filename)) {
+        usb_mtp_queue_result(s, RES_INVALID_OBJECTINFO, d->trans,
+                             0, 0, 0, 0);
+        return;
+    }
+
+    filename_chars = d->length - offsetof(ObjectInfo, filename);
 
     /*
      * filename is utf-16. We're intentionally doing
@@ -1807,7 +1809,7 @@ static void usb_mtp_get_data(MTPState *s, mtp_container *container,
         if (d->data_offset == d->length) {
             /* The operation might have already failed */
             if (!s->result) {
-                usb_mtp_write_metadata(s, dlen);
+                usb_mtp_write_metadata(s);
             }
             usb_mtp_data_free(s->data_out);
             s->data_out = NULL;
@@ -1819,9 +1821,6 @@ static void usb_mtp_get_data(MTPState *s, mtp_container *container,
         d->offset += dlen;
         d->data_offset += dlen;
         if ((p->iov.size % 64) || !p->iov.size) {
-            assert((s->dataset.size == 0xFFFFFFFF) ||
-                   (s->dataset.size == d->offset));
-
             if (d->length == MTP_WRITE_BUF_SZ) {
                 d->write_status = WRITE_END;
             } else {
@@ -1911,6 +1910,13 @@ static void usb_mtp_handle_data(USBDevice *dev, USBPacket *p)
         } else if (s->result != NULL) {
             MTPControl *r = s->result;
             int length = sizeof(container) + r->argc * sizeof(uint32_t);
+
+            if (p->iov.size < length) {
+                trace_usb_mtp_stall(s->dev.addr,
+                                    "packet too small to send response");
+                p->status = USB_RET_STALL;
+                return;
+            }
             if (r->code == RES_OK) {
                 trace_usb_mtp_success(s->dev.addr, r->trans,
                                       (r->argc > 0) ? r->argv[0] : 0,
@@ -2075,20 +2081,19 @@ static const VMStateDescription vmstate_usb_mtp = {
     .unmigratable = 1,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_USB_DEVICE(dev, MTPState),
         VMSTATE_END_OF_LIST()
     }
 };
 
-static Property mtp_properties[] = {
+static const Property mtp_properties[] = {
     DEFINE_PROP_STRING("rootdir", MTPState, root),
     DEFINE_PROP_STRING("desc", MTPState, desc),
     DEFINE_PROP_BOOL("readonly", MTPState, readonly, true),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void usb_mtp_class_initfn(ObjectClass *klass, void *data)
+static void usb_mtp_class_initfn(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
@@ -2108,7 +2113,7 @@ static void usb_mtp_class_initfn(ObjectClass *klass, void *data)
     device_class_set_props(dc, mtp_properties);
 }
 
-static TypeInfo mtp_info = {
+static const TypeInfo mtp_info = {
     .name          = TYPE_USB_MTP,
     .parent        = TYPE_USB_DEVICE,
     .instance_size = sizeof(MTPState),

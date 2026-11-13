@@ -19,10 +19,12 @@
 #include "hw/virtio/virtio.h"
 #include "net/announce.h"
 #include "qemu/option_int.h"
+#include "qom/object.h"
+
+#include "ebpf/ebpf_rss.h"
 
 #define TYPE_VIRTIO_NET "virtio-net-device"
-#define VIRTIO_NET(obj) \
-        OBJECT_CHECK(VirtIONet, (obj), TYPE_VIRTIO_NET)
+OBJECT_DECLARE_SIMPLE_TYPE(VirtIONet, VIRTIO_NET)
 
 #define TX_TIMER_INTERVAL 150000 /* 150 us */
 
@@ -33,6 +35,15 @@
  * and latency. */
 #define TX_BURST 256
 
+/* Maximum VIRTIO_NET_CTRL_MAC_TABLE_SET unicast + multicast entries. */
+#define MAC_TABLE_ENTRIES    64
+
+/*
+ * The maximum number of VLANs in the VLAN filter table
+ * added by VIRTIO_NET_CTRL_VLAN_ADD
+ */
+#define MAX_VLAN    (1 << 12)   /* Per 802.1Q definition */
+
 typedef struct virtio_net_conf
 {
     uint32_t txtimer;
@@ -41,6 +52,7 @@ typedef struct virtio_net_conf
     uint16_t rx_queue_size;
     uint16_t tx_queue_size;
     uint16_t mtu;
+    bool mtu_from_tap;
     int32_t speed;
     char *duplex_str;
     uint8_t duplex;
@@ -91,7 +103,7 @@ typedef struct VirtioNetRscStat {
 /* Rsc unit general info used to checking if can coalescing */
 typedef struct VirtioNetRscUnit {
     void *ip;   /* ip header */
-    uint16_t *ip_plen;      /* data len pointer in ip header field */
+    void *ip_plen; /* pointer to unaligned uint16_t data len in ip header */
     struct tcp_header *tcp; /* tcp header */
     uint16_t tcp_hdrlen;    /* tcp header len */
     uint16_t payload;       /* pure payload without virtio/eth/ip/tcp */
@@ -104,12 +116,11 @@ typedef struct VirtioNetRscSeg {
     size_t size;
     uint16_t packets;
     uint16_t dup_ack;
-    bool is_coalesced;      /* need recal ipv4 header checksum, mark here */
+    bool is_coalesced;      /* need recall ipv4 header checksum, mark here */
     VirtioNetRscUnit unit;
     NetClientState *nc;
 } VirtioNetRscSeg;
 
-typedef struct VirtIONet VirtIONet;
 
 /* Chain is divided by protocol(ipv4/v6) and NetClientInfo */
 typedef struct VirtioNetRscChain {
@@ -125,6 +136,25 @@ typedef struct VirtioNetRscChain {
 
 /* Maximum packet size we can receive from tap device: header + 64k */
 #define VIRTIO_NET_MAX_BUFSIZE (sizeof(struct virtio_net_hdr) + (64 * KiB))
+
+#define VIRTIO_NET_RSS_MAX_KEY_SIZE     40
+#define VIRTIO_NET_RSS_MAX_TABLE_LEN    128
+
+typedef struct VirtioNetRssData {
+    bool    enabled;
+    bool    enabled_software_rss;
+    bool    redirect;
+    bool    populate_hash;
+    bool    peer_hash_available;
+    uint32_t runtime_hash_types;
+    uint32_t supported_hash_types;
+    uint32_t peer_hash_types;
+    OnOffAutoBit64 specified_hash_types;
+    uint8_t key[VIRTIO_NET_RSS_MAX_KEY_SIZE];
+    uint16_t indirections_len;
+    uint16_t *indirections_table;
+    uint16_t default_queue;
+} VirtioNetRssData;
 
 typedef struct VirtIONetQueue {
     VirtQueue *rx_vq;
@@ -153,7 +183,7 @@ struct VirtIONet {
     uint32_t has_vnet_hdr;
     size_t host_hdr_len;
     size_t guest_hdr_len;
-    uint64_t host_features;
+    VIRTIO_DECLARE_FEATURES(host_features);
     uint32_t rsc_timeout;
     uint8_t rsc4_enabled;
     uint8_t rsc6_enabled;
@@ -178,8 +208,9 @@ struct VirtIONet {
     NICConf nic_conf;
     DeviceState *qdev;
     int multiqueue;
-    uint16_t max_queues;
-    uint16_t curr_queues;
+    uint16_t max_queue_pairs;
+    uint16_t curr_queue_pairs;
+    uint16_t max_ncs;
     size_t config_size;
     char *netclient_name;
     char *netclient_type;
@@ -188,20 +219,27 @@ struct VirtIONet {
     uint64_t saved_guest_offloads;
     AnnounceTimer announce_timer;
     bool needs_vnet_hdr_swap;
-    bool mtu_bypass_backend;
-    QemuOpts *primary_device_opts;
-    QDict *primary_device_dict;
-    DeviceState *primary_dev;
-    BusState *primary_bus;
-    char *primary_device_id;
-    char *standby_id;
-    bool primary_should_be_hidden;
+    /* primary failover device is hidden*/
+    bool failover_primary_hidden;
     bool failover;
     DeviceListener primary_listener;
-    Notifier migration_state;
+    QDict *primary_opts;
+    bool primary_opts_from_json;
+    NotifierWithReturn migration_state;
+    VirtioNetRssData rss_data;
+    struct NetRxPkt *rx_pkt;
+    struct EBPFRSSContext ebpf_rss;
+    uint32_t nr_ebpf_rss_fds;
+    char **ebpf_rss_fds;
+    bool peers_wait_incoming;
 };
 
+size_t virtio_net_handle_ctrl_iov(VirtIODevice *vdev,
+                                  const struct iovec *in_sg, unsigned in_num,
+                                  const struct iovec *out_sg,
+                                  unsigned out_num);
 void virtio_net_set_netclient_name(VirtIONet *n, const char *name,
                                    const char *type);
+uint64_t virtio_net_supported_guest_offloads(const VirtIONet *n);
 
 #endif

@@ -32,6 +32,7 @@
 #ifndef BLOCK_PARALLELS_H
 #define BLOCK_PARALLELS_H
 #include "qemu/coroutine.h"
+#include "qapi/qapi-types-block-core.h"
 
 #define HEADS_NUMBER 16
 #define SEC_IN_CYL 32
@@ -48,7 +49,8 @@ typedef struct ParallelsHeader {
     uint64_t nb_sectors;
     uint32_t inuse;
     uint32_t data_off;
-    char padding[12];
+    uint32_t flags;
+    uint64_t ext_off;
 } QEMU_PACKED ParallelsHeader;
 
 typedef enum ParallelsPreallocMode {
@@ -71,17 +73,46 @@ typedef struct BDRVParallelsState {
     unsigned long *bat_dirty_bmap;
     unsigned int  bat_dirty_block;
 
+    unsigned long *used_bmap;
+    unsigned long used_bmap_size;
+
     uint32_t *bat_bitmap;
     unsigned int bat_size;
 
-    int64_t  data_end;
+    int64_t  data_start;
+    /* Exclusive end of the Format Extension, which is absent from used_bmap */
+    int64_t  ext_end;
     uint64_t prealloc_size;
     ParallelsPreallocMode prealloc_mode;
 
     unsigned int tracks;
+    unsigned int cluster_size;
 
     unsigned int off_multiplier;
     Error *migration_blocker;
 } BDRVParallelsState;
+
+int parallels_mark_used(BlockDriverState *bs, unsigned long *bitmap,
+                        uint32_t bitmap_size, int64_t off, uint32_t count);
+int parallels_mark_unused(BlockDriverState *bs, unsigned long *bitmap,
+                          uint32_t bitmap_size, int64_t off, uint32_t count);
+
+int64_t GRAPH_RDLOCK parallels_allocate_host_clusters(BlockDriverState *bs,
+                                                      int64_t *clusters);
+int GRAPH_RDLOCK parallels_update_header(BlockDriverState *bs);
+
+int GRAPH_RDLOCK
+parallels_read_format_extension(BlockDriverState *bs, int64_t ext_off,
+                                Error **errp);
+void GRAPH_RDLOCK
+parallels_store_persistent_dirty_bitmaps(BlockDriverState *bs, Error **errp);
+bool coroutine_fn GRAPH_RDLOCK
+parallels_co_can_store_new_dirty_bitmap(BlockDriverState *bs, const char *name,
+                                        uint32_t granularity, Error **errp);
+int coroutine_fn GRAPH_RDLOCK
+parallels_co_remove_persistent_dirty_bitmap(BlockDriverState *bs,
+                                            const char *name, Error **errp);
+void parallels_get_bitmap_info_list(BlockDriverState *bs,
+                                    ParallelsBitmapInfoList **info_list);
 
 #endif

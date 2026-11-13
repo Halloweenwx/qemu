@@ -22,8 +22,25 @@
 #define QCRYPTO_TLSCREDSPRIV_H
 
 #include "crypto/tlscreds.h"
+#include "crypto/tlscredsbox.h"
 
 #ifdef CONFIG_GNUTLS
+#include <gnutls/gnutls.h>
+#endif
+
+struct QCryptoTLSCreds {
+    Object parent_obj;
+    char *dir;
+    QCryptoTLSCredsEndpoint endpoint;
+    bool verifyPeer;
+    char *priority;
+    QCryptoTLSCredsBox *box;
+};
+
+#ifdef CONFIG_GNUTLS
+
+char *qcrypto_tls_creds_build_path(QCryptoTLSCreds *creds,
+                                   const char *filename);
 
 int qcrypto_tls_creds_get_path(QCryptoTLSCreds *creds,
                                const char *filename,

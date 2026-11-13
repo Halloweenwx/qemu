@@ -14,13 +14,14 @@
 
 #include "qemu/osdep.h"
 #include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/virtio/virtio.h"
 #include "hw/virtio/virtio-bus.h"
 #include "hw/virtio/virtio-pci.h"
 #include "hw/virtio/virtio-crypto.h"
 #include "qapi/error.h"
 #include "qemu/module.h"
+#include "qom/object.h"
 
 typedef struct VirtIOCryptoPCI VirtIOCryptoPCI;
 
@@ -28,19 +29,18 @@ typedef struct VirtIOCryptoPCI VirtIOCryptoPCI;
  * virtio-crypto-pci: This extends VirtioPCIProxy.
  */
 #define TYPE_VIRTIO_CRYPTO_PCI "virtio-crypto-pci"
-#define VIRTIO_CRYPTO_PCI(obj) \
-        OBJECT_CHECK(VirtIOCryptoPCI, (obj), TYPE_VIRTIO_CRYPTO_PCI)
+DECLARE_INSTANCE_CHECKER(VirtIOCryptoPCI, VIRTIO_CRYPTO_PCI,
+                         TYPE_VIRTIO_CRYPTO_PCI)
 
 struct VirtIOCryptoPCI {
     VirtIOPCIProxy parent_obj;
     VirtIOCrypto vdev;
 };
 
-static Property virtio_crypto_pci_properties[] = {
+static const Property virtio_crypto_pci_properties[] = {
     DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
                     VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 2),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void virtio_crypto_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
@@ -53,15 +53,13 @@ static void virtio_crypto_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
         return;
     }
 
-    qdev_set_parent_bus(vdev, BUS(&vpci_dev->bus));
     virtio_pci_force_virtio_1(vpci_dev);
-    object_property_set_bool(OBJECT(vdev), true, "realized", errp);
-    object_property_set_link(OBJECT(vcrypto),
-                 OBJECT(vcrypto->vdev.conf.cryptodev), "cryptodev",
-                 NULL);
+    if (!qdev_realize(vdev, BUS(&vpci_dev->bus), errp)) {
+        return;
+    }
 }
 
-static void virtio_crypto_pci_class_init(ObjectClass *klass, void *data)
+static void virtio_crypto_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);

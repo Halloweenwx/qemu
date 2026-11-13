@@ -28,18 +28,19 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/irq.h"
-#include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/pci/pci_device.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
-#include "sysemu/dma.h"
-#include "sysemu/sysemu.h"
+#include "system/dma.h"
+#include "system/system.h"
 #include "trace.h"
 
 #include "pcnet.h"
+#include "qom/object.h"
 
 //#define PCNET_DEBUG
 //#define PCNET_DEBUG_IO
@@ -51,17 +52,16 @@
 
 #define TYPE_PCI_PCNET "pcnet"
 
-#define PCI_PCNET(obj) \
-     OBJECT_CHECK(PCIPCNetState, (obj), TYPE_PCI_PCNET)
+OBJECT_DECLARE_SIMPLE_TYPE(PCIPCNetState, PCI_PCNET)
 
-typedef struct {
+struct PCIPCNetState {
     /*< private >*/
     PCIDevice parent_obj;
     /*< public >*/
 
     PCNetState state;
     MemoryRegion io_bar;
-} PCIPCNetState;
+};
 
 static void pcnet_aprom_writeb(void *opaque, uint32_t addr, uint32_t val)
 {
@@ -147,7 +147,7 @@ static const VMStateDescription vmstate_pci_pcnet = {
     .name = "pcnet",
     .version_id = 3,
     .minimum_version_id = 2,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(parent_obj, PCIPCNetState),
         VMSTATE_STRUCT(state, PCIPCNetState, 0, vmstate_pcnet, PCNetState),
         VMSTATE_END_OF_LIST()
@@ -183,7 +183,6 @@ static void pci_pcnet_uninit(PCIDevice *dev)
     PCIPCNetState *d = PCI_PCNET(dev);
 
     qemu_free_irq(d->state.irq);
-    timer_del(d->state.poll_timer);
     timer_free(d->state.poll_timer);
     qemu_del_nic(d->state.nic);
 }
@@ -250,15 +249,14 @@ static void pcnet_instance_init(Object *obj)
 
     device_add_bootindex_property(obj, &s->conf.bootindex,
                                   "bootindex", "/ethernet-phy@0",
-                                  DEVICE(obj), NULL);
+                                  DEVICE(obj));
 }
 
-static Property pcnet_properties[] = {
+static const Property pcnet_properties[] = {
     DEFINE_NIC_PROPERTIES(PCIPCNetState, state.conf),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void pcnet_class_init(ObjectClass *klass, void *data)
+static void pcnet_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -270,7 +268,7 @@ static void pcnet_class_init(ObjectClass *klass, void *data)
     k->device_id = PCI_DEVICE_ID_AMD_LANCE;
     k->revision = 0x10;
     k->class_id = PCI_CLASS_NETWORK_ETHERNET;
-    dc->reset = pci_reset;
+    device_class_set_legacy_reset(dc, pci_reset);
     dc->vmsd = &vmstate_pci_pcnet;
     device_class_set_props(dc, pcnet_properties);
     set_bit(DEVICE_CATEGORY_NETWORK, dc->categories);
@@ -282,7 +280,7 @@ static const TypeInfo pcnet_info = {
     .instance_size = sizeof(PCIPCNetState),
     .class_init    = pcnet_class_init,
     .instance_init = pcnet_instance_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },

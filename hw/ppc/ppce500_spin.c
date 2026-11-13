@@ -8,7 +8,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -30,10 +30,12 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
-#include "hw/hw.h"
-#include "hw/sysbus.h"
-#include "sysemu/hw_accel.h"
+#include "hw/core/hw-error.h"
+#include "hw/core/sysbus.h"
+#include "system/hw_accel.h"
+#include "hw/ppc/ppc.h"
 #include "e500.h"
+#include "qom/object.h"
 
 #define MAX_CPUS 32
 
@@ -46,14 +48,14 @@ typedef struct spin_info {
 } QEMU_PACKED SpinInfo;
 
 #define TYPE_E500_SPIN "e500-spin"
-#define E500_SPIN(obj) OBJECT_CHECK(SpinState, (obj), TYPE_E500_SPIN)
+OBJECT_DECLARE_SIMPLE_TYPE(SpinState, E500_SPIN)
 
-typedef struct SpinState {
+struct SpinState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
     SpinInfo spin[MAX_CPUS];
-} SpinState;
+};
 
 static void spin_reset(DeviceState *dev)
 {
@@ -69,29 +71,12 @@ static void spin_reset(DeviceState *dev)
     }
 }
 
-static void mmubooke_create_initial_mapping(CPUPPCState *env,
-                                     target_ulong va,
-                                     hwaddr pa,
-                                     hwaddr len)
-{
-    ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 1, 0, 1);
-    hwaddr size;
-
-    size = (booke206_page_size_to_tlb(len) << MAS1_TSIZE_SHIFT);
-    tlb->mas1 = MAS1_VALID | size;
-    tlb->mas2 = (va & TARGET_PAGE_MASK) | MAS2_M;
-    tlb->mas7_3 = pa & TARGET_PAGE_MASK;
-    tlb->mas7_3 |= MAS3_UR | MAS3_UW | MAS3_UX | MAS3_SR | MAS3_SW | MAS3_SX;
-    env->tlb_dirty = true;
-}
-
 static void spin_kick(CPUState *cs, run_on_cpu_data data)
 {
-    PowerPCCPU *cpu = POWERPC_CPU(cs);
-    CPUPPCState *env = &cpu->env;
+    CPUPPCState *env = cpu_env(cs);
     SpinInfo *curspin = data.host_ptr;
-    hwaddr map_size = 64 * MiB;
-    hwaddr map_start;
+    hwaddr map_start, map_size = 64 * MiB;
+    ppcmas_tlb_t *tlb = booke206_get_tlbm(env, 1, 0, 1);
 
     cpu_synchronize_state(cs);
     stl_p(&curspin->pir, env->spr[SPR_BOOKE_PIR]);
@@ -105,12 +90,16 @@ static void spin_kick(CPUState *cs, run_on_cpu_data data)
     env->gpr[9] = 0;
 
     map_start = ldq_p(&curspin->addr) & ~(map_size - 1);
-    mmubooke_create_initial_mapping(env, 0, map_start, map_size);
+    /* create initial mapping */
+    booke206_set_tlb(tlb, 0, map_start, map_size);
+    tlb->mas2 |= MAS2_M;
+#ifdef CONFIG_KVM
+    env->tlb_dirty = true;
+#endif
 
     cs->halted = 0;
     cs->exception_index = -1;
-    cs->stopped = false;
-    qemu_cpu_kick(cs);
+    cpu_resume(cs);
 }
 
 static void spin_write(void *opaque, hwaddr addr, uint64_t value,
@@ -185,11 +174,11 @@ static void ppce500_spin_initfn(Object *obj)
     sysbus_init_mmio(dev, &s->iomem);
 }
 
-static void ppce500_spin_class_init(ObjectClass *klass, void *data)
+static void ppce500_spin_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = spin_reset;
+    device_class_set_legacy_reset(dc, spin_reset);
 }
 
 static const TypeInfo ppce500_spin_info = {

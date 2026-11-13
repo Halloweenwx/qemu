@@ -1,5 +1,5 @@
 /*
- *  Exynos4210 Pseudo Random Nubmer Generator Emulation
+ *  Exynos4210 Pseudo Random Number Generator Emulation
  *
  *  Copyright (c) 2017 Krzysztof Kozlowski <krzk@kernel.org>
  *
@@ -18,12 +18,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "qapi/error.h"
 #include "qemu/log.h"
 #include "qemu/guest-random.h"
 #include "qemu/module.h"
+#include "qom/object.h"
 
 #define DEBUG_EXYNOS_RNG 0
 
@@ -35,8 +36,7 @@
     } while (0)
 
 #define TYPE_EXYNOS4210_RNG             "exynos4210.rng"
-#define EXYNOS4210_RNG(obj) \
-    OBJECT_CHECK(Exynos4210RngState, (obj), TYPE_EXYNOS4210_RNG)
+OBJECT_DECLARE_SIMPLE_TYPE(Exynos4210RngState, EXYNOS4210_RNG)
 
 /*
  * Exynos4220, PRNG, only polling mode is supported.
@@ -68,7 +68,7 @@
 
 #define EXYNOS4210_RNG_REGS_MEM_SIZE            0x200
 
-typedef struct Exynos4210RngState {
+struct Exynos4210RngState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
 
@@ -79,7 +79,7 @@ typedef struct Exynos4210RngState {
     /* Register values */
     uint32_t reg_control;
     uint32_t reg_status;
-} Exynos4210RngState;
+};
 
 static bool exynos4210_rng_seed_ready(const Exynos4210RngState *s)
 {
@@ -217,6 +217,8 @@ static const MemoryRegionOps exynos4210_rng_ops = {
     .read = exynos4210_rng_read,
     .write = exynos4210_rng_write,
     .endianness = DEVICE_NATIVE_ENDIAN,
+    .valid.min_access_size = 4,
+    .valid.max_access_size = 4,
 };
 
 static void exynos4210_rng_reset(DeviceState *dev)
@@ -243,7 +245,7 @@ static const VMStateDescription exynos4210_rng_vmstate = {
     .name = TYPE_EXYNOS4210_RNG,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_INT32_ARRAY(randr_value, Exynos4210RngState,
                             EXYNOS4210_RNG_PRNG_NUM),
         VMSTATE_UINT32(seed_set, Exynos4210RngState),
@@ -253,11 +255,11 @@ static const VMStateDescription exynos4210_rng_vmstate = {
     }
 };
 
-static void exynos4210_rng_class_init(ObjectClass *klass, void *data)
+static void exynos4210_rng_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = exynos4210_rng_reset;
+    device_class_set_legacy_reset(dc, exynos4210_rng_reset);
     dc->vmsd = &exynos4210_rng_vmstate;
 }
 

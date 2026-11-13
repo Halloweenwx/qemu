@@ -17,7 +17,6 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
 #include "qapi/error.h"
 #include "target/ppc/cpu.h"
 #include "qemu/log.h"
@@ -51,6 +50,11 @@ typedef struct OemSel {
 #define SOFT_OFF        0x00
 #define SOFT_REBOOT     0x01
 
+static bool pnv_bmc_is_simulator(IPMIBmc *bmc)
+{
+    return object_dynamic_cast(OBJECT(bmc), TYPE_IPMI_BMC_SIMULATOR);
+}
+
 static void pnv_gen_oem_sel(IPMIBmc *bmc, uint8_t reboot)
 {
     /* IPMI SEL Event are 16 bytes long */
@@ -78,6 +82,10 @@ void pnv_dt_bmc_sensors(IPMIBmc *bmc, void *fdt)
     int i;
     const struct ipmi_sdr_compact *sdr;
     uint16_t nextrec;
+
+    if (!pnv_bmc_is_simulator(bmc)) {
+        return;
+    }
 
     offset = fdt_add_subnode(fdt, 0, "bmc");
     _FDT(offset);
@@ -140,13 +148,34 @@ static uint16_t bytes_to_blocks(uint32_t bytes)
     return bytes >> BLOCK_SHIFT;
 }
 
+static uint32_t blocks_to_bytes(uint16_t blocks)
+{
+    return blocks << BLOCK_SHIFT;
+}
+
+static int hiomap_erase(PnvPnor *pnor, uint32_t offset, uint32_t size)
+{
+    MemTxResult result;
+    int i;
+
+    for (i = 0; i < size / 4; i++) {
+        result = memory_region_dispatch_write(&pnor->mmio, offset + i * 4,
+                                              0xFFFFFFFF, MO_32,
+                                              MEMTXATTRS_UNSPECIFIED);
+        if (result != MEMTX_OK) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static void hiomap_cmd(IPMIBmcSim *ibs, uint8_t *cmd, unsigned int cmd_len,
                        RspBuffer *rsp)
 {
     PnvPnor *pnor = PNV_PNOR(object_property_get_link(OBJECT(ibs), "pnor",
                                                       &error_abort));
+    uint32_t pnor_addr = pnor->lpc_address;
     uint32_t pnor_size = pnor->size;
-    uint32_t pnor_addr = PNOR_SPI_OFFSET;
     bool readonly = false;
 
     rsp_buffer_push(rsp, cmd[2]);
@@ -155,8 +184,14 @@ static void hiomap_cmd(IPMIBmcSim *ibs, uint8_t *cmd, unsigned int cmd_len,
     switch (cmd[2]) {
     case HIOMAP_C_MARK_DIRTY:
     case HIOMAP_C_FLUSH:
-    case HIOMAP_C_ERASE:
     case HIOMAP_C_ACK:
+        break;
+
+    case HIOMAP_C_ERASE:
+        if (hiomap_erase(pnor, blocks_to_bytes(cmd[5] << 8 | cmd[4]),
+                        blocks_to_bytes(cmd[7] << 8 | cmd[6]))) {
+            rsp_buffer_set_error(rsp, IPMI_CC_UNSPECIFIED);
+        }
         break;
 
     case HIOMAP_C_GET_INFO:
@@ -197,7 +232,7 @@ static void hiomap_cmd(IPMIBmcSim *ibs, uint8_t *cmd, unsigned int cmd_len,
     case HIOMAP_C_RESET:
     case HIOMAP_C_LOCK:
     default:
-        qemu_log_mask(LOG_GUEST_ERROR, "HIOMAP: unknow command %02X\n", cmd[2]);
+        qemu_log_mask(LOG_GUEST_ERROR, "HIOMAP: unknown command %02X\n", cmd[2]);
         break;
     }
 }
@@ -213,22 +248,93 @@ static const IPMINetfn hiomap_netfn = {
     .cmd_handlers = hiomap_cmds
 };
 
+
+void pnv_bmc_set_pnor(IPMIBmc *bmc, PnvPnor *pnor)
+{
+    uint32_t pnor_addr = pnor->lpc_address;
+    uint32_t pnor_size = pnor->size;
+
+    if (!pnv_bmc_is_simulator(bmc)) {
+        return;
+    }
+
+    /*
+     * The HIOMAP protocol uses block units and 16-bit addressing.
+     * Prevent overflow or misalign.
+     */
+    if (pnor_addr >= 1U << (BLOCK_SHIFT + 16)) {
+        warn_report("PNOR address is larger than 2^%d, disabling PNOR",
+                    BLOCK_SHIFT + 16);
+        return;
+    }
+    if (pnor_addr & ((1U << BLOCK_SHIFT) - 1)) {
+        warn_report("PNOR address is not aligned to 2^%d, disabling PNOR",
+                    BLOCK_SHIFT);
+        return;
+    }
+    if (pnor_size > 1U << (BLOCK_SHIFT + 16)) {
+        warn_report("PNOR size is larger than 2^%d, disabling PNOR",
+                    BLOCK_SHIFT + 16);
+        return;
+    }
+    if (pnor_size & ((1U << BLOCK_SHIFT) - 1)) {
+        warn_report("PNOR size is not aligned to 2^%d, disabling PNOR",
+                    BLOCK_SHIFT);
+        return;
+    }
+
+    object_ref(OBJECT(pnor));
+    object_property_add_const_link(OBJECT(bmc), "pnor", OBJECT(pnor));
+
+    /* Install the HIOMAP protocol handlers to access the PNOR */
+    ipmi_sim_register_netfn(IPMI_BMC_SIMULATOR(bmc), IPMI_NETFN_OEM,
+                            &hiomap_netfn);
+}
+
 /*
  * Instantiate the machine BMC. PowerNV uses the QEMU internal
  * simulator but it could also be external.
  */
 IPMIBmc *pnv_bmc_create(PnvPnor *pnor)
 {
+    DeviceState *dev;
+
+    dev = qdev_new(TYPE_IPMI_BMC_SIMULATOR);
+    qdev_realize(dev, NULL, &error_fatal);
+    pnv_bmc_set_pnor(IPMI_BMC(dev), pnor);
+
+    return IPMI_BMC(dev);
+}
+
+typedef struct ForeachArgs {
+    const char *name;
     Object *obj;
+} ForeachArgs;
 
-    obj = object_new(TYPE_IPMI_BMC_SIMULATOR);
-    object_ref(OBJECT(pnor));
-    object_property_add_const_link(obj, "pnor", OBJECT(pnor), &error_abort);
-    object_property_set_bool(obj, true, "realized", &error_fatal);
+static int bmc_find(Object *child, void *opaque)
+{
+    ForeachArgs *args = opaque;
 
-    /* Install the HIOMAP protocol handlers to access the PNOR */
-    ipmi_sim_register_netfn(IPMI_BMC_SIMULATOR(obj), IPMI_NETFN_OEM,
-                            &hiomap_netfn);
+    if (object_dynamic_cast(child, args->name)) {
+        if (args->obj) {
+            return 1;
+        }
+        args->obj = child;
+    }
+    return 0;
+}
 
-    return IPMI_BMC(obj);
+IPMIBmc *pnv_bmc_find(Error **errp)
+{
+    ForeachArgs args = { TYPE_IPMI_BMC, NULL };
+    int ret;
+
+    ret = object_child_foreach_recursive(object_get_root(), bmc_find, &args);
+    if (ret) {
+        error_setg(errp, "machine should have only one BMC device. "
+                   "Use '-nodefaults'");
+        return NULL;
+    }
+
+    return args.obj ? IPMI_BMC(args.obj) : NULL;
 }

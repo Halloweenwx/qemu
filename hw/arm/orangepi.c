@@ -19,21 +19,26 @@
 
 #include "qemu/osdep.h"
 #include "qemu/units.h"
-#include "exec/address-spaces.h"
+#include "system/address-spaces.h"
 #include "qapi/error.h"
-#include "cpu.h"
-#include "hw/sysbus.h"
-#include "hw/boards.h"
-#include "hw/qdev-properties.h"
+#include "qemu/error-report.h"
+#include "hw/core/boards.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/arm/allwinner-h3.h"
-#include "sysemu/sysemu.h"
+#include "hw/arm/boot.h"
 
-static struct arm_boot_info orangepi_binfo = {
-    .nb_cpus = AW_H3_NUM_CPUS,
+#define TYPE_ORANGEPI_MACHINE MACHINE_TYPE_NAME("orangepi-pc")
+OBJECT_DECLARE_SIMPLE_TYPE(OrangePiMachineState, ORANGEPI_MACHINE)
+
+struct OrangePiMachineState {
+    MachineState parent;
+
+    struct arm_boot_info bootinfo;
 };
 
 static void orangepi_init(MachineState *machine)
 {
+    OrangePiMachineState *opms = ORANGEPI_MACHINE(machine);
     AwH3State *h3;
     DriveInfo *di;
     BlockBackend *blk;
@@ -41,7 +46,7 @@ static void orangepi_init(MachineState *machine)
     DeviceState *carddev;
 
     /* BIOS is not supported by this board */
-    if (bios_name) {
+    if (machine->firmware) {
         error_report("BIOS not supported for this machine");
         exit(1);
     }
@@ -52,21 +57,13 @@ static void orangepi_init(MachineState *machine)
         exit(1);
     }
 
-    /* Only allow Cortex-A7 for this board */
-    if (strcmp(machine->cpu_type, ARM_CPU_TYPE_NAME("cortex-a7")) != 0) {
-        error_report("This board can only be used with cortex-a7 CPU");
-        exit(1);
-    }
-
     h3 = AW_H3(object_new(TYPE_AW_H3));
-    object_property_add_child(OBJECT(machine), "soc", OBJECT(h3),
-                              &error_abort);
+    object_property_add_child(OBJECT(machine), "soc", OBJECT(h3));
     object_unref(OBJECT(h3));
 
     /* Setup timer properties */
-    object_property_set_int(OBJECT(h3), 32768, "clk0-freq",
-                            &error_abort);
-    object_property_set_int(OBJECT(h3), 24 * 1000 * 1000, "clk1-freq",
+    object_property_set_int(OBJECT(h3), "clk0-freq", 32768, &error_abort);
+    object_property_set_int(OBJECT(h3), "clk1-freq", 24 * 1000 * 1000,
                             &error_abort);
 
     /* Setup SID properties. Currently using a default fixed SID identifier. */
@@ -78,44 +75,50 @@ static void orangepi_init(MachineState *machine)
     }
 
     /* Setup EMAC properties */
-    object_property_set_int(OBJECT(&h3->emac), 1, "phy-addr", &error_abort);
+    object_property_set_int(OBJECT(&h3->emac), "phy-addr", 1, &error_abort);
 
     /* DRAMC */
-    object_property_set_uint(OBJECT(h3), h3->memmap[AW_H3_SDRAM],
-                             "ram-addr", &error_abort);
-    object_property_set_int(OBJECT(h3), machine->ram_size / MiB, "ram-size",
+    object_property_set_uint(OBJECT(h3), "ram-addr", h3->memmap[AW_H3_DEV_SDRAM],
+                             &error_abort);
+    object_property_set_int(OBJECT(h3), "ram-size", machine->ram_size / MiB,
                             &error_abort);
 
     /* Mark H3 object realized */
-    object_property_set_bool(OBJECT(h3), true, "realized", &error_abort);
+    qdev_realize(DEVICE(h3), NULL, &error_abort);
 
     /* Retrieve SD bus */
-    di = drive_get_next(IF_SD);
+    di = drive_get(IF_SD, 0, 0);
     blk = di ? blk_by_legacy_dinfo(di) : NULL;
     bus = qdev_get_child_bus(DEVICE(h3), "sd-bus");
 
     /* Plug in SD card */
-    carddev = qdev_create(bus, TYPE_SD_CARD);
-    qdev_prop_set_drive(carddev, "drive", blk, &error_fatal);
-    object_property_set_bool(OBJECT(carddev), true, "realized", &error_fatal);
+    carddev = qdev_new(TYPE_SD_CARD);
+    qdev_prop_set_drive_err(carddev, "drive", blk, &error_fatal);
+    qdev_realize_and_unref(carddev, bus, &error_fatal);
 
     /* SDRAM */
-    memory_region_add_subregion(get_system_memory(), h3->memmap[AW_H3_SDRAM],
+    memory_region_add_subregion(get_system_memory(), h3->memmap[AW_H3_DEV_SDRAM],
                                 machine->ram);
 
     /* Load target kernel or start using BootROM */
-    if (!machine->kernel_filename && blk_is_available(blk)) {
+    if (!machine->kernel_filename && blk && blk_is_available(blk)) {
         /* Use Boot ROM to copy data from SD card to SRAM */
         allwinner_h3_bootrom_setup(h3, blk);
     }
-    orangepi_binfo.loader_start = h3->memmap[AW_H3_SDRAM];
-    orangepi_binfo.ram_size = machine->ram_size;
-    arm_load_kernel(ARM_CPU(first_cpu), machine, &orangepi_binfo);
+    opms->bootinfo.loader_start = h3->memmap[AW_H3_DEV_SDRAM];
+    opms->bootinfo.ram_size = machine->ram_size;
+    opms->bootinfo.psci_conduit = QEMU_PSCI_CONDUIT_SMC;
+    arm_load_kernel(&h3->cpus[0], machine, &opms->bootinfo);
 }
 
 static void orangepi_machine_init(MachineClass *mc)
 {
-    mc->desc = "Orange Pi PC";
+    static const char * const valid_cpu_types[] = {
+        ARM_CPU_TYPE_NAME("cortex-a7"),
+        NULL
+    };
+
+    mc->desc = "Orange Pi PC (Cortex-A7)";
     mc->init = orangepi_init;
     mc->block_default_type = IF_SD;
     mc->units_per_default_bus = 1;
@@ -123,8 +126,12 @@ static void orangepi_machine_init(MachineClass *mc)
     mc->max_cpus = AW_H3_NUM_CPUS;
     mc->default_cpus = AW_H3_NUM_CPUS;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a7");
+    mc->valid_cpu_types = valid_cpu_types;
     mc->default_ram_size = 1 * GiB;
     mc->default_ram_id = "orangepi.ram";
+    mc->auto_create_sdcard = true;
 }
 
-DEFINE_MACHINE("orangepi-pc", orangepi_machine_init)
+DEFINE_MACHINE_EXTENDED("orangepi-pc", MACHINE, OrangePiMachineState,
+                        orangepi_machine_init, false, false,
+                        NULL)

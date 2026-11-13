@@ -8,7 +8,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -20,8 +20,9 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/platform-bus.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/platform-bus.h"
+#include "hw/core/qdev-properties.h"
+#include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 
@@ -58,14 +59,12 @@ hwaddr platform_bus_get_mmio_addr(PlatformBusDevice *pbus, SysBusDevice *sbdev,
     Object *pbus_mr_obj = OBJECT(pbus_mr);
     Object *parent_mr;
 
-    if (!memory_region_is_mapped(sbdev_mr)) {
-        /* Region is not mapped? */
+    if (!sbdev_mr || !memory_region_is_mapped(sbdev_mr)) {
         return -1;
     }
 
-    parent_mr = object_property_get_link(OBJECT(sbdev_mr), "container", NULL);
-
-    assert(parent_mr);
+    parent_mr = object_property_get_link(OBJECT(sbdev_mr), "container",
+                                         &error_abort);
     if (parent_mr != pbus_mr_obj) {
         /* MMIO region is not mapped on platform bus */
         return -1;
@@ -145,9 +144,12 @@ static void platform_bus_map_mmio(PlatformBusDevice *pbus, SysBusDevice *sbdev,
      * the target device's memory region
      */
     for (off = 0; off < pbus->mmio_size; off += alignment) {
-        if (!memory_region_find(&pbus->mmio, off, size).mr) {
+        MemoryRegion *mr = memory_region_find(&pbus->mmio, off, size).mr;
+        if (!mr) {
             found_region = true;
             break;
+        } else {
+            memory_region_unref(mr);
         }
     }
 
@@ -201,13 +203,12 @@ static void platform_bus_realize(DeviceState *dev, Error **errp)
     plaform_bus_refresh_irqs(pbus);
 }
 
-static Property platform_bus_properties[] = {
+static const Property platform_bus_properties[] = {
     DEFINE_PROP_UINT32("num_irqs", PlatformBusDevice, num_irqs, 0),
     DEFINE_PROP_UINT32("mmio_size", PlatformBusDevice, mmio_size, 0),
-    DEFINE_PROP_END_OF_LIST()
 };
 
-static void platform_bus_class_init(ObjectClass *klass, void *data)
+static void platform_bus_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

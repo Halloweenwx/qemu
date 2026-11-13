@@ -1,10 +1,10 @@
 /*
- *  PowerPC interal definitions for qemu.
+ *  PowerPC internal definitions for qemu.
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -17,6 +17,48 @@
 
 #ifndef PPC_INTERNAL_H
 #define PPC_INTERNAL_H
+
+#include "exec/breakpoint.h"
+#include "exec/memop.h"
+#include "hw/core/registerfields.h"
+#include "exec/page-protection.h"
+#include "exec/helper-head.h.inc"
+
+/**
+ * ppc_env_is_64bit:
+ * @env: the cpu context
+ *
+ * Return whether the CPU is a 64-bit implementation.
+ */
+static inline bool ppc_env_is_64bit(const CPUPPCState *env)
+{
+    return env->insns_flags & PPC_64B;
+}
+
+static inline bool ppc_env_is_little_endian(const CPUPPCState *env)
+{
+    return FIELD_EX64(env->msr, MSR, LE);
+}
+
+/**
+ * ppc_data_endian_env:
+ * @env: the cpu context
+ *
+ * Return the MemOp endianness of the DATA path.
+ */
+static inline MemOp ppc_data_endian_env(const CPUPPCState *env)
+{
+    return ppc_env_is_little_endian(env) ? MO_LE : MO_BE;
+}
+
+/* PM instructions */
+typedef enum {
+    PPC_PM_DOZE,
+    PPC_PM_NAP,
+    PPC_PM_SLEEP,
+    PPC_PM_RVWINKLE,
+    PPC_PM_STOP,
+} powerpc_pm_insn_t;
 
 #define FUNC_MASK(name, ret_type, size, max_val)                  \
 static inline ret_type name(uint##size##_t start,                 \
@@ -157,22 +199,15 @@ EXTRACT_HELPER(FPL, 25, 1);
 EXTRACT_HELPER(FPFLM, 17, 8);
 EXTRACT_HELPER(FPW, 16, 1);
 
-/* mffscrni */
-EXTRACT_HELPER(RM, 11, 2);
-
 /* addpcis */
 EXTRACT_HELPER_SPLIT_3(DX, 10, 6, 6, 5, 16, 1, 1, 0, 0)
 #if defined(TARGET_PPC64)
 /* darn */
 EXTRACT_HELPER(L, 16, 2);
 #endif
-
-/***                            Jump target decoding                       ***/
-/* Immediate address */
-static inline target_ulong LI(uint32_t opcode)
-{
-    return (opcode >> 0) & 0x03FFFFFC;
-}
+/* wait */
+EXTRACT_HELPER(WC, 21, 2);
+EXTRACT_HELPER(PL, 16, 2);
 
 static inline uint32_t BD(uint32_t opcode)
 {
@@ -207,12 +242,105 @@ EXTRACT_HELPER(IMM8, 11, 8);
 EXTRACT_HELPER(DCMX, 16, 7);
 EXTRACT_HELPER_SPLIT_3(DCMX_XV, 5, 16, 0, 1, 2, 5, 1, 6, 6);
 
-void helper_compute_fprf_float16(CPUPPCState *env, float16 arg);
-void helper_compute_fprf_float32(CPUPPCState *env, float32 arg);
-void helper_compute_fprf_float128(CPUPPCState *env, float128 arg);
+void HELPER(compute_fprf_float16)(CPUPPCState *env, float16 arg);
+void HELPER(compute_fprf_float32)(CPUPPCState *env, float32 arg);
+void HELPER(compute_fprf_float128)(CPUPPCState *env, float128 arg);
 
-/* Raise a data fault alignment exception for the specified virtual address */
-void ppc_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
-                                 MMUAccessType access_type,
-                                 int mmu_idx, uintptr_t retaddr);
+/* translate.c */
+
+int ppc_fixup_cpu(PowerPCCPU *cpu);
+void create_ppc_opcodes(PowerPCCPU *cpu, Error **errp);
+void destroy_ppc_opcodes(PowerPCCPU *cpu);
+
+/* gdbstub.c */
+void ppc_gdb_init(CPUState *cs, PowerPCCPUClass *ppc);
+const gchar *ppc_gdb_arch_name(CPUState *cs);
+
+#ifndef CONFIG_USER_ONLY
+
+/* Check if permission bit required for the access_type is set in prot */
+static inline int check_prot_access_type(int prot, MMUAccessType access_type)
+{
+    return prot & (1 << access_type);
+}
+
+/* PowerPC MMU emulation */
+
+bool ppc_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
+                      hwaddr *raddrp, int *psizep, int *protp,
+                      int mmu_idx, bool guest_visible);
+
+/* Software driven TLB helpers */
+int ppc6xx_tlb_getnum(CPUPPCState *env, target_ulong eaddr,
+                                    int way, int is_code);
+
+#endif /* !CONFIG_USER_ONLY */
+
+/* Common routines used by software and hardware TLBs emulation */
+static inline int pte_is_valid(target_ulong pte0)
+{
+    return pte0 & 0x80000000 ? 1 : 0;
+}
+
+static inline void pte_invalidate(target_ulong *pte0)
+{
+    *pte0 &= ~0x80000000;
+}
+
+#define PTE_PTEM_MASK 0x7FFFFFBF
+#define PTE_CHECK_MASK (TARGET_PAGE_MASK | 0x7B)
+
+uint32_t ppc_ldl_code(CPUArchState *env, target_ulong addr);
+
+#ifdef CONFIG_USER_ONLY
+void ppc_cpu_record_sigsegv(CPUState *cs, vaddr addr,
+                            MMUAccessType access_type,
+                            bool maperr, uintptr_t ra);
+#else
+bool ppc_cpu_tlb_fill(CPUState *cs, vaddr address, int size,
+                      MMUAccessType access_type, int mmu_idx,
+                      bool probe, uintptr_t retaddr);
+G_NORETURN void ppc_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
+                                            MMUAccessType access_type, int mmu_idx,
+                                            uintptr_t retaddr);
+void ppc_cpu_do_transaction_failed(CPUState *cs, hwaddr physaddr,
+                                   vaddr addr, unsigned size,
+                                   MMUAccessType access_type,
+                                   int mmu_idx, MemTxAttrs attrs,
+                                   MemTxResult response, uintptr_t retaddr);
+void ppc_cpu_debug_excp_handler(CPUState *cs);
+bool ppc_cpu_debug_check_breakpoint(CPUState *cs);
+bool ppc_cpu_debug_check_watchpoint(CPUState *cs, CPUWatchpoint *wp);
+
+G_NORETURN void powerpc_checkstop(CPUPPCState *env, const char *reason);
+void powerpc_excp(PowerPCCPU *cpu, int excp);
+
+#endif /* !CONFIG_USER_ONLY */
+
+FIELD(GER_MSK, XMSK, 0, 4)
+FIELD(GER_MSK, YMSK, 4, 4)
+FIELD(GER_MSK, PMSK, 8, 8)
+
+static inline int ger_pack_masks(int pmsk, int ymsk, int xmsk)
+{
+    int msk = 0;
+    msk = FIELD_DP32(msk, GER_MSK, XMSK, xmsk);
+    msk = FIELD_DP32(msk, GER_MSK, YMSK, ymsk);
+    msk = FIELD_DP32(msk, GER_MSK, PMSK, pmsk);
+    return msk;
+}
+
+#ifdef CONFIG_TCG
+#include "accel/tcg/tb-cpu-state.h"
+
+TCGTBCPUState ppc_get_tb_cpu_state(CPUState *cs);
+#endif
+
+#ifndef CONFIG_USER_ONLY
+void ppc_get_dump_info(const CPUState *cs, ArchDumpInfo *info,
+                       const GuestPhysBlockList *guest_phys_blocks);
+size_t ppc_get_note_size(const CPUState *cs, int class, int machine,
+                         int nr_cpus);
+#endif
+
 #endif /* PPC_INTERNAL_H */

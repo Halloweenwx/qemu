@@ -1,15 +1,11 @@
 #ifndef UI_GTK_H
 #define UI_GTK_H
 
-#ifdef CONFIG_PRAGMA_DIAGNOSTIC_AVAILABLE
 /* Work around an -Wstrict-prototypes warning in GTK headers */
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstrict-prototypes"
-#endif
 #include <gtk/gtk.h>
-#ifdef CONFIG_PRAGMA_DIAGNOSTIC_AVAILABLE
 #pragma GCC diagnostic pop
-#endif
 
 #include <gdk/gdkkeysyms.h>
 
@@ -22,23 +18,30 @@
 #include <gdk/gdkwayland.h>
 #endif
 
+#include "ui/clipboard.h"
+#include "ui/console.h"
 #include "ui/kbd-state.h"
 #if defined(CONFIG_OPENGL)
 #include "ui/egl-helpers.h"
 #include "ui/egl-context.h"
 #endif
+#ifdef CONFIG_VTE
+#include "qemu/fifo8.h"
+#endif
 
-#define MILLISEC_PER_SEC 1000000
+#define MAX_VCS 10
 
 typedef struct GtkDisplayState GtkDisplayState;
 
 typedef struct VirtualGfxConsole {
     GtkWidget *drawing_area;
+    DisplayGLCtx dgc;
     DisplayChangeListener dcl;
     QKbdState *kbd;
     DisplaySurface *ds;
     pixman_image_t *convert;
     cairo_surface_t *surface;
+    double preferred_scale;
     double scale_x;
     double scale_y;
 #if defined(CONFIG_OPENGL)
@@ -54,6 +57,9 @@ typedef struct VirtualGfxConsole {
     int cursor_y;
     bool y0_top;
     bool scanout_mode;
+    bool has_dmabuf;
+    int gl_fence_fd;
+    bool draw_submitted;
 #endif
 } VirtualGfxConsole;
 
@@ -63,6 +69,7 @@ typedef struct VirtualVteConsole {
     GtkWidget *scrollbar;
     GtkWidget *terminal;
     Chardev *chr;
+    Fifo8 out_fifo;
     bool echo;
 } VirtualVteConsole;
 #endif
@@ -88,10 +95,75 @@ typedef struct VirtualConsole {
     };
 } VirtualConsole;
 
+struct GtkDisplayState {
+    GtkWidget *window;
+
+    GtkWidget *menu_bar;
+
+    GtkAccelGroup *accel_group;
+
+    GtkWidget *machine_menu_item;
+    GtkWidget *machine_menu;
+    GtkWidget *pause_item;
+    GtkWidget *reset_item;
+    GtkWidget *powerdown_item;
+    GtkWidget *quit_item;
+
+    GtkWidget *view_menu_item;
+    GtkWidget *view_menu;
+    GtkWidget *full_screen_item;
+    GtkWidget *copy_item;
+    GtkWidget *zoom_in_item;
+    GtkWidget *zoom_out_item;
+    GtkWidget *zoom_fixed_item;
+    GtkWidget *zoom_fit_item;
+    GtkWidget *grab_item;
+    GtkWidget *grab_on_hover_item;
+
+    GPtrArray *vcs;
+
+    GtkWidget *vc_menu_separator;
+    GtkWidget *show_tabs_item;
+    GtkWidget *untabify_item;
+    GtkWidget *show_menubar_item;
+
+    GtkWidget *vbox;
+    GtkWidget *notebook;
+    int button_mask;
+    gboolean last_set;
+    int last_x;
+    int last_y;
+    int grab_x_root;
+    int grab_y_root;
+    VirtualConsole *kbd_owner;
+    VirtualConsole *ptr_owner;
+
+    gboolean full_screen;
+
+    GdkCursor *null_cursor;
+    Notifier mouse_mode_notifier;
+    VMChangeStateEntry *vmse;
+    Notifier console_notifier;
+    gboolean free_scale;
+    gboolean keep_aspect_ratio;
+
+    bool external_pause_update;
+
+    QemuClipboardPeer cbpeer;
+    uint32_t cbpending[QEMU_CLIPBOARD_SELECTION__COUNT];
+    GtkClipboard *gtkcb[QEMU_CLIPBOARD_SELECTION__COUNT];
+    bool cbowner[QEMU_CLIPBOARD_SELECTION__COUNT];
+
+    DisplayOptions *opts;
+};
+
 extern bool gtk_use_gl_area;
 
 /* ui/gtk.c */
 void gd_update_windowsize(VirtualConsole *vc);
+void gd_update_monitor_refresh_rate(VirtualConsole *vc, GtkWidget *widget);
+void gd_gl_wait_sync(VirtualConsole *vc, void *sync);
+void gd_release_dmabuf(VirtualConsole *vc, QemuDmaBuf *dmabuf);
 
 /* ui/gtk-egl.c */
 void gd_egl_init(VirtualConsole *vc);
@@ -101,7 +173,7 @@ void gd_egl_update(DisplayChangeListener *dcl,
 void gd_egl_refresh(DisplayChangeListener *dcl);
 void gd_egl_switch(DisplayChangeListener *dcl,
                    DisplaySurface *surface);
-QEMUGLContext gd_egl_create_context(DisplayChangeListener *dcl,
+QEMUGLContext gd_egl_create_context(DisplayGLCtx *dgc,
                                     QEMUGLParams *params);
 void gd_egl_scanout_disable(DisplayChangeListener *dcl);
 void gd_egl_scanout_texture(DisplayChangeListener *dcl,
@@ -110,7 +182,8 @@ void gd_egl_scanout_texture(DisplayChangeListener *dcl,
                             uint32_t backing_width,
                             uint32_t backing_height,
                             uint32_t x, uint32_t y,
-                            uint32_t w, uint32_t h);
+                            uint32_t w, uint32_t h,
+                            void *d3d_tex2d);
 void gd_egl_scanout_dmabuf(DisplayChangeListener *dcl,
                            QemuDmaBuf *dmabuf);
 void gd_egl_cursor_dmabuf(DisplayChangeListener *dcl,
@@ -120,10 +193,13 @@ void gd_egl_cursor_position(DisplayChangeListener *dcl,
                             uint32_t pos_x, uint32_t pos_y);
 void gd_egl_release_dmabuf(DisplayChangeListener *dcl,
                            QemuDmaBuf *dmabuf);
-void gd_egl_scanout_flush(DisplayChangeListener *dcl,
-                          uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+void gd_egl_flush(DisplayChangeListener *dcl,
+                  uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+void *gd_egl_scanout_flush(DisplayChangeListener *dcl,
+                           uint32_t x, uint32_t y,
+                           uint32_t w, uint32_t h);
 void gtk_egl_init(DisplayGLMode mode);
-int gd_egl_make_current(DisplayChangeListener *dcl,
+int gd_egl_make_current(DisplayGLCtx *dgc,
                         QEMUGLContext ctx);
 
 /* ui/gtk-gl-area.c */
@@ -134,22 +210,33 @@ void gd_gl_area_update(DisplayChangeListener *dcl,
 void gd_gl_area_refresh(DisplayChangeListener *dcl);
 void gd_gl_area_switch(DisplayChangeListener *dcl,
                        DisplaySurface *surface);
-QEMUGLContext gd_gl_area_create_context(DisplayChangeListener *dcl,
+QEMUGLContext gd_gl_area_create_context(DisplayGLCtx *dgc,
                                         QEMUGLParams *params);
-void gd_gl_area_destroy_context(DisplayChangeListener *dcl,
+void gd_gl_area_destroy_context(DisplayGLCtx *dgc,
                                 QEMUGLContext ctx);
+void gd_gl_area_scanout_dmabuf(DisplayChangeListener *dcl,
+                               QemuDmaBuf *dmabuf);
 void gd_gl_area_scanout_texture(DisplayChangeListener *dcl,
                                 uint32_t backing_id,
                                 bool backing_y_0_top,
                                 uint32_t backing_width,
                                 uint32_t backing_height,
                                 uint32_t x, uint32_t y,
-                                uint32_t w, uint32_t h);
+                                uint32_t w, uint32_t h,
+                                void *d3d_tex2d);
+void gd_gl_area_release_dmabuf(DisplayChangeListener *dcl,
+                               QemuDmaBuf *dmabuf);
+void gd_gl_area_scanout_disable(DisplayChangeListener *dcl);
 void gd_gl_area_scanout_flush(DisplayChangeListener *dcl,
                               uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 void gtk_gl_area_init(void);
-QEMUGLContext gd_gl_area_get_current_context(DisplayChangeListener *dcl);
-int gd_gl_area_make_current(DisplayChangeListener *dcl,
+int gd_gl_area_make_current(DisplayGLCtx *dgc,
                             QEMUGLContext ctx);
+
+/* gtk-clipboard.c */
+void gd_clipboard_init(GtkDisplayState *gd);
+void gd_clipboard_cleanup(GtkDisplayState *gd);
+
+void gd_update_scale(VirtualConsole *vc, int ww, int wh, int fbw, int fbh);
 
 #endif /* UI_GTK_H */

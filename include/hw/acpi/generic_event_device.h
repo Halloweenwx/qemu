@@ -56,24 +56,42 @@
  *
  */
 
-#ifndef HW_ACPI_GED_H
-#define HW_ACPI_GED_H
+#ifndef HW_ACPI_GENERIC_EVENT_DEVICE_H
+#define HW_ACPI_GENERIC_EVENT_DEVICE_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "hw/acpi/memory_hotplug.h"
+#include "hw/acpi/ghes.h"
+#include "hw/acpi/cpu.h"
+#include "hw/acpi/pcihp.h"
+#include "qom/object.h"
 
 #define ACPI_POWER_BUTTON_DEVICE "PWRB"
 
 #define TYPE_ACPI_GED "acpi-ged"
-#define ACPI_GED(obj) \
-    OBJECT_CHECK(AcpiGedState, (obj), TYPE_ACPI_GED)
+OBJECT_DECLARE_TYPE(AcpiGedState, AcpiGedClass, ACPI_GED)
 
 #define ACPI_GED_EVT_SEL_OFFSET    0x0
 #define ACPI_GED_EVT_SEL_LEN       0x4
 
+#define ACPI_GED_REG_SLEEP_CTL     0x00
+#define ACPI_GED_REG_SLEEP_STS     0x01
+#define ACPI_GED_REG_RESET         0x02
+#define ACPI_GED_REG_COUNT         0x03
+
+/* ACPI_GED_REG_RESET value for reset*/
+#define ACPI_GED_RESET_VALUE       0x42
+
+/* [ACPI 5.0 Chapter 4.8.3.7] Sleep Control and Status Register */
+#define ACPI_GED_SLP_TYP_POS       0x2   /* SLP_TYPx Bit Offset */
+#define ACPI_GED_SLP_TYP_MASK      0x07  /* SLP_TYPx 3-bit mask */
+#define ACPI_GED_SLP_TYP_S5        0x05  /* System _S5 State (Soft Off) */
+#define ACPI_GED_SLP_EN            0x20  /* SLP_EN write-only bit */
+
 #define GED_DEVICE      "GED"
 #define AML_GED_EVT_REG "EREG"
 #define AML_GED_EVT_SEL "ESEL"
+#define AML_GED_EVT_CPU_SCAN_METHOD "\\_SB.GED.CSCN"
 
 /*
  * Platforms need to specify the GED event bitmap
@@ -82,22 +100,45 @@
  */
 #define ACPI_GED_MEM_HOTPLUG_EVT   0x1
 #define ACPI_GED_PWR_DOWN_EVT      0x2
+#define ACPI_GED_NVDIMM_HOTPLUG_EVT 0x4
+#define ACPI_GED_CPU_HOTPLUG_EVT    0x8
+#define ACPI_GED_PCI_HOTPLUG_EVT    0x10
+#define ACPI_GED_ERROR_EVT          0x20
 
 typedef struct GEDState {
-    MemoryRegion io;
+    MemoryRegion evt;
+    MemoryRegion regs;
     uint32_t     sel;
 } GEDState;
 
-typedef struct AcpiGedState {
+#define ACPI_PCIHP_REGION_NAME "pcihp container"
+#define ACPI_MEMHP_REGION_NAME "memhp container"
+
+struct AcpiGedState {
     SysBusDevice parent_obj;
     MemHotplugState memhp_state;
     MemoryRegion container_memhp;
+    CPUHotplugState cpuhp_state;
+    MemoryRegion container_cpuhp;
+    AcpiPciHpState pcihp_state;
+    MemoryRegion container_pcihp;
     GEDState ged_state;
     uint32_t ged_event_bitmap;
     qemu_irq irq;
-} AcpiGedState;
+    AcpiGhesState ghes_state;
+};
 
-void build_ged_aml(Aml *table, const char* name, HotplugHandler *hotplug_dev,
+typedef struct AcpiGedClass {
+    /* <private> */
+    SysBusDeviceClass parent_class;
+
+    /*< public >*/
+    ResettablePhases parent_phases;
+} AcpiGedClass;
+
+void build_ged_aml(Aml *table, const char *name,
+                   const HotplugHandler *hotplug_dev,
                    uint32_t ged_irq, AmlRegionSpace rs, hwaddr ged_base);
+void acpi_dsdt_add_power_button(Aml *scope);
 
 #endif

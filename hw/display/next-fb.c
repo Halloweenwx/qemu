@@ -24,14 +24,13 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "ui/console.h"
-#include "hw/hw.h"
-#include "hw/boards.h"
-#include "hw/loader.h"
-#include "hw/display/framebuffer.h"
+#include "hw/core/loader.h"
+#include "framebuffer.h"
 #include "ui/pixel_ops.h"
 #include "hw/m68k/next-cube.h"
+#include "qom/object.h"
 
-#define NEXTFB(obj) OBJECT_CHECK(NeXTFbState, (obj), TYPE_NEXTFB)
+OBJECT_DECLARE_SIMPLE_TYPE(NeXTFbState, NEXTFB)
 
 struct NeXTFbState {
     SysBusDevice parent_obj;
@@ -44,7 +43,6 @@ struct NeXTFbState {
     uint32_t rows;
     int invalidate;
 };
-typedef struct NeXTFbState NeXTFbState;
 
 static void nextfb_draw_line(void *opaque, uint8_t *d, const uint8_t *s,
                              int width, int pitch)
@@ -69,7 +67,7 @@ static void nextfb_draw_line(void *opaque, uint8_t *d, const uint8_t *s,
     }
 }
 
-static void nextfb_update(void *opaque)
+static bool nextfb_update(void *opaque)
 {
     NeXTFbState *s = NEXTFB(opaque);
     int dest_width = 4;
@@ -91,7 +89,9 @@ static void nextfb_update(void *opaque)
                                src_width, dest_width, 0, 1, nextfb_draw_line,
                                s, &first, &last);
 
-    dpy_gfx_update(s->con, 0, 0, s->cols, s->rows);
+    qemu_console_update(s->con, 0, 0, s->cols, s->rows);
+
+    return true;
 }
 
 static void nextfb_invalidate(void *opaque)
@@ -117,18 +117,18 @@ static void nextfb_realize(DeviceState *dev, Error **errp)
     s->cols = 1120;
     s->rows = 832;
 
-    s->con = graphic_console_init(dev, 0, &nextfb_ops, s);
+    s->con = qemu_graphic_console_create(dev, 0, &nextfb_ops, s);
     qemu_console_resize(s->con, s->cols, s->rows);
 }
 
-static void nextfb_class_init(ObjectClass *oc, void *data)
+static void nextfb_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     set_bit(DEVICE_CATEGORY_DISPLAY, dc->categories);
     dc->realize = nextfb_realize;
 
-    /* Note: This device does not any state that we have to reset or migrate */
+    /* Note: This device does not have any state that we have to reset or migrate */
 }
 
 static const TypeInfo nextfb_info = {

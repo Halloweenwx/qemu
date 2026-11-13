@@ -23,73 +23,14 @@
  */
 #include "qemu/osdep.h"
 #include "qemu/host-utils.h"
-#include "cpu.h"
-#include "exec/helper-proto.h"
-#include "exec/cpu_ldst.h"
-#include "exec/exec-all.h"
-#include "exec/tb-lookup.h"
-#include "disas/disas.h"
-#include "exec/log.h"
-#include "tcg/tcg.h"
+#include "exec/cpu-common.h"
+#include "exec/helper-proto-common.h"
+#include "accel/tcg/cpu-loop.h"
+#include "accel/tcg/getpc.h"
 
-/* 32-bit helpers */
-
-int32_t HELPER(div_i32)(int32_t arg1, int32_t arg2)
-{
-    return arg1 / arg2;
-}
-
-int32_t HELPER(rem_i32)(int32_t arg1, int32_t arg2)
-{
-    return arg1 % arg2;
-}
-
-uint32_t HELPER(divu_i32)(uint32_t arg1, uint32_t arg2)
-{
-    return arg1 / arg2;
-}
-
-uint32_t HELPER(remu_i32)(uint32_t arg1, uint32_t arg2)
-{
-    return arg1 % arg2;
-}
-
-/* 64-bit helpers */
-
-uint64_t HELPER(shl_i64)(uint64_t arg1, uint64_t arg2)
-{
-    return arg1 << arg2;
-}
-
-uint64_t HELPER(shr_i64)(uint64_t arg1, uint64_t arg2)
-{
-    return arg1 >> arg2;
-}
-
-int64_t HELPER(sar_i64)(int64_t arg1, int64_t arg2)
-{
-    return arg1 >> arg2;
-}
-
-int64_t HELPER(div_i64)(int64_t arg1, int64_t arg2)
-{
-    return arg1 / arg2;
-}
-
-int64_t HELPER(rem_i64)(int64_t arg1, int64_t arg2)
-{
-    return arg1 % arg2;
-}
-
-uint64_t HELPER(divu_i64)(uint64_t arg1, uint64_t arg2)
-{
-    return arg1 / arg2;
-}
-
-uint64_t HELPER(remu_i64)(uint64_t arg1, uint64_t arg2)
-{
-    return arg1 % arg2;
-}
+#define HELPER_H  "accel/tcg/tcg-runtime.h"
+#include "exec/helper-info.c.inc"
+#undef  HELPER_H
 
 uint64_t HELPER(muluh_i64)(uint64_t arg1, uint64_t arg2)
 {
@@ -143,25 +84,6 @@ uint32_t HELPER(ctpop_i32)(uint32_t arg)
 uint64_t HELPER(ctpop_i64)(uint64_t arg)
 {
     return ctpop64(arg);
-}
-
-void *HELPER(lookup_tb_ptr)(CPUArchState *env)
-{
-    CPUState *cpu = env_cpu(env);
-    TranslationBlock *tb;
-    target_ulong cs_base, pc;
-    uint32_t flags;
-
-    tb = tb_lookup__cpu_state(cpu, &pc, &cs_base, &flags, curr_cflags());
-    if (tb == NULL) {
-        return tcg_ctx->code_gen_epilogue;
-    }
-    qemu_log_mask_and_addr(CPU_LOG_EXEC, pc,
-                           "Chain %d: %p ["
-                           TARGET_FMT_lx "/" TARGET_FMT_lx "/%#x] %s\n",
-                           cpu->cpu_index, tb->tc.ptr, cs_base, pc, flags,
-                           lookup_symbol(pc));
-    return tb->tc.ptr;
 }
 
 void HELPER(exit_atomic)(CPUArchState *env)

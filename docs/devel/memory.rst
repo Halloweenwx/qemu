@@ -67,11 +67,15 @@ MemoryRegion):
 
   You initialize a pure container with memory_region_init().
 
-- alias: a subsection of another region.  Aliases allow a region to be
-  split apart into discontiguous regions.  Examples of uses are memory banks
-  used when the guest address space is smaller than the amount of RAM
-  addressed, or a memory controller that splits main memory to expose a "PCI
-  hole".  Aliases may point to any type of region, including other aliases,
+- alias: a subsection of another region. Aliases allow a region to be
+  split apart into discontiguous regions. Examples of uses are memory
+  banks used when the guest address space is smaller than the amount
+  of RAM addressed, or a memory controller that splits main memory to
+  expose a "PCI hole". You can also create aliases to avoid trying to
+  add the original region to multiple parents via
+  `memory_region_add_subregion`.
+
+  Aliases may point to any type of region, including other aliases,
   but an alias may not point back to itself, directly or indirectly.
   You initialize these with memory_region_init_alias().
 
@@ -106,13 +110,9 @@ migrated:
 
 For most devices and boards this is the correct thing. If you
 have a special case where you need to manage the migration of
-the backing memory yourself, you can call the functions:
-
-- memory_region_init_ram_nomigrate()
-- memory_region_init_rom_nomigrate()
-- memory_region_init_rom_device_nomigrate()
-
-which only initialize the MemoryRegion and leave handling
+the backing memory yourself, you can call the function
+memory_region_init_ram_flags_nomigrate()
+which only initializes the MemoryRegion and leaves handling
 migration to the caller.
 
 The functions:
@@ -154,21 +154,21 @@ ioeventfd) can be changed during the region lifecycle.  They take effect
 as soon as the region is made visible.  This can be immediately, later,
 or never.
 
-Destruction of a memory region happens automatically when the owner
-object dies.
+Destruction of a memory region happens automatically when the owner object
+dies.  When there are multiple memory regions under the same owner object,
+the memory API will guarantee all memory regions will be properly detached
+and finalized one by one.  The order in which memory regions will be
+finalized is not guaranteed.
 
 If however the memory region is part of a dynamically allocated data
-structure, you should call object_unparent() to destroy the memory region
-before the data structure is freed.  For an example see VFIOMSIXInfo
-and VFIOQuirk in hw/vfio/pci.c.
+structure, you should free the memory region in the instance_finalize
+callback.  For an example see VFIOMSIXInfo and VFIOQuirk in
+hw/vfio/pci.c.
 
 You must not destroy a memory region as long as it may be in use by a
 device or CPU.  In order to do this, as a general rule do not create or
-destroy memory regions dynamically during a device's lifetime, and only
-call object_unparent() in the memory region owner's instance_finalize
-callback.  The dynamically allocated data structure that contains the
-memory region then should obviously be freed in the instance_finalize
-callback as well.
+destroy memory regions dynamically during a device's lifetime, and never
+call object_unparent().
 
 If you break this rule, the following situation can happen:
 
@@ -194,9 +194,7 @@ this exception is rarely necessary, and therefore it is discouraged,
 but nevertheless it is used in a few places.
 
 For regions that "have no owner" (NULL is passed at creation time), the
-machine object is actually used as the owner.  Since instance_finalize is
-never called for the machine object, you must never call object_unparent
-on regions that have no owner, unless they are aliases or containers.
+machine object is actually used as the owner.
 
 
 Overlapping regions and priority
@@ -365,4 +363,4 @@ callbacks are called:
 API Reference
 -------------
 
-.. kernel-doc:: include/exec/memory.h
+.. kernel-doc:: include/system/memory.h

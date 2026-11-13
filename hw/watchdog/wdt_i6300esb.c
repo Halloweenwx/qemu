@@ -23,9 +23,10 @@
 
 #include "qemu/module.h"
 #include "qemu/timer.h"
-#include "sysemu/watchdog.h"
-#include "hw/pci/pci.h"
+#include "system/watchdog.h"
+#include "hw/pci/pci_device.h"
 #include "migration/vmstate.h"
+#include "qom/object.h"
 
 /*#define I6300ESB_DEBUG 1*/
 
@@ -54,7 +55,7 @@
 /* Config register bits */
 #define ESB_WDT_REBOOT  (0x01 << 5)   /* Enable reboot on timeout          */
 #define ESB_WDT_FREQ    (0x01 << 2)   /* Decrement frequency               */
-#define ESB_WDT_INTTYPE (0x11 << 0)   /* Interrupt type on timer1 timeout  */
+#define ESB_WDT_INTTYPE (0x03 << 0)   /* Interrupt type on timer1 timeout  */
 
 /* Reload register bits */
 #define ESB_WDT_RELOAD  (0x01 << 8)    /* prevent timeout                   */
@@ -101,11 +102,9 @@ struct I6300State {
                                  */
 };
 
-typedef struct I6300State I6300State;
 
 #define TYPE_WATCHDOG_I6300ESB_DEVICE "i6300esb"
-#define WATCHDOG_I6300ESB_DEVICE(obj) \
-    OBJECT_CHECK(I6300State, (obj), TYPE_WATCHDOG_I6300ESB_DEVICE)
+OBJECT_DECLARE_SIMPLE_TYPE(I6300State, WATCHDOG_I6300ESB_DEVICE)
 
 /* This function is called when the watchdog has either been enabled
  * (hence it starts counting down) or has been keep-alived.
@@ -419,7 +418,7 @@ static const VMStateDescription vmstate_i6300esb = {
      */
     .version_id = 10000,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, I6300State),
         VMSTATE_INT32(reboot_enabled, I6300State),
         VMSTATE_INT32(clock_scale, I6300State),
@@ -455,16 +454,10 @@ static void i6300esb_exit(PCIDevice *dev)
 {
     I6300State *d = WATCHDOG_I6300ESB_DEVICE(dev);
 
-    timer_del(d->timer);
     timer_free(d->timer);
 }
 
-static WatchdogTimerModel model = {
-    .wdt_name = "i6300esb",
-    .wdt_description = "Intel 6300ESB",
-};
-
-static void i6300esb_class_init(ObjectClass *klass, void *data)
+static void i6300esb_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -476,9 +469,10 @@ static void i6300esb_class_init(ObjectClass *klass, void *data)
     k->vendor_id = PCI_VENDOR_ID_INTEL;
     k->device_id = PCI_DEVICE_ID_INTEL_ESB_9;
     k->class_id = PCI_CLASS_SYSTEM_OTHER;
-    dc->reset = i6300esb_reset;
+    device_class_set_legacy_reset(dc, i6300esb_reset);
     dc->vmsd = &vmstate_i6300esb;
-    set_bit(DEVICE_CATEGORY_MISC, dc->categories);
+    set_bit(DEVICE_CATEGORY_WATCHDOG, dc->categories);
+    dc->desc = "Intel 6300ESB";
 }
 
 static const TypeInfo i6300esb_info = {
@@ -486,7 +480,7 @@ static const TypeInfo i6300esb_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(I6300State),
     .class_init    = i6300esb_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },
@@ -494,7 +488,6 @@ static const TypeInfo i6300esb_info = {
 
 static void i6300esb_register_types(void)
 {
-    watchdog_add_model(&model);
     type_register_static(&i6300esb_info);
 }
 

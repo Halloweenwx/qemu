@@ -23,10 +23,11 @@
 #ifndef HW_MAC_DBDMA_H
 #define HW_MAC_DBDMA_H
 
-#include "exec/memory.h"
+#include "system/memory.h"
 #include "qemu/iov.h"
-#include "sysemu/dma.h"
-#include "hw/sysbus.h"
+#include "system/dma.h"
+#include "hw/core/sysbus.h"
+#include "qom/object.h"
 
 typedef struct DBDMA_io DBDMA_io;
 
@@ -43,10 +44,6 @@ struct DBDMA_io {
     DBDMA_end dma_end;
     /* DMA is in progress, don't start another one */
     bool processing;
-    /* DMA request */
-    void *dma_mem;
-    dma_addr_t dma_len;
-    DMADirection dir;
 };
 
 /*
@@ -160,13 +157,16 @@ typedef struct DBDMA_channel {
     dbdma_cmd current;
 } DBDMA_channel;
 
-typedef struct {
+struct DBDMAState {
     SysBusDevice parent_obj;
 
     MemoryRegion mem;
     DBDMA_channel channels[DBDMA_CHANNELS];
     QEMUBH *bh;
-} DBDMAState;
+};
+
+#define TYPE_MAC_DBDMA "mac-dbdma"
+OBJECT_DECLARE_SIMPLE_TYPE(DBDMAState, MAC_DBDMA)
 
 /* Externally callable functions */
 
@@ -174,8 +174,5 @@ void DBDMA_register_channel(void *dbdma, int nchan, qemu_irq irq,
                             DBDMA_rw rw, DBDMA_flush flush,
                             void *opaque);
 void DBDMA_kick(DBDMAState *dbdma);
-
-#define TYPE_MAC_DBDMA "mac-dbdma"
-#define MAC_DBDMA(obj) OBJECT_CHECK(DBDMAState, (obj), TYPE_MAC_DBDMA)
 
 #endif

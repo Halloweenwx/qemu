@@ -7,7 +7,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -19,6 +19,23 @@
  */
 #ifndef SPARC_TARGET_CPU_H
 #define SPARC_TARGET_CPU_H
+
+#if defined(TARGET_SPARC64) && !defined(TARGET_ABI32)
+# define TARGET_STACK_BIAS 2047
+#else
+# define TARGET_STACK_BIAS 0
+#endif
+
+static void set_syscall_C(CPUSPARCState *env, bool val)
+{
+#ifndef TARGET_SPARC64
+    env->icc_C = val;
+#elif defined(TARGET_ABI32)
+    env->icc_C = (uint64_t)val << 32;
+#else
+    env->xcc_C = val;
+#endif
+}
 
 static inline void cpu_clone_regs_child(CPUSPARCState *env, target_ulong newsp,
                                         unsigned flags)
@@ -40,6 +57,7 @@ static inline void cpu_clone_regs_child(CPUSPARCState *env, target_ulong newsp,
 #endif
         /* ??? The kernel appears to copy one stack frame to the new stack. */
         /* ??? The kernel force aligns the new stack. */
+        /* Userspace provides a biased stack pointer value. */
         env->regwptr[WREG_SP] = newsp;
     }
 
@@ -51,11 +69,7 @@ static inline void cpu_clone_regs_child(CPUSPARCState *env, target_ulong newsp,
          * do the pc advance twice.
          */
         env->regwptr[WREG_O0] = 0;
-#if defined(TARGET_SPARC64) && !defined(TARGET_ABI32)
-        env->xcc &= ~PSR_CARRY;
-#else
-        env->psr &= ~PSR_CARRY;
-#endif
+        set_syscall_C(env, 0);
         env->pc = env->npc;
         env->npc = env->npc + 4;
     }
@@ -77,7 +91,7 @@ static inline void cpu_set_tls(CPUSPARCState *env, target_ulong newtls)
 
 static inline abi_ulong get_sp_from_cpustate(CPUSPARCState *state)
 {
-    return state->regwptr[WREG_SP];
+    return state->regwptr[WREG_SP] + TARGET_STACK_BIAS;
 }
 
 #endif

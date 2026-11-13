@@ -3,10 +3,12 @@
 
 #ifndef CONFIG_USER_ONLY
 
-hwaddr get_pteg_offset32(PowerPCCPU *cpu, hwaddr hash);
-hwaddr ppc_hash32_get_phys_page_debug(PowerPCCPU *cpu, target_ulong addr);
-int ppc_hash32_handle_mmu_fault(PowerPCCPU *cpu, vaddr address, int rw,
-                                int mmu_idx);
+#include "exec/page-protection.h"
+#include "system/memory.h"
+
+bool ppc_hash32_xlate(PowerPCCPU *cpu, vaddr eaddr, MMUAccessType access_type,
+                      hwaddr *raddrp, int *psizep, int *protp, int mmu_idx,
+                      bool guest_visible);
 
 /*
  * Segment register definitions
@@ -22,6 +24,8 @@ int ppc_hash32_handle_mmu_fault(PowerPCCPU *cpu, vaddr address, int rw,
  * Block Address Translation (BAT) definitions
  */
 
+#define BATU32_BEPIU            0xf0000000
+#define BATU32_BEPIL            0x0ffe0000
 #define BATU32_BEPI             0xfffe0000
 #define BATU32_BL               0x00001ffc
 #define BATU32_VS               0x00000002
@@ -31,15 +35,6 @@ int ppc_hash32_handle_mmu_fault(PowerPCCPU *cpu, vaddr address, int rw,
 #define BATL32_BRPN             0xfffe0000
 #define BATL32_WIMG             0x00000078
 #define BATL32_PP               0x00000003
-
-/* PowerPC 601 has slightly different BAT registers */
-
-#define BATU32_601_KS           0x00000008
-#define BATU32_601_KP           0x00000004
-#define BATU32_601_PP           0x00000003
-
-#define BATL32_601_V            0x00000040
-#define BATL32_601_BL           0x0000003f
 
 /*
  * Hash page table definitions
@@ -77,36 +72,64 @@ static inline hwaddr ppc_hash32_hpt_mask(PowerPCCPU *cpu)
     return ((cpu->env.spr[SPR_SDR1] & SDR_32_HTABMASK) << 16) | 0xFFFF;
 }
 
-static inline target_ulong ppc_hash32_load_hpte0(PowerPCCPU *cpu,
-                                                 hwaddr pte_offset)
+static inline hwaddr get_pteg_offset32(PowerPCCPU *cpu, hwaddr hash)
 {
-    target_ulong base = ppc_hash32_hpt_base(cpu);
-
-    return ldl_phys(CPU(cpu)->as, base + pte_offset);
+    return (hash * HASH_PTEG_SIZE_32) & ppc_hash32_hpt_mask(cpu);
 }
 
-static inline target_ulong ppc_hash32_load_hpte1(PowerPCCPU *cpu,
-                                                 hwaddr pte_offset)
+static inline bool ppc_hash32_key(bool pr, target_ulong sr)
 {
-    target_ulong base = ppc_hash32_hpt_base(cpu);
-
-    return ldl_phys(CPU(cpu)->as, base + pte_offset + HASH_PTE_SIZE_32 / 2);
+    return pr ? (sr & SR32_KP) : (sr & SR32_KS);
 }
 
-static inline void ppc_hash32_store_hpte0(PowerPCCPU *cpu,
-                                          hwaddr pte_offset, target_ulong pte0)
+static inline int ppc_hash32_prot(bool key, int pp, bool nx)
 {
-    target_ulong base = ppc_hash32_hpt_base(cpu);
+    int prot;
 
-    stl_phys(CPU(cpu)->as, base + pte_offset, pte0);
+    if (key) {
+        switch (pp) {
+        case 0x0:
+            prot = 0;
+            break;
+        case 0x1:
+        case 0x3:
+            prot = PAGE_READ;
+            break;
+        case 0x2:
+            prot = PAGE_READ | PAGE_WRITE;
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    } else {
+        switch (pp) {
+        case 0x0:
+        case 0x1:
+        case 0x2:
+            prot = PAGE_READ | PAGE_WRITE;
+            break;
+        case 0x3:
+            prot = PAGE_READ;
+            break;
+        default:
+            g_assert_not_reached();
+        }
+    }
+    return nx ? prot : prot | PAGE_EXEC;
 }
 
-static inline void ppc_hash32_store_hpte1(PowerPCCPU *cpu,
-                                          hwaddr pte_offset, target_ulong pte1)
+static inline int ppc_hash32_bat_prot(target_ulong batu, target_ulong batl)
 {
-    target_ulong base = ppc_hash32_hpt_base(cpu);
+    int prot = 0;
+    int pp = batl & BATL32_PP;
 
-    stl_phys(CPU(cpu)->as, base + pte_offset + HASH_PTE_SIZE_32 / 2, pte1);
+    if (pp) {
+        prot = PAGE_READ | PAGE_EXEC;
+        if (pp == 0x2) {
+            prot |= PAGE_WRITE;
+        }
+    }
+    return prot;
 }
 
 typedef struct {

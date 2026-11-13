@@ -1,7 +1,6 @@
 /*
  * Raspberry Pi emulation (c) 2012 Gregory Estrade
  * Refactoring for Pi2 Copyright (c) 2015, Microsoft. Written by Andrew Baumann.
- * This code is licensed under the GNU GPLv2 and later.
  *
  * Heavily based on milkymist-vgafb.c, copyright terms below:
  *  QEMU model of the Milkymist VGA framebuffer.
@@ -11,7 +10,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -26,12 +25,13 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/display/bcm2835_fb.h"
-#include "hw/hw.h"
-#include "hw/irq.h"
+#include "hw/core/hw-error.h"
+#include "hw/core/irq.h"
+#include "ui/console.h"
 #include "framebuffer.h"
 #include "ui/pixel_ops.h"
 #include "hw/misc/bcm2835_mbox_defs.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -146,11 +146,11 @@ static bool fb_use_offsets(BCM2835FBConfig *config)
      * viewport size is larger than the physical screen. (It doesn't
      * prevent the guest setting this silly viewport setting, though...)
      */
-    return config->xres_virtual > config->xres &&
+    return config->xres_virtual > config->xres ||
         config->yres_virtual > config->yres;
 }
 
-static void fb_update_display(void *opaque)
+static bool fb_update_display(void *opaque)
 {
     BCM2835FBState *s = opaque;
     DisplaySurface *surface = qemu_console_surface(s->con);
@@ -161,7 +161,7 @@ static void fb_update_display(void *opaque)
     uint32_t xoff = 0, yoff = 0;
 
     if (s->lock || !s->config.xres) {
-        return;
+        return true;
     }
 
     src_width = bcm2835_fb_get_pitch(&s->config);
@@ -174,7 +174,7 @@ static void fb_update_display(void *opaque)
 
     switch (surface_bits_per_pixel(surface)) {
     case 0:
-        return;
+        return true;
     case 8:
         break;
     case 15:
@@ -207,11 +207,11 @@ static void fb_update_display(void *opaque)
                                draw_line_src16, s, &first, &last);
 
     if (first >= 0) {
-        dpy_gfx_update(s->con, 0, first, s->config.xres,
-                       last - first + 1);
+        qemu_console_update(s->con, 0, first, s->config.xres, last - first + 1);
     }
 
     s->invalidate = false;
+    return true;
 }
 
 void bcm2835_fb_validate_config(BCM2835FBConfig *config)
@@ -280,8 +280,11 @@ static void bcm2835_fb_mbox_push(BCM2835FBState *s, uint32_t value)
     newconf.xoffset = ldl_le_phys(&s->dma_as, value + 24);
     newconf.yoffset = ldl_le_phys(&s->dma_as, value + 28);
 
-    newconf.base = s->vcram_base | (value & 0xc0000000);
-    newconf.base += BCM2835_FB_OFFSET;
+    newconf.base = s->vcram_base + BCM2835_FB_OFFSET;
+
+    /* Copy fields which we don't want to change from the existing config */
+    newconf.pixo = s->config.pixo;
+    newconf.alpha = s->config.alpha;
 
     bcm2835_fb_validate_config(&newconf);
 
@@ -349,11 +352,22 @@ static const MemoryRegionOps bcm2835_fb_ops = {
     .valid.max_access_size = 4,
 };
 
+static int bcm2835_fb_post_load(void *opaque, int version_id)
+{
+    BCM2835FBState *s = opaque;
+
+    bcm2835_fb_validate_config(&s->config);
+    s->invalidate = true;
+    qemu_console_resize(s->con, s->config.xres, s->config.yres);
+    return 0;
+}
+
 static const VMStateDescription vmstate_bcm2835_fb = {
     .name = TYPE_BCM2835_FB,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .post_load = bcm2835_fb_post_load,
+    .fields = (const VMStateField[]) {
         VMSTATE_BOOL(lock, BCM2835FBState),
         VMSTATE_BOOL(invalidate, BCM2835FBState),
         VMSTATE_BOOL(pending, BCM2835FBState),
@@ -402,7 +416,6 @@ static void bcm2835_fb_reset(DeviceState *dev)
 static void bcm2835_fb_realize(DeviceState *dev, Error **errp)
 {
     BCM2835FBState *s = BCM2835_FB(dev);
-    Error *err = NULL;
     Object *obj;
 
     if (s->vcram_base == 0) {
@@ -410,12 +423,7 @@ static void bcm2835_fb_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    obj = object_property_get_link(OBJECT(dev), "dma-mr", &err);
-    if (obj == NULL) {
-        error_setg(errp, "%s: required dma-mr link not found: %s",
-                   __func__, error_get_pretty(err));
-        return;
-    }
+    obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
 
     /* Fill in the parts of initial_config that are not set by QOM properties */
     s->initial_config.xres_virtual = s->initial_config.xres;
@@ -429,11 +437,11 @@ static void bcm2835_fb_realize(DeviceState *dev, Error **errp)
 
     bcm2835_fb_reset(dev);
 
-    s->con = graphic_console_init(dev, 0, &vgafb_ops, s);
+    s->con = qemu_graphic_console_create(dev, 0, &vgafb_ops, s);
     qemu_console_resize(s->con, s->config.xres, s->config.yres);
 }
 
-static Property bcm2835_fb_props[] = {
+static const Property bcm2835_fb_props[] = {
     DEFINE_PROP_UINT32("vcram-base", BCM2835FBState, vcram_base, 0),/*required*/
     DEFINE_PROP_UINT32("vcram-size", BCM2835FBState, vcram_size,
                        DEFAULT_VCRAM_SIZE),
@@ -444,20 +452,19 @@ static Property bcm2835_fb_props[] = {
                        initial_config.pixo, 1), /* 1=RGB, 0=BGR */
     DEFINE_PROP_UINT32("alpha", BCM2835FBState,
                        initial_config.alpha, 2), /* alpha ignored */
-    DEFINE_PROP_END_OF_LIST()
 };
 
-static void bcm2835_fb_class_init(ObjectClass *klass, void *data)
+static void bcm2835_fb_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     device_class_set_props(dc, bcm2835_fb_props);
     dc->realize = bcm2835_fb_realize;
-    dc->reset = bcm2835_fb_reset;
+    device_class_set_legacy_reset(dc, bcm2835_fb_reset);
     dc->vmsd = &vmstate_bcm2835_fb;
 }
 
-static TypeInfo bcm2835_fb_info = {
+static const TypeInfo bcm2835_fb_info = {
     .name          = TYPE_BCM2835_FB,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(BCM2835FBState),

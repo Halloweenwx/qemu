@@ -1,13 +1,16 @@
 config FDC
     bool
-    # FIXME: there is no separate file for the MMIO floppy disk controller, so
-    # select ISA_BUS here instead of polluting each board that requires one
-    select ISA_BUS
+
+config FDC_ISA
+    bool
+    depends on ISA_BUS
+    select FDC
+
+config FDC_SYSBUS
+    bool
+    select FDC
 
 config SSI_M25P80
-    bool
-
-config NAND
     bool
 
 config PFLASH_CFI01
@@ -15,17 +18,6 @@ config PFLASH_CFI01
 
 config PFLASH_CFI02
     bool
-
-config ECC
-    bool
-
-config ONENAND
-    bool
-
-config NVME_PCI
-    bool
-    default y if PCI_DEVICES
-    depends on PCI
 
 config VIRTIO_BLK
     bool

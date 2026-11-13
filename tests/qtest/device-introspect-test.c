@@ -11,17 +11,16 @@
  */
 
 /*
- * Covers QMP device-list-properties and HMP device_add help.  We
- * currently don't check that their output makes sense, only that QEMU
- * survives.  Useful since we've had an astounding number of crash
- * bugs around here.
+ * Covers QMP device-list-properties and HMP device_add help (if
+ * CONFIG_HMP).  We currently don't check that the output makes sense,
+ * only that QEMU survives.  Useful since we've had an astounding
+ * number of crash bugs around here.
  */
 
 #include "qemu/osdep.h"
-#include "qemu-common.h"
-#include "qapi/qmp/qstring.h"
-#include "qapi/qmp/qdict.h"
-#include "qapi/qmp/qlist.h"
+#include "qobject/qstring.h"
+#include "qobject/qdict.h"
+#include "qobject/qlist.h"
 #include "libqtest.h"
 
 const char common_args[] = "-nodefaults -machine none";
@@ -101,46 +100,83 @@ static QList *device_type_list(QTestState *qts, bool abstract)
     return qom_list_types(qts, "device", abstract);
 }
 
+/*
+ * Recursively walk the QOM composition tree via qom-list and build a
+ * string representation.  This serves two purposes: detecting dangling
+ * pointers (qom-list would crash QEMU) and detecting leaked objects
+ * (by comparing the output before and after device introspection).
+ */
+static void qom_tree_walk(QTestState *qts, const char *path, GString *result)
+{
+    QDict *resp;
+    QList *list;
+    QListEntry *e;
+    GList *children = NULL;
+
+    resp = qtest_qmp(qts, "{'execute': 'qom-list',"
+                     " 'arguments': {'path': %s}}", path);
+    g_assert(qdict_haskey(resp, "return"));
+    list = qdict_get_qlist(resp, "return");
+
+    QLIST_FOREACH_ENTRY(list, e) {
+        QDict *prop = qobject_to(QDict, qlist_entry_obj(e));
+        const char *type = qdict_get_str(prop, "type");
+        if (g_str_has_prefix(type, "child<")) {
+            const char *name = qdict_get_str(prop, "name");
+            children = g_list_prepend(children, g_strdup(name));
+        }
+    }
+
+    children = g_list_sort_with_data(children, (GCompareDataFunc)g_strcmp0,
+                                     NULL);
+
+    for (GList *l = children; l; l = l->next) {
+        const char *name = l->data;
+        g_autofree char *child_path = (!strcmp(path, "/"))
+            ? g_strdup_printf("/%s", name)
+            : g_strdup_printf("%s/%s", path, name);
+
+        g_string_append_printf(result, "%s\n", child_path);
+        qom_tree_walk(qts, child_path, result);
+    }
+
+    g_list_free_full(children, g_free);
+    qobject_unref(resp);
+}
+
+static char *qom_tree_str(QTestState *qts)
+{
+    GString *result = g_string_new("");
+    qom_tree_walk(qts, "/", result);
+    return g_string_free(result, FALSE);
+}
+
 static void test_one_device(QTestState *qts, const char *type)
 {
     QDict *resp;
-    char *help;
-    char *qom_tree_start, *qom_tree_end;
-    char *qtree_start, *qtree_end;
 
     g_test_message("Testing device '%s'", type);
-
-    qom_tree_start = qtest_hmp(qts, "info qom-tree");
-    qtree_start = qtest_hmp(qts, "info qtree");
 
     resp = qtest_qmp(qts, "{'execute': 'device-list-properties',"
                           " 'arguments': {'typename': %s}}",
                type);
     qobject_unref(resp);
 
-    help = qtest_hmp(qts, "device_add \"%s,help\"", type);
-    g_free(help);
+#ifdef CONFIG_HMP
+    {
+        g_autofree char *escaped = NULL;
+        g_autoptr(GRegex) comma = NULL;
 
-    /*
-     * Some devices leave dangling pointers in QOM behind.
-     * "info qom-tree" or "info qtree" have a good chance at crashing then.
-     * Also make sure that the tree did not change.
-     */
-    qom_tree_end = qtest_hmp(qts, "info qom-tree");
-    g_assert_cmpstr(qom_tree_start, ==, qom_tree_end);
-    g_free(qom_tree_start);
-    g_free(qom_tree_end);
-
-    qtree_end = qtest_hmp(qts, "info qtree");
-    g_assert_cmpstr(qtree_start, ==, qtree_end);
-    g_free(qtree_start);
-    g_free(qtree_end);
+        comma = g_regex_new(",", 0, 0, NULL);
+        escaped = g_regex_replace_literal(comma, type, -1, 0, ",,", 0, NULL);
+        g_free(qtest_hmp(qts, "device_add \"%s,help\"", escaped));
+    }
+#endif
 }
 
 static void test_device_intro_list(void)
 {
     QList *types;
-    char *help;
     QTestState *qts;
 
     qts = qtest_init(common_args);
@@ -148,8 +184,11 @@ static void test_device_intro_list(void)
     types = device_type_list(qts, true);
     qobject_unref(types);
 
-    help = qtest_hmp(qts, "device_add help");
-    g_free(help);
+#ifdef CONFIG_HMP
+    {
+        g_free(qtest_hmp(qts, "device_add help"));
+    }
+#endif
 
     qtest_quit(qts);
 }
@@ -213,16 +252,46 @@ static void test_qom_list_fields(void)
 static void test_device_intro_none(void)
 {
     QTestState *qts = qtest_init(common_args);
+    g_autofree char *qom_tree_start = qom_tree_str(qts);
+    g_autofree char *qom_tree_end = NULL;
+#ifdef CONFIG_HMP
+    g_autofree char *qtree_start = qtest_hmp(qts, "info qtree");
+    g_autofree char *qtree_end = NULL;
+#endif
 
     test_one_device(qts, "nonexistent");
+
+    /* Make sure that really nothing changed in the trees */
+    qom_tree_end = qom_tree_str(qts);
+    g_assert_cmpstr(qom_tree_start, ==, qom_tree_end);
+#ifdef CONFIG_HMP
+    qtree_end = qtest_hmp(qts, "info qtree");
+    g_assert_cmpstr(qtree_start, ==, qtree_end);
+#endif
+
     qtest_quit(qts);
 }
 
 static void test_device_intro_abstract(void)
 {
     QTestState *qts = qtest_init(common_args);
+    g_autofree char *qom_tree_start = qom_tree_str(qts);
+    g_autofree char *qom_tree_end = NULL;
+#ifdef CONFIG_HMP
+    g_autofree char *qtree_start = qtest_hmp(qts, "info qtree");
+    g_autofree char *qtree_end = NULL;
+#endif
 
     test_one_device(qts, "device");
+
+    /* Make sure that really nothing changed in the trees */
+    qom_tree_end = qom_tree_str(qts);
+    g_assert_cmpstr(qom_tree_start, ==, qom_tree_end);
+#ifdef CONFIG_HMP
+    qtree_end = qtest_hmp(qts, "info qtree");
+    g_assert_cmpstr(qtree_start, ==, qtree_end);
+#endif
+
     qtest_quit(qts);
 }
 
@@ -231,9 +300,14 @@ static void test_device_intro_concrete(const void *args)
     QList *types;
     QListEntry *entry;
     const char *type;
-    QTestState *qts;
+    QTestState *qts = qtest_init(args);
+    g_autofree char *qom_tree_start = qom_tree_str(qts);
+    g_autofree char *qom_tree_end = NULL;
+#ifdef CONFIG_HMP
+    g_autofree char *qtree_start = qtest_hmp(qts, "info qtree");
+    g_autofree char *qtree_end = NULL;
+#endif
 
-    qts = qtest_init(args);
     types = device_type_list(qts, false);
 
     QLIST_FOREACH_ENTRY(types, entry) {
@@ -243,9 +317,20 @@ static void test_device_intro_concrete(const void *args)
         test_one_device(qts, type);
     }
 
+    /*
+     * Some devices leave dangling pointers in QOM behind.
+     * Walking the QOM tree via qom-list has a good chance at crashing then.
+     * Also make sure that the tree did not change.
+     */
+    qom_tree_end = qom_tree_str(qts);
+    g_assert_cmpstr(qom_tree_start, ==, qom_tree_end);
+#ifdef CONFIG_HMP
+    qtree_end = qtest_hmp(qts, "info qtree");
+    g_assert_cmpstr(qtree_start, ==, qtree_end);
+#endif
+
     qobject_unref(types);
     qtest_quit(qts);
-    g_free((void *)args);
 }
 
 static void test_abstract_interfaces(void)
@@ -287,19 +372,14 @@ static void add_machine_test_case(const char *mname)
 {
     char *path, *args;
 
-    /* Ignore blacklisted machines */
-    if (g_str_equal("xenfv", mname) || g_str_equal("xenpv", mname)) {
-        return;
-    }
-
     path = g_strdup_printf("device/introspect/concrete/defaults/%s", mname);
     args = g_strdup_printf("-M %s", mname);
-    qtest_add_data_func(path, args, test_device_intro_concrete);
+    qtest_add_data_func_full(path, args, test_device_intro_concrete, g_free);
     g_free(path);
 
     path = g_strdup_printf("device/introspect/concrete/nodefaults/%s", mname);
     args = g_strdup_printf("-nodefaults -M %s", mname);
-    qtest_add_data_func(path, args, test_device_intro_concrete);
+    qtest_add_data_func_full(path, args, test_device_intro_concrete, g_free);
     g_free(path);
 }
 
@@ -314,7 +394,7 @@ int main(int argc, char **argv)
     qtest_add_func("device/introspect/abstract-interfaces", test_abstract_interfaces);
     if (g_test_quick()) {
         qtest_add_data_func("device/introspect/concrete/defaults/none",
-                            g_strdup(common_args), test_device_intro_concrete);
+                            common_args, test_device_intro_concrete);
     } else {
         qtest_cb_for_every_machine(add_machine_test_case, true);
     }

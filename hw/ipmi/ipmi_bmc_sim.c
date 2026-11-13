@@ -23,14 +23,17 @@
  */
 
 #include "qemu/osdep.h"
-#include "sysemu/sysemu.h"
+#include "system/system.h"
 #include "qemu/timer.h"
 #include "hw/ipmi/ipmi.h"
 #include "qemu/error-report.h"
+#include "qapi/error.h"
 #include "qemu/module.h"
-#include "hw/loader.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/loader.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/qdev-properties-system.h"
 #include "migration/vmstate.h"
+#include "net/net.h"
 
 #define IPMI_NETFN_CHASSIS            0x00
 
@@ -49,6 +52,7 @@
 #define IPMI_CMD_GET_SENSOR_READING       0x2d
 #define IPMI_CMD_SET_SENSOR_TYPE          0x2e
 #define IPMI_CMD_GET_SENSOR_TYPE          0x2f
+#define IPMI_CMD_SET_SENSOR_READING       0x30
 
 /* #define IPMI_NETFN_APP             0x06 In ipmi.h */
 
@@ -68,6 +72,8 @@
 #define IPMI_CMD_GET_MSG                  0x33
 #define IPMI_CMD_SEND_MSG                 0x34
 #define IPMI_CMD_READ_EVT_MSG_BUF         0x35
+#define IPMI_CMD_GET_CHANNEL_ACCESS       0x41
+#define IPMI_CMD_GET_CHANNEL_INFO         0x42
 
 #define IPMI_NETFN_STORAGE            0x0a
 
@@ -97,6 +103,11 @@
 #define IPMI_CMD_CLEAR_SEL                0x47
 #define IPMI_CMD_GET_SEL_TIME             0x48
 #define IPMI_CMD_SET_SEL_TIME             0x49
+
+#define IPMI_NETFN_TRANSPORT          0x0c
+
+#define IPMI_CMD_SET_LAN_CONFIG           0x01
+#define IPMI_CMD_GET_LAN_CONFIG           0x02
 
 
 /* Same as a timespec struct. */
@@ -167,6 +178,23 @@ typedef struct IPMISensor {
 #define MAX_SENSORS 20
 #define IPMI_WATCHDOG_SENSOR 0
 
+#define NBYTES_IP  4
+#define NBYTES_MAC 6
+
+typedef struct IPMILan {
+    uint8_t channel;
+    uint8_t ipaddr[NBYTES_IP];
+    uint8_t ipsrc;
+    MACAddr macaddr;
+    uint8_t netmask[NBYTES_IP];
+    uint8_t defgw_ipaddr[NBYTES_IP];
+    MACAddr defgw_macaddr;
+
+    char *arg_ipaddr;
+    char *arg_netmask;
+    char *arg_defgw_ipaddr;
+} IPMILan;
+
 #define MAX_NETFNS 64
 
 typedef struct IPMIRcvBufEntry {
@@ -187,7 +215,7 @@ struct IPMIBmcSim {
     uint8_t  watchdog_use;
     uint8_t  watchdog_action;
     uint8_t  watchdog_pretimeout; /* In seconds */
-    bool     watchdog_expired;
+    uint8_t  watchdog_expired;
     uint16_t watchdog_timeout; /* in 100's of milliseconds */
 
     bool     watchdog_running;
@@ -212,6 +240,7 @@ struct IPMIBmcSim {
     IPMIFru fru;
     IPMISensor sensors[MAX_SENSORS];
     char *sdr_filename;
+    IPMILan lan;
 
     /* Odd netfns are for responses, so we only need the even ones. */
     const IPMINetfn *netfns[MAX_NETFNS / 2];
@@ -232,6 +261,7 @@ struct IPMIBmcSim {
 #define IPMI_BMC_MSG_FLAG_RCV_MSG_QUEUE_SET(s) \
     (IPMI_BMC_MSG_FLAG_RCV_MSG_QUEUE & (s)->msg_flags)
 
+#define IPMI_BMC_GLOBAL_ENABLES_SUPPORTED 0x0f
 #define IPMI_BMC_RCV_MSG_QUEUE_INT_BIT    0
 #define IPMI_BMC_EVBUF_FULL_INT_BIT       1
 #define IPMI_BMC_EVENT_MSG_BUF_BIT        2
@@ -260,6 +290,37 @@ struct IPMIBmcSim {
 #define IPMI_BMC_WATCHDOG_ACTION_RESET           1
 #define IPMI_BMC_WATCHDOG_ACTION_POWER_DOWN      2
 #define IPMI_BMC_WATCHDOG_ACTION_POWER_CYCLE     3
+
+#define IPMI_CHANNEL_IMPLEMENTATION_MIN    0x1
+#define IPMI_CHANNEL_IMPLEMENTATION_MAX    0xb
+#define IPMI_CHANNEL_IS_IMPLEMENTATION_SPECIFIC(c) \
+    (IPMI_CHANNEL_IMPLEMENTATION_MIN <= (c) && \
+     (c) <= IPMI_CHANNEL_IMPLEMENTATION_MAX)
+
+#define IPMI_BMC_CHANNEL_IS_LAN(ibs, c) \
+    ((ibs)->lan.channel != 0 && (ibs)->lan.channel == (c))
+
+#define IPMI_BMC_LAN_CFG_CC_PARAM_NOT_SUPPORTED    0x80
+#define IPMI_BMC_LAN_CFG_CC_PARAM_READONLY         0x82
+
+#define IPMI_BMC_LAN_CFG_PARAM_SET_IN_PROGRESS        0x00
+#define IPMI_BMC_LAN_CFG_PARAM_AUTH_TYPE_SUPPORT      0x01
+#define IPMI_BMC_LAN_CFG_PARAM_AUTH_TYPE_ENABLES      0x02
+#define IPMI_BMC_LAN_CFG_PARAM_IP_ADDR                0x03
+#define IPMI_BMC_LAN_CFG_PARAM_IP_ADDR_SOURCE         0x04
+#define IPMI_BMC_LAN_CFG_PARAM_MAC_ADDR               0x05
+#define IPMI_BMC_LAN_CFG_PARAM_SUBNET_MASK            0x06
+#define IPMI_BMC_LAN_CFG_PARAM_IPV4_HDR_PARAMS        0x07
+#define IPMI_BMC_LAN_CFG_PARAM_DEFAULT_GW_IP_ADDR     0x0c
+#define IPMI_BMC_LAN_CFG_PARAM_DEFAULT_GW_MAC_ADDR    0x0d
+#define IPMI_BMC_LAN_CFG_PARAM_BACKUP_GW_ADDR         0x0e
+#define IPMI_BMC_LAN_CFG_PARAM_BACKUP_GW_MAC_ADDR     0x0f
+#define IPMI_BMC_LAN_CFG_PARAM_COMMUNITY_STRING       0x10
+#define IPMI_BMC_LAN_CFG_PARAM_NUM_DESTINATIONS       0x11
+
+#define IPMI_BMC_LAN_CFG_PARAMETER_REVISION    0x11
+
+#define IPMI_BMC_LAN_CFG_IS_VALID_IP_SOURCE(v)    (0x0 <= (v) && (v) <= 0x4)
 
 #define RSP_BUFFER_INITIALIZER { }
 
@@ -461,14 +522,12 @@ void ipmi_bmc_gen_event(IPMIBmc *b, uint8_t *evt, bool log)
     }
 
     if (ibs->msg_flags & IPMI_BMC_MSG_FLAG_EVT_BUF_FULL) {
-        goto out;
+        return;
     }
 
     memcpy(ibs->evtbuf, evt, 16);
     ibs->msg_flags |= IPMI_BMC_MSG_FLAG_EVT_BUF_FULL;
     k->set_atn(s, 1, attn_irq_enabled(ibs));
- out:
-    return;
 }
 static void gen_event(IPMIBmcSim *ibs, unsigned int sens_num, uint8_t deassert,
                       uint8_t evd1, uint8_t evd2, uint8_t evd3)
@@ -511,7 +570,8 @@ static void gen_event(IPMIBmcSim *ibs, unsigned int sens_num, uint8_t deassert,
 
 static void sensor_set_discrete_bit(IPMIBmcSim *ibs, unsigned int sensor,
                                     unsigned int bit, unsigned int val,
-                                    uint8_t evd1, uint8_t evd2, uint8_t evd3)
+                                    uint8_t evd1, uint8_t evd2, uint8_t evd3,
+                                    bool do_log)
 {
     IPMISensor *sens;
     uint16_t mask;
@@ -531,7 +591,7 @@ static void sensor_set_discrete_bit(IPMIBmcSim *ibs, unsigned int sensor,
             return; /* Already asserted */
         }
         sens->assert_states |= mask & sens->assert_suppt;
-        if (sens->assert_enable & mask & sens->assert_states) {
+        if (do_log && (sens->assert_enable & mask & sens->assert_states)) {
             /* Send an event on assert */
             gen_event(ibs, sensor, 0, evd1, evd2, evd3);
         }
@@ -541,7 +601,7 @@ static void sensor_set_discrete_bit(IPMIBmcSim *ibs, unsigned int sensor,
             return; /* Already deasserted */
         }
         sens->deassert_states |= mask & sens->deassert_suppt;
-        if (sens->deassert_enable & mask & sens->deassert_states) {
+        if (do_log && (sens->deassert_enable & mask & sens->deassert_states)) {
             /* Send an event on deassert */
             gen_event(ibs, sensor, 1, evd1, evd2, evd3);
         }
@@ -697,6 +757,7 @@ static void ipmi_sim_handle_timeout(IPMIBmcSim *ibs)
 {
     IPMIInterface *s = ibs->parent.intf;
     IPMIInterfaceClass *k = IPMI_INTERFACE_GET_CLASS(s);
+    bool do_log = !IPMI_BMC_WATCHDOG_GET_DONT_LOG(ibs);
 
     if (!ibs->watchdog_running) {
         goto out;
@@ -708,14 +769,16 @@ static void ipmi_sim_handle_timeout(IPMIBmcSim *ibs)
             ibs->msg_flags |= IPMI_BMC_MSG_FLAG_WATCHDOG_TIMEOUT_MASK;
             k->do_hw_op(s, IPMI_SEND_NMI, 0);
             sensor_set_discrete_bit(ibs, IPMI_WATCHDOG_SENSOR, 8, 1,
-                                    0xc8, (2 << 4) | 0xf, 0xff);
+                                    0xc8, (2 << 4) | 0xf, 0xff,
+                                    do_log);
             break;
 
         case IPMI_BMC_WATCHDOG_PRE_MSG_INT:
             ibs->msg_flags |= IPMI_BMC_MSG_FLAG_WATCHDOG_TIMEOUT_MASK;
             k->set_atn(s, 1, attn_irq_enabled(ibs));
             sensor_set_discrete_bit(ibs, IPMI_WATCHDOG_SENSOR, 8, 1,
-                                    0xc8, (3 << 4) | 0xf, 0xff);
+                                    0xc8, (3 << 4) | 0xf, 0xff,
+                                    do_log);
             break;
 
         default:
@@ -735,24 +798,28 @@ static void ipmi_sim_handle_timeout(IPMIBmcSim *ibs)
     switch (IPMI_BMC_WATCHDOG_GET_ACTION(ibs)) {
     case IPMI_BMC_WATCHDOG_ACTION_NONE:
         sensor_set_discrete_bit(ibs, IPMI_WATCHDOG_SENSOR, 0, 1,
-                                0xc0, ibs->watchdog_use & 0xf, 0xff);
+                                0xc0, ibs->watchdog_use & 0xf, 0xff,
+                                do_log);
         break;
 
     case IPMI_BMC_WATCHDOG_ACTION_RESET:
         sensor_set_discrete_bit(ibs, IPMI_WATCHDOG_SENSOR, 1, 1,
-                                0xc1, ibs->watchdog_use & 0xf, 0xff);
+                                0xc1, ibs->watchdog_use & 0xf, 0xff,
+                                do_log);
         k->do_hw_op(s, IPMI_RESET_CHASSIS, 0);
         break;
 
     case IPMI_BMC_WATCHDOG_ACTION_POWER_DOWN:
         sensor_set_discrete_bit(ibs, IPMI_WATCHDOG_SENSOR, 2, 1,
-                                0xc2, ibs->watchdog_use & 0xf, 0xff);
+                                0xc2, ibs->watchdog_use & 0xf, 0xff,
+                                do_log);
         k->do_hw_op(s, IPMI_POWEROFF_CHASSIS, 0);
         break;
 
     case IPMI_BMC_WATCHDOG_ACTION_POWER_CYCLE:
         sensor_set_discrete_bit(ibs, IPMI_WATCHDOG_SENSOR, 2, 1,
-                                0xc3, ibs->watchdog_use & 0xf, 0xff);
+                                0xc3, ibs->watchdog_use & 0xf, 0xff,
+                                do_log);
         k->do_hw_op(s, IPMI_POWERCYCLE_CHASSIS, 0);
         break;
     }
@@ -923,7 +990,14 @@ static void set_bmc_global_enables(IPMIBmcSim *ibs,
                                    uint8_t *cmd, unsigned int cmd_len,
                                    RspBuffer *rsp)
 {
-    set_global_enables(ibs, cmd[2]);
+    uint8_t val = cmd[2];
+
+    if (val & ~IPMI_BMC_GLOBAL_ENABLES_SUPPORTED) {
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+        return;
+    }
+
+    set_global_enables(ibs, val);
 }
 
 static void get_bmc_global_enables(IPMIBmcSim *ibs,
@@ -978,7 +1052,7 @@ static void get_msg(IPMIBmcSim *ibs,
 
     if (QTAILQ_EMPTY(&ibs->rcvbufs)) {
         rsp_buffer_set_error(rsp, 0x80); /* Queue empty */
-        goto out;
+        return;
     }
     rsp_buffer_push(rsp, 0); /* Channel 0 */
     msg = QTAILQ_FIRST(&ibs->rcvbufs);
@@ -993,9 +1067,6 @@ static void get_msg(IPMIBmcSim *ibs,
         ibs->msg_flags &= ~IPMI_BMC_MSG_FLAG_RCV_MSG_QUEUE;
         k->set_atn(s, attn_set(ibs), attn_irq_enabled(ibs));
     }
-
-out:
-    return;
 }
 
 static unsigned char
@@ -1018,8 +1089,8 @@ static void send_msg(IPMIBmcSim *ibs,
     uint8_t *buf;
     uint8_t netfn, rqLun, rsLun, rqSeq;
 
-    if (cmd[2] != 0) {
-        /* We only handle channel 0 with no options */
+    if (cmd[2] != IPMI_CHANNEL_IPMB) {
+        /* We only handle channel 0h (IPMB) with no options */
         rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
         return;
     }
@@ -1214,6 +1285,87 @@ static void get_watchdog_timer(IPMIBmcSim *ibs,
     } else {
         rsp_buffer_push(rsp, 0);
         rsp_buffer_push(rsp, 0);
+    }
+}
+
+static void get_channel_access(IPMIBmcSim *ibs,
+                               uint8_t *cmd, unsigned int cmd_len,
+                               RspBuffer *rsp)
+{
+    uint8_t channel = cmd[2] & 0xf;
+
+    if (channel == IPMI_CHANNEL_IPMB || channel == IPMI_CHANNEL_SYSTEM ||
+        IPMI_BMC_CHANNEL_IS_LAN(ibs, channel)) {
+        /* alerting disabled */
+        /* per message authentication disabled */
+        /* user level authentication disabled */
+        /* channel always available */
+        rsp_buffer_push(rsp, 0x20 | 0x10 | 0x08 | 0x02);
+        rsp_buffer_push(rsp, 0x04);  /* privilege limit: ADMINISTRATOR */
+    } else {
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+    }
+}
+
+static void get_channel_info(IPMIBmcSim *ibs,
+                             uint8_t *cmd, unsigned int cmd_len,
+                             RspBuffer *rsp)
+{
+    IPMIInterface *s = ibs->parent.intf;
+    IPMIInterfaceClass *k = IPMI_INTERFACE_GET_CLASS(s);
+    IPMIFwInfo info = {};
+    uint8_t ch = cmd[2] & 0x0f;
+
+    if (ch == 0x0e) { /* "This channel" */
+        ch = IPMI_CHANNEL_SYSTEM;
+    }
+    rsp_buffer_push(rsp, ch);
+
+    if (k->get_fwinfo) {
+        k->get_fwinfo(s, &info);
+    }
+
+    /* Only define channel 0h (IPMB), LAN, and Fh (system interface) */
+    if (ch == IPMI_CHANNEL_IPMB) {
+        rsp_buffer_push(rsp, IPMI_CHANNEL_MEDIUM_IPMB);
+        rsp_buffer_push(rsp, IPMI_CHANNEL_PROTOCOL_IPMB);
+    } else if (IPMI_BMC_CHANNEL_IS_LAN(ibs, ch)) {
+        rsp_buffer_push(rsp, IPMI_CHANNEL_MEDIUM_802_3_LAN);
+        rsp_buffer_push(rsp, IPMI_CHANNEL_PROTOCOL_IPMB);
+    } else if (ch == IPMI_CHANNEL_SYSTEM) {
+        rsp_buffer_push(rsp, IPMI_CHANNEL_MEDIUM_SYSTEM);
+        rsp_buffer_push(rsp, info.ipmi_channel_protocol);
+    } else {
+        /* Not a supported channel */
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+        return;
+    }
+
+    rsp_buffer_push(rsp, 0x00); /* Session-less */
+
+    /* IPMI Enterprise Number for Vendor ID */
+    rsp_buffer_push(rsp, 0xf2);
+    rsp_buffer_push(rsp, 0x1b);
+    rsp_buffer_push(rsp, 0x00);
+
+    if (ch == IPMI_CHANNEL_SYSTEM) {
+        uint8_t irq;
+
+        if (info.irq_source == IPMI_ISA_IRQ) {
+            irq = info.interrupt_number;
+        } else if (info.irq_source == IPMI_PCI_IRQ) {
+            irq = 0x10 + info.interrupt_number;
+        } else {
+            irq = 0xff; /* no interrupt / unspecified */
+        }
+
+        /* Both interrupts use the same irq number */
+        rsp_buffer_push(rsp, irq);
+        rsp_buffer_push(rsp, irq);
+    } else {
+        /* Reserved */
+        rsp_buffer_push(rsp, 0x00);
+        rsp_buffer_push(rsp, 0x00);
     }
 }
 
@@ -1747,6 +1899,463 @@ static void get_sensor_type(IPMIBmcSim *ibs,
     rsp_buffer_push(rsp, sens->evt_reading_type_code);
 }
 
+/*
+ * bytes   parameter
+ *    1    sensor number
+ *    2    operation (see below for bits meaning)
+ *    3    sensor reading
+ *  4:5    assertion states (optional)
+ *  6:7    deassertion states (optional)
+ *  8:10   event data 1,2,3 (optional)
+ */
+static void set_sensor_reading(IPMIBmcSim *ibs,
+                               uint8_t *cmd, unsigned int cmd_len,
+                               RspBuffer *rsp)
+{
+    IPMISensor *sens;
+    uint8_t evd1 = 0;
+    uint8_t evd2 = 0;
+    uint8_t evd3 = 0;
+    uint8_t new_reading = 0;
+    uint16_t new_assert_states = 0;
+    uint16_t new_deassert_states = 0;
+    bool change_reading = false;
+    bool change_assert = false;
+    bool change_deassert = false;
+    enum {
+        SENSOR_GEN_EVENT_NONE,
+        SENSOR_GEN_EVENT_DATA,
+        SENSOR_GEN_EVENT_BMC,
+    } do_gen_event = SENSOR_GEN_EVENT_NONE;
+
+    if ((cmd[2] >= MAX_SENSORS) ||
+            !IPMI_SENSOR_GET_PRESENT(ibs->sensors + cmd[2])) {
+        rsp_buffer_set_error(rsp, IPMI_CC_REQ_ENTRY_NOT_PRESENT);
+        return;
+    }
+
+    sens = ibs->sensors + cmd[2];
+
+    /* [1:0] Sensor Reading operation */
+    switch ((cmd[3]) & 0x3) {
+    case 0: /* Do not change */
+        break;
+    case 1: /* write given value to sensor reading byte */
+        new_reading = cmd[4];
+        if (sens->reading != new_reading) {
+            change_reading = true;
+        }
+        break;
+    case 2:
+    case 3:
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+        return;
+    }
+
+    /* [3:2] Deassertion bits operation */
+    switch ((cmd[3] >> 2) & 0x3) {
+    case 0: /* Do not change */
+        break;
+    case 1: /* write given value */
+        if (cmd_len > 7) {
+            new_deassert_states = cmd[7];
+            change_deassert = true;
+        }
+        if (cmd_len > 8) {
+            new_deassert_states |= (cmd[8] << 8);
+        }
+        break;
+
+    case 2: /* mask on */
+        if (cmd_len > 7) {
+            new_deassert_states = (sens->deassert_states | cmd[7]);
+            change_deassert = true;
+        }
+        if (cmd_len > 8) {
+            new_deassert_states |= (sens->deassert_states | (cmd[8] << 8));
+        }
+        break;
+
+    case 3: /* mask off */
+        if (cmd_len > 7) {
+            new_deassert_states = (sens->deassert_states & cmd[7]);
+            change_deassert = true;
+        }
+        if (cmd_len > 8) {
+            new_deassert_states |= (sens->deassert_states & (cmd[8] << 8));
+        }
+        break;
+    }
+
+    if (change_deassert && (new_deassert_states == sens->deassert_states)) {
+        change_deassert = false;
+    }
+
+    /* [5:4] Assertion bits operation */
+    switch ((cmd[3] >> 4) & 0x3) {
+    case 0: /* Do not change */
+        break;
+    case 1: /* write given value */
+        if (cmd_len > 5) {
+            new_assert_states = cmd[5];
+            change_assert = true;
+        }
+        if (cmd_len > 6) {
+            new_assert_states |= (cmd[6] << 8);
+        }
+        break;
+
+    case 2: /* mask on */
+        if (cmd_len > 5) {
+            new_assert_states = (sens->assert_states | cmd[5]);
+            change_assert = true;
+        }
+        if (cmd_len > 6) {
+            new_assert_states |= (sens->assert_states | (cmd[6] << 8));
+        }
+        break;
+
+    case 3: /* mask off */
+        if (cmd_len > 5) {
+            new_assert_states = (sens->assert_states & cmd[5]);
+            change_assert = true;
+        }
+        if (cmd_len > 6) {
+            new_assert_states |= (sens->assert_states & (cmd[6] << 8));
+        }
+        break;
+    }
+
+    if (change_assert && (new_assert_states == sens->assert_states)) {
+        change_assert = false;
+    }
+
+    if (cmd_len > 9) {
+        evd1 = cmd[9];
+    }
+    if (cmd_len > 10) {
+        evd2 = cmd[10];
+    }
+    if (cmd_len > 11) {
+        evd3 = cmd[11];
+    }
+
+    /* [7:6] Event Data Bytes operation */
+    switch ((cmd[3] >> 6) & 0x3) {
+    case 0: /*
+             * Don’t use Event Data bytes from this command. BMC will
+             * generate it's own Event Data bytes based on its sensor
+             * implementation.
+             */
+        evd1 = evd2 = evd3 = 0x0;
+        do_gen_event = SENSOR_GEN_EVENT_BMC;
+        break;
+    case 1: /*
+             * Write given values to event data bytes including bits
+             * [3:0] Event Data 1.
+             */
+        do_gen_event = SENSOR_GEN_EVENT_DATA;
+        break;
+    case 2: /*
+             * Write given values to event data bytes excluding bits
+             * [3:0] Event Data 1.
+             */
+        evd1 &= 0xf0;
+        do_gen_event = SENSOR_GEN_EVENT_DATA;
+        break;
+    case 3:
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+        return;
+    }
+
+    /*
+     * Event Data Bytes operation and parameter are inconsistent. The
+     * Specs are not clear on that topic but generating an error seems
+     * correct.
+     */
+    if (do_gen_event == SENSOR_GEN_EVENT_DATA && cmd_len < 10) {
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+        return;
+    }
+
+    /* commit values */
+    if (change_reading) {
+        sens->reading = new_reading;
+    }
+
+    if (change_assert) {
+        sens->assert_states = new_assert_states;
+    }
+
+    if (change_deassert) {
+        sens->deassert_states = new_deassert_states;
+    }
+
+    /* TODO: handle threshold sensor */
+    if (!IPMI_SENSOR_IS_DISCRETE(sens)) {
+        return;
+    }
+
+    switch (do_gen_event) {
+    case SENSOR_GEN_EVENT_DATA: {
+        unsigned int bit = evd1 & 0xf;
+        uint16_t mask = (1 << bit);
+
+        if (sens->assert_states & mask & sens->assert_enable) {
+            gen_event(ibs, cmd[2], 0, evd1, evd2, evd3);
+        }
+
+        if (sens->deassert_states & mask & sens->deassert_enable) {
+            gen_event(ibs, cmd[2], 1, evd1, evd2, evd3);
+        }
+        break;
+    }
+    case SENSOR_GEN_EVENT_BMC:
+        /*
+         * TODO: generate event and event data bytes depending on the
+         * sensor
+         */
+        break;
+    case SENSOR_GEN_EVENT_NONE:
+        break;
+    }
+}
+
+static inline bool is_ipv4_netmask_valid(const void *buf)
+{
+    uint32_t netmask = ldl_be_p(buf);
+
+    return netmask != 0 && clo32(netmask) + ctz32(netmask) == 32;
+}
+
+/*
+ * Request data (from cmd[2] on):
+ * bytes   meaning
+ *    1    [bits 3:0] channel number
+ *    2    parameter selector
+ * [3:N]   configuration parameter data (from cmd[4] on)
+ */
+static void set_lan_config(IPMIBmcSim *ibs,
+                           uint8_t *cmd, unsigned int cmd_len,
+                           RspBuffer *rsp)
+{
+    uint8_t channel;
+    uint8_t *param;  /* pointer to configuration parameter data */
+    unsigned int param_len;
+
+    if (ibs->lan.channel == 0) {
+        /* LAN channel disabled. Fail as if this command were not defined. */
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_CMD);
+        return;
+    }
+    if (cmd_len < 5) {
+        rsp_buffer_set_error(rsp, IPMI_CC_REQUEST_DATA_LENGTH_INVALID);
+        return;
+    }
+    channel = cmd[2] & 0xf;
+    param = cmd + 4;
+    param_len = cmd_len - 4;
+
+    if (!IPMI_BMC_CHANNEL_IS_LAN(ibs, channel)) {
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+        return;
+    }
+
+    switch (cmd[3]) {
+    case IPMI_BMC_LAN_CFG_PARAM_IP_ADDR:
+        if (param_len < NBYTES_IP) {
+            rsp_buffer_set_error(rsp, IPMI_CC_REQUEST_DATA_LENGTH_INVALID);
+            return;
+        }
+        memcpy(ibs->lan.ipaddr, param, NBYTES_IP);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_IP_ADDR_SOURCE:
+        if (param_len < 1) {
+            rsp_buffer_set_error(rsp, IPMI_CC_REQUEST_DATA_LENGTH_INVALID);
+            return;
+        }
+        if (!IPMI_BMC_LAN_CFG_IS_VALID_IP_SOURCE(*param)) {
+            rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+            return;
+        }
+        ibs->lan.ipsrc = *param;
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_MAC_ADDR:
+        if (param_len < NBYTES_MAC) {
+            rsp_buffer_set_error(rsp, IPMI_CC_REQUEST_DATA_LENGTH_INVALID);
+            return;
+        }
+        memcpy(ibs->lan.macaddr.a, param, NBYTES_MAC);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_SUBNET_MASK:
+        if (param_len < NBYTES_IP) {
+            rsp_buffer_set_error(rsp, IPMI_CC_REQUEST_DATA_LENGTH_INVALID);
+            return;
+        }
+        if (!is_ipv4_netmask_valid(param)) {
+            rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+            return;
+        }
+        memcpy(ibs->lan.netmask, param, NBYTES_IP);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_DEFAULT_GW_IP_ADDR:
+        if (param_len < NBYTES_IP) {
+            rsp_buffer_set_error(rsp, IPMI_CC_REQUEST_DATA_LENGTH_INVALID);
+            return;
+        }
+        memcpy(ibs->lan.defgw_ipaddr, param, NBYTES_IP);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_DEFAULT_GW_MAC_ADDR:
+        if (param_len < NBYTES_MAC) {
+            rsp_buffer_set_error(rsp, IPMI_CC_REQUEST_DATA_LENGTH_INVALID);
+            return;
+        }
+        memcpy(ibs->lan.defgw_macaddr.a, param, NBYTES_MAC);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_SET_IN_PROGRESS:
+    case IPMI_BMC_LAN_CFG_PARAM_AUTH_TYPE_SUPPORT:
+    case IPMI_BMC_LAN_CFG_PARAM_AUTH_TYPE_ENABLES:
+    case IPMI_BMC_LAN_CFG_PARAM_IPV4_HDR_PARAMS:
+    case IPMI_BMC_LAN_CFG_PARAM_BACKUP_GW_ADDR:
+    case IPMI_BMC_LAN_CFG_PARAM_BACKUP_GW_MAC_ADDR:
+    case IPMI_BMC_LAN_CFG_PARAM_COMMUNITY_STRING:
+    case IPMI_BMC_LAN_CFG_PARAM_NUM_DESTINATIONS:
+        rsp_buffer_set_error(rsp, IPMI_BMC_LAN_CFG_CC_PARAM_READONLY);
+        return;
+
+    default:
+        rsp_buffer_set_error(rsp, IPMI_BMC_LAN_CFG_CC_PARAM_NOT_SUPPORTED);
+        return;
+    }
+}
+
+/*
+ * Request data (from cmd[2] to cmd[5] inclusive):
+ * bytes   meaning
+ *    1    [bit 7] revision only flag, [bits 3:0] channel number
+ *    2    parameter selector
+ *    3    set selector
+ *    4    block selector
+ */
+static void get_lan_config(IPMIBmcSim *ibs,
+                           uint8_t *cmd, unsigned int cmd_len,
+                           RspBuffer *rsp)
+{
+    uint8_t channel;
+
+    if (ibs->lan.channel == 0) {
+        /* LAN channel disabled. Fail as if this command were not defined. */
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_CMD);
+        return;
+    }
+    if (cmd_len < 6) {
+        rsp_buffer_set_error(rsp, IPMI_CC_REQUEST_DATA_LENGTH_INVALID);
+        return;
+    }
+    channel = cmd[2] & 0xf;
+
+    rsp_buffer_push(rsp, IPMI_BMC_LAN_CFG_PARAMETER_REVISION);
+    if (cmd[2] & 0x80) {
+        /* The requester only requests parameter revision, not the parameter */
+        return;
+    }
+    if (!IPMI_BMC_CHANNEL_IS_LAN(ibs, channel)) {
+        rsp_buffer_set_error(rsp, IPMI_CC_INVALID_DATA_FIELD);
+        return;
+    }
+
+    switch (cmd[3]) {
+    case IPMI_BMC_LAN_CFG_PARAM_SET_IN_PROGRESS:
+        rsp_buffer_push(rsp, 0x0);  /* set complete */
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_AUTH_TYPE_SUPPORT:
+        rsp_buffer_push(rsp, 0x01); /* Authentication type "none" supported */
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_AUTH_TYPE_ENABLES:
+        /* Only authentication type "none" enabled */
+        rsp_buffer_push(rsp, 0x01); /* for privilege level "Callback" */
+        rsp_buffer_push(rsp, 0x01); /* for privilege level "User" */
+        rsp_buffer_push(rsp, 0x01); /* for privilege level "Operator" */
+        rsp_buffer_push(rsp, 0x01); /* for privilege level "Administrator" */
+        rsp_buffer_push(rsp, 0x01); /* for privilege level "OEM" */
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_IP_ADDR:
+        rsp_buffer_pushmore(rsp, ibs->lan.ipaddr, NBYTES_IP);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_IP_ADDR_SOURCE:
+        rsp_buffer_push(rsp, ibs->lan.ipsrc);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_MAC_ADDR:
+        rsp_buffer_pushmore(rsp, ibs->lan.macaddr.a, NBYTES_MAC);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_SUBNET_MASK:
+        rsp_buffer_pushmore(rsp, ibs->lan.netmask, NBYTES_IP);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_IPV4_HDR_PARAMS:
+        /* TTL 0x40 */
+        rsp_buffer_push(rsp, 0x40);
+        /* don't fragment */
+        rsp_buffer_push(rsp, 0x40);
+        /* precedence 0x0, minimize delay */
+        rsp_buffer_push(rsp, 0x10);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_DEFAULT_GW_IP_ADDR:
+        rsp_buffer_pushmore(rsp, ibs->lan.defgw_ipaddr, NBYTES_IP);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_DEFAULT_GW_MAC_ADDR:
+        rsp_buffer_pushmore(rsp, ibs->lan.defgw_macaddr.a, NBYTES_MAC);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_BACKUP_GW_ADDR:
+        /* 0.0.0.0 */
+        rsp_buffer_push(rsp, 0x00);
+        rsp_buffer_push(rsp, 0x00);
+        rsp_buffer_push(rsp, 0x00);
+        rsp_buffer_push(rsp, 0x00);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_BACKUP_GW_MAC_ADDR:
+        /* 00:00:00:00:00:00 */
+        rsp_buffer_push(rsp, 0x00);
+        rsp_buffer_push(rsp, 0x00);
+        rsp_buffer_push(rsp, 0x00);
+        rsp_buffer_push(rsp, 0x00);
+        rsp_buffer_push(rsp, 0x00);
+        rsp_buffer_push(rsp, 0x00);
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_COMMUNITY_STRING:
+        {
+            static uint8_t community_str[18] = "public";
+
+            rsp_buffer_pushmore(rsp, community_str, sizeof(community_str));
+        }
+        break;
+
+    case IPMI_BMC_LAN_CFG_PARAM_NUM_DESTINATIONS:
+        rsp_buffer_push(rsp, 0x00); /* LAN Alerting not supported */
+        break;
+
+    default:
+        rsp_buffer_set_error(rsp, IPMI_BMC_LAN_CFG_CC_PARAM_NOT_SUPPORTED);
+        return;
+    };
+}
 
 static const IPMICmdHandler chassis_cmds[] = {
     [IPMI_CMD_GET_CHASSIS_CAPABILITIES] = { chassis_capabilities },
@@ -1768,6 +2377,7 @@ static const IPMICmdHandler sensor_event_cmds[] = {
     [IPMI_CMD_GET_SENSOR_READING] = { get_sensor_reading, 3 },
     [IPMI_CMD_SET_SENSOR_TYPE] = { set_sensor_type, 5 },
     [IPMI_CMD_GET_SENSOR_TYPE] = { get_sensor_type, 3 },
+    [IPMI_CMD_SET_SENSOR_READING] = { set_sensor_reading, 5 },
 };
 static const IPMINetfn sensor_event_netfn = {
     .cmd_nums = ARRAY_SIZE(sensor_event_cmds),
@@ -1791,6 +2401,8 @@ static const IPMICmdHandler app_cmds[] = {
     [IPMI_CMD_RESET_WATCHDOG_TIMER] = { reset_watchdog_timer },
     [IPMI_CMD_SET_WATCHDOG_TIMER] = { set_watchdog_timer, 8 },
     [IPMI_CMD_GET_WATCHDOG_TIMER] = { get_watchdog_timer },
+    [IPMI_CMD_GET_CHANNEL_ACCESS] = { get_channel_access, 4 },
+    [IPMI_CMD_GET_CHANNEL_INFO] = { get_channel_info, 3 },
 };
 static const IPMINetfn app_netfn = {
     .cmd_nums = ARRAY_SIZE(app_cmds),
@@ -1820,12 +2432,23 @@ static const IPMINetfn storage_netfn = {
     .cmd_handlers = storage_cmds
 };
 
+static const IPMICmdHandler transport_cmds[] = {
+    [IPMI_CMD_SET_LAN_CONFIG] = { set_lan_config },
+    [IPMI_CMD_GET_LAN_CONFIG] = { get_lan_config },
+};
+static const IPMINetfn transport_netfn = {
+    .cmd_nums = ARRAY_SIZE(transport_cmds),
+    .cmd_handlers = transport_cmds
+};
+
+
 static void register_cmds(IPMIBmcSim *s)
 {
     ipmi_sim_register_netfn(s, IPMI_NETFN_CHASSIS, &chassis_netfn);
     ipmi_sim_register_netfn(s, IPMI_NETFN_SENSOR_EVENT, &sensor_event_netfn);
     ipmi_sim_register_netfn(s, IPMI_NETFN_APP, &app_netfn);
     ipmi_sim_register_netfn(s, IPMI_NETFN_STORAGE, &storage_netfn);
+    ipmi_sim_register_netfn(s, IPMI_NETFN_TRANSPORT, &transport_netfn);
 }
 
 static uint8_t init_sdrs[] = {
@@ -1875,18 +2498,34 @@ static void ipmi_sdr_init(IPMIBmcSim *ibs)
     }
 }
 
-static const VMStateDescription vmstate_ipmi_sim = {
-    .name = TYPE_IPMI_BMC_SIMULATOR,
+static const VMStateDescription vmstate_ipmi_sim_lan = {
+    .name = TYPE_IPMI_BMC_SIMULATOR "-lan",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields      = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(channel, IPMILan),
+        VMSTATE_UINT8_ARRAY(ipaddr, IPMILan, NBYTES_IP),
+        VMSTATE_UINT8(ipsrc, IPMILan),
+        VMSTATE_UINT8_ARRAY(macaddr.a, IPMILan, NBYTES_MAC),
+        VMSTATE_UINT8_ARRAY(netmask, IPMILan, NBYTES_IP),
+        VMSTATE_UINT8_ARRAY(defgw_ipaddr, IPMILan, NBYTES_IP),
+        VMSTATE_UINT8_ARRAY(defgw_macaddr.a, IPMILan, NBYTES_MAC),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_ipmi_sim = {
+    .name = TYPE_IPMI_BMC_SIMULATOR,
+    .version_id = 2,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT8(bmc_global_enables, IPMIBmcSim),
         VMSTATE_UINT8(msg_flags, IPMIBmcSim),
         VMSTATE_BOOL(watchdog_initialized, IPMIBmcSim),
         VMSTATE_UINT8(watchdog_use, IPMIBmcSim),
         VMSTATE_UINT8(watchdog_action, IPMIBmcSim),
         VMSTATE_UINT8(watchdog_pretimeout, IPMIBmcSim),
-        VMSTATE_BOOL(watchdog_expired, IPMIBmcSim),
+        VMSTATE_UINT8(watchdog_expired, IPMIBmcSim),
         VMSTATE_UINT16(watchdog_timeout, IPMIBmcSim),
         VMSTATE_BOOL(watchdog_running, IPMIBmcSim),
         VMSTATE_BOOL(watchdog_preaction_ran, IPMIBmcSim),
@@ -1899,6 +2538,7 @@ static const VMStateDescription vmstate_ipmi_sim = {
         VMSTATE_UINT16(sensors[IPMI_WATCHDOG_SENSOR].deassert_states,
                        IPMIBmcSim),
         VMSTATE_UINT16(sensors[IPMI_WATCHDOG_SENSOR].assert_enable, IPMIBmcSim),
+        VMSTATE_STRUCT(lan, IPMIBmcSim, 2, vmstate_ipmi_sim_lan, IPMILan),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -1912,7 +2552,7 @@ static void ipmi_fru_init(IPMIFru *fru)
         goto out;
     }
 
-    fsize = get_image_size(fru->filename);
+    fsize = get_image_size(fru->filename, NULL);
     if (fsize > 0) {
         size = QEMU_ALIGN_UP(fsize, fru->areasize);
         fru->data = g_malloc0(size);
@@ -1921,6 +2561,8 @@ static void ipmi_fru_init(IPMIFru *fru)
             g_free(fru->data);
             fru->data = NULL;
         }
+    } else {
+        error_report("Could not get file size '%s'", fru->filename);
     }
 
 out:
@@ -1931,6 +2573,47 @@ out:
     }
 
     fru->nentries = size / fru->areasize;
+}
+
+static void ipmi_lan_init(IPMILan *lan, Error **errp)
+{
+    struct in_addr ip;
+
+    /*
+     * `lan->channel` can be either 0 (meaning LAN channel disabled) or
+     * a valid IPMI implementation-specific channel.
+     */
+    if (lan->channel != 0 &&
+        !IPMI_CHANNEL_IS_IMPLEMENTATION_SPECIFIC(lan->channel)) {
+        error_setg(errp, "invalid LAN channel %d", lan->channel);
+        return;
+    }
+    if (lan->arg_ipaddr) {
+        if (inet_pton(AF_INET, lan->arg_ipaddr, &ip) != 1) {
+            error_setg(errp, "invalid ip address '%s'", lan->arg_ipaddr);
+            return;
+        }
+        memcpy(lan->ipaddr, &ip.s_addr, NBYTES_IP);
+    }
+    if (!IPMI_BMC_LAN_CFG_IS_VALID_IP_SOURCE(lan->ipsrc)) {
+        error_setg(errp, "invalid ip source %d", lan->ipsrc);
+        return;
+    }
+    if (lan->arg_netmask) {
+        if (inet_pton(AF_INET, lan->arg_netmask, &ip) != 1 ||
+            !is_ipv4_netmask_valid(&ip.s_addr)) {
+            error_setg(errp, "invalid subnet mask '%s'", lan->arg_netmask);
+            return;
+        }
+        memcpy(lan->netmask, &ip.s_addr, NBYTES_IP);
+    }
+    if (lan->arg_defgw_ipaddr) {
+        if (inet_pton(AF_INET, lan->arg_defgw_ipaddr, &ip) != 1) {
+            error_setg(errp, "invalid ip address '%s'", lan->arg_defgw_ipaddr);
+            return;
+        }
+        memcpy(lan->defgw_ipaddr, &ip.s_addr, NBYTES_IP);
+    }
 }
 
 static void ipmi_sim_realize(DeviceState *dev, Error **errp)
@@ -1960,14 +2643,15 @@ static void ipmi_sim_realize(DeviceState *dev, Error **errp)
     ibs->acpi_power_state[1] = 0;
 
     ipmi_init_sensors_from_sdrs(ibs);
+
+    ipmi_lan_init(&ibs->lan, errp);
+
     register_cmds(ibs);
 
     ibs->timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ipmi_timeout, ibs);
-
-    vmstate_register(NULL, 0, &vmstate_ipmi_sim, ibs);
 }
 
-static Property ipmi_sim_properties[] = {
+static const Property ipmi_sim_properties[] = {
     DEFINE_PROP_UINT16("fruareasize", IPMIBmcSim, fru.areasize, 1024),
     DEFINE_PROP_STRING("frudatafile", IPMIBmcSim, fru.filename),
     DEFINE_PROP_STRING("sdrfile", IPMIBmcSim, sdr_filename),
@@ -1979,16 +2663,23 @@ static Property ipmi_sim_properties[] = {
     DEFINE_PROP_UINT32("mfg_id", IPMIBmcSim, mfg_id, 0),
     DEFINE_PROP_UINT16("product_id", IPMIBmcSim, product_id, 0),
     DEFINE_PROP_UUID_NODEFAULT("guid", IPMIBmcSim, uuid),
-    DEFINE_PROP_END_OF_LIST(),
+    DEFINE_PROP_UINT8("lan.channel", IPMIBmcSim, lan.channel, 0),
+    DEFINE_PROP_STRING("lan.ipaddr", IPMIBmcSim, lan.arg_ipaddr),
+    DEFINE_PROP_UINT8("lan.ipsrc", IPMIBmcSim, lan.ipsrc, 0),
+    DEFINE_PROP_MACADDR("lan.macaddr", IPMIBmcSim, lan.macaddr),
+    DEFINE_PROP_STRING("lan.netmask", IPMIBmcSim, lan.arg_netmask),
+    DEFINE_PROP_STRING("lan.defgw_ipaddr", IPMIBmcSim, lan.arg_defgw_ipaddr),
+    DEFINE_PROP_MACADDR("lan.defgw_macaddr", IPMIBmcSim, lan.defgw_macaddr),
 };
 
-static void ipmi_sim_class_init(ObjectClass *oc, void *data)
+static void ipmi_sim_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     IPMIBmcClass *bk = IPMI_BMC_CLASS(oc);
 
     dc->hotpluggable = false;
     dc->realize = ipmi_sim_realize;
+    dc->vmsd = &vmstate_ipmi_sim;
     device_class_set_props(dc, ipmi_sim_properties);
     bk->handle_command = ipmi_sim_handle_command;
 }

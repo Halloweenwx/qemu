@@ -13,29 +13,25 @@
 
 /* #define DEBUG */
 
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+
 typedef unsigned char      u8;
 typedef unsigned short     u16;
 typedef unsigned int       u32;
 typedef unsigned long long u64;
-typedef unsigned long      ulong;
-typedef unsigned char      __u8;
-typedef unsigned short     __u16;
-typedef unsigned int       __u32;
-typedef unsigned long long __u64;
 
 #define true 1
 #define false 0
 #define PAGE_SIZE 4096
 
-#ifndef EIO
 #define EIO     1
-#endif
-#ifndef EBUSY
 #define EBUSY   2
-#endif
-#ifndef NULL
-#define NULL    0
-#endif
+#define ENODEV  3
+#define EINVAL  4
+
 #ifndef MIN
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 #endif
@@ -44,54 +40,81 @@ typedef unsigned long long __u64;
                             ((b) == 0 ? (a) : (MIN(a, b))))
 #endif
 
+/*
+ * Round number down to multiple. Requires that d be a power of 2.
+ * Works even if d is a smaller type than n.
+ */
+#ifndef ROUND_DOWN
+#define ROUND_DOWN(n, d) ((n) & -(0 ? (n) : (d)))
+#endif
+
+/*
+ * Round number up to multiple. Requires that d be a power of 2.
+ * Works even if d is a smaller type than n.
+ */
+#ifndef ROUND_UP
+#define ROUND_UP(n, d) ROUND_DOWN((n) + (d) - 1, (d))
+#endif
+
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 
 #include "cio.h"
 #include "iplb.h"
 
 /* start.s */
-void disabled_wait(void);
+void disabled_wait(void) __attribute__ ((__noreturn__));
 void consume_sclp_int(void);
 void consume_io_int(void);
 
 /* main.c */
-void panic(const char *string);
 void write_subsystem_identification(void);
 void write_iplb_location(void);
-extern char stack[PAGE_SIZE * 8] __attribute__((__aligned__(PAGE_SIZE)));
 unsigned int get_loadparm_index(void);
+void main(void);
+
+/* netmain.c */
+int netmain(void);
 
 /* sclp.c */
 void sclp_print(const char *string);
 void sclp_set_write_mask(uint32_t receive_mask, uint32_t send_mask);
 void sclp_setup(void);
 void sclp_get_loadparm_ascii(char *loadparm);
+bool sclp_is_diag320_on(void);
+bool sclp_is_fac_ipl_flag_on(uint16_t fac_ipl_flag);
 int sclp_read(char *str, size_t count);
-
-/* virtio.c */
-unsigned long virtio_load_direct(ulong rec_list1, ulong rec_list2,
-                                 ulong subchan_id, void *load_addr);
-bool virtio_is_supported(SubChannelId schid);
-void virtio_blk_setup_device(SubChannelId schid);
-int virtio_read(ulong sector, void *load_addr);
-u64 get_clock(void);
-ulong get_second(void);
 
 /* bootmap.c */
 void zipl_load(void);
 
+typedef enum ZiplBootMode {
+    ZIPL_BOOT_MODE_NORMAL = 0,
+    ZIPL_BOOT_MODE_SECURE_AUDIT = 1,
+    ZIPL_BOOT_MODE_SECURE = 2,
+} ZiplBootMode;
+
+extern ZiplBootMode boot_mode;
+ZiplBootMode get_boot_mode(uint8_t hdr_flags);
+
 /* jump2ipl.c */
-void jump_to_IPL_code(uint64_t address);
+void write_reset_psw(uint64_t psw);
+int jump_to_IPL_code(uint64_t address);
 void jump_to_low_kernel(void);
 
 /* menu.c */
 void menu_set_parms(uint8_t boot_menu_flag, uint32_t boot_menu_timeout);
-int menu_get_zipl_boot_index(const char *menu_data);
+int menu_get_zipl_boot_index(const char *menu_data, const char *menu_data_end);
 bool menu_is_enabled_zipl(void);
 int menu_get_enum_boot_index(bool *valid_entries);
 bool menu_is_enabled_enum(void);
+int menu_get_boot_index(bool *valid_entries);
 
-#define MAX_BOOT_ENTRIES  31
+__attribute__ ((__noreturn__))
+static inline void panic(const char *string)
+{
+    printf("ERROR: %s\n ", string);
+    disabled_wait();
+}
 
 static inline void fill_hex(char *out, unsigned char val)
 {
@@ -111,20 +134,10 @@ static inline void fill_hex_val(char *out, void *ptr, unsigned size)
     }
 }
 
-static inline void print_int(const char *desc, u64 addr)
-{
-    char out[] = ": 0xffffffffffffffff\n";
-
-    fill_hex_val(&out[4], &addr, sizeof(addr));
-
-    sclp_print(desc);
-    sclp_print(out);
-}
-
 static inline void debug_print_int(const char *desc, u64 addr)
 {
 #ifdef DEBUG
-    print_int(desc, addr);
+    printf("%s 0x%llx\n", desc, addr);
 #endif
 }
 
@@ -144,39 +157,19 @@ static inline void debug_print_addr(const char *desc, void *p)
 #define KVM_S390_VIRTIO_SET_STATUS      2
 #define KVM_S390_VIRTIO_CCW_NOTIFY      3
 
-static inline void yield(void)
-{
-    asm volatile ("diag 0,0,0x44"
-                  : :
-                  : "memory", "cc");
-}
-
 #define MAX_SECTOR_SIZE 4096
-
-static inline void sleep(unsigned int seconds)
-{
-    ulong target = get_second() + seconds;
-
-    while (get_second() < target) {
-        yield();
-    }
-}
 
 static inline void IPL_assert(bool term, const char *message)
 {
     if (!term) {
-        sclp_print("\n! ");
-        sclp_print(message);
-        panic(" !\n"); /* no return */
+        panic(message); /* no return */
     }
 }
 
 static inline void IPL_check(bool term, const char *message)
 {
     if (!term) {
-        sclp_print("\n! WARNING: ");
-        sclp_print(message);
-        sclp_print(" !\n");
+        printf("WARNING: %s\n", message);
     }
 }
 

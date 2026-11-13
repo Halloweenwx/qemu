@@ -26,15 +26,13 @@
 #ifndef QEMU_CO_SHARED_RESOURCE_H
 #define QEMU_CO_SHARED_RESOURCE_H
 
-
+/* Accesses to co-shared-resource API are thread-safe */
 typedef struct SharedResource SharedResource;
 
 /*
  * Create SharedResource structure
  *
  * @total: total amount of some resource to be shared between clients
- *
- * Note: this API is not thread-safe.
  */
 SharedResource *shres_create(uint64_t total);
 
@@ -45,13 +43,6 @@ SharedResource *shres_create(uint64_t total);
  * clients has been deallocated.
  */
 void shres_destroy(SharedResource *s);
-
-/*
- * Try to allocate an amount of @n.  Return true on success, and false
- * if there is too little left of the collective resource to fulfill
- * the request.
- */
-bool co_try_get_from_shres(SharedResource *s, uint64_t n);
 
 /*
  * Allocate an amount of @n, and, if necessary, yield until

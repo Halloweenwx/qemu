@@ -20,21 +20,22 @@
  * specification.
  *
  * TPM TIS for TPM 2 implementation following TCG PC Client Platform
- * TPM Profile (PTP) Specification, Familiy 2.0, Revision 00.43
+ * TPM Profile (PTP) Specification, Family 2.0, Revision 00.43
  */
 #include "qemu/osdep.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "hw/isa/isa.h"
 #include "qapi/error.h"
+#include "qemu/bswap.h"
+#include "qemu/crc-ccitt.h"
 #include "qemu/module.h"
 
 #include "hw/acpi/tpm.h"
 #include "hw/pci/pci_ids.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
-#include "sysemu/tpm_backend.h"
-#include "tpm_int.h"
-#include "tpm_util.h"
+#include "system/tpm_backend.h"
+#include "system/tpm_util.h"
 #include "tpm_ppi.h"
 #include "trace.h"
 
@@ -51,7 +52,12 @@ static uint64_t tpm_tis_mmio_read(void *opaque, hwaddr addr,
 
 static uint8_t tpm_tis_locality_from_addr(hwaddr addr)
 {
-    return (uint8_t)((addr >> TPM_TIS_LOCALITY_SHIFT) & 0x7);
+    uint8_t locty;
+
+    locty = (uint8_t)((addr >> TPM_TIS_LOCALITY_SHIFT) & 0x7);
+    assert(TPM_TIS_IS_VALID_LOCTY(locty));
+
+    return locty;
 }
 
 
@@ -79,9 +85,7 @@ static void tpm_tis_sts_set(TPMLocality *l, uint32_t flags)
  */
 static void tpm_tis_tpm_send(TPMState *s, uint8_t locty)
 {
-    if (trace_event_get_state_backends(TRACE_TPM_UTIL_SHOW_BUFFER)) {
-        tpm_util_show_buffer(s->buffer, s->be_buffer_size, "To TPM");
-    }
+    tpm_util_show_buffer(s->buffer, s->be_buffer_size, "To TPM");
 
     /*
      * rw_offset serves as length indicator for length of data;
@@ -247,9 +251,7 @@ void tpm_tis_request_completed(TPMState *s, int ret)
     s->loc[locty].state = TPM_TIS_STATE_COMPLETION;
     s->rw_offset = 0;
 
-    if (trace_event_get_state_backends(TRACE_TPM_UTIL_SHOW_BUFFER)) {
-        tpm_util_show_buffer(s->buffer, s->be_buffer_size, "From TPM");
-    }
+    tpm_util_show_buffer(s->buffer, s->be_buffer_size, "From TPM");
 
     if (TPM_TIS_IS_VALID_LOCTY(s->next_locty)) {
         tpm_tis_abort(s);
@@ -271,13 +273,15 @@ static uint32_t tpm_tis_data_read(TPMState *s, uint8_t locty)
         len = MIN(tpm_cmd_get_size(&s->buffer),
                   s->be_buffer_size);
 
-        ret = s->buffer[s->rw_offset++];
+        if (s->rw_offset < len) {
+            ret = s->buffer[s->rw_offset++];
+            trace_tpm_tis_data_read(ret, s->rw_offset - 1);
+        }
         if (s->rw_offset >= len) {
             /* got last byte */
             tpm_tis_sts_set(&s->loc[locty], TPM_TIS_STS_VALID);
             tpm_tis_raise_irq(s, locty, TPM_TIS_INT_STS_VALID);
         }
-        trace_tpm_tis_data_read(ret, s->rw_offset - 1);
     }
 
     return ret;
@@ -448,6 +452,23 @@ static uint64_t tpm_tis_mmio_read(void *opaque, hwaddr addr,
 }
 
 /*
+ * A wrapper read function so that it can be directly called without
+ * mmio.
+ */
+uint32_t tpm_tis_read_data(TPMState *s, hwaddr addr, unsigned size)
+{
+    return tpm_tis_mmio_read(s, addr, size);
+}
+
+/*
+ * Calculate current data buffer checksum
+ */
+uint16_t tpm_tis_get_checksum(TPMState *s)
+{
+    return bswap16(crc_ccitt(0, s->buffer, s->rw_offset));
+}
+
+/*
  * Write a value to a register of the TIS interface
  * See specs pages 33-63 for description of the registers
  */
@@ -460,7 +481,7 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
     uint8_t locty = tpm_tis_locality_from_addr(addr);
     uint8_t active_locty, l;
     int c, set_new_locty = 1;
-    uint16_t len;
+    uint32_t len;
     uint32_t mask = (size == 1) ? 0xff : ((size == 2) ? 0xffff : ~0);
 
     trace_tpm_tis_mmio_write(size, addr, val);
@@ -536,7 +557,7 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
             while ((TPM_TIS_IS_VALID_LOCTY(s->active_locty) &&
                     locty > s->active_locty) ||
                     !TPM_TIS_IS_VALID_LOCTY(s->active_locty)) {
-                bool higher_seize = FALSE;
+                bool higher_seize = false;
 
                 /* already a pending SEIZE ? */
                 if ((s->loc[locty].access & TPM_TIS_ACCESS_SEIZE)) {
@@ -546,7 +567,7 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
                 /* check for ongoing seize by a higher locality */
                 for (l = locty + 1; l < TPM_TIS_NUM_LOCALITIES; l++) {
                     if ((s->loc[l].access & TPM_TIS_ACCESS_SEIZE)) {
-                        higher_seize = TRUE;
+                        higher_seize = true;
                         break;
                     }
                 }
@@ -588,10 +609,6 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
 
         break;
     case TPM_TIS_REG_INT_ENABLE:
-        if (s->active_locty != locty) {
-            break;
-        }
-
         s->loc[locty].inte &= mask;
         s->loc[locty].inte |= (val & (TPM_TIS_INT_ENABLED |
                                         TPM_TIS_INT_POLARITY_MASK |
@@ -601,10 +618,6 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
         /* hard wired -- ignore */
         break;
     case TPM_TIS_REG_INT_STATUS:
-        if (s->active_locty != locty) {
-            break;
-        }
-
         /* clearing of interrupt flags */
         if (((val & TPM_TIS_INTERRUPTS_SUPPORTED)) &&
             (s->loc[locty].ints & TPM_TIS_INTERRUPTS_SUPPORTED)) {
@@ -767,6 +780,15 @@ static void tpm_tis_mmio_write(void *opaque, hwaddr addr,
     }
 }
 
+/*
+ * A wrapper write function so that it can be directly called without
+ * mmio.
+ */
+void tpm_tis_write_data(TPMState *s, hwaddr addr, uint64_t val, uint32_t size)
+{
+    tpm_tis_mmio_write(s, addr, val, size);
+}
+
 const MemoryRegionOps tpm_tis_memory_ops = {
     .read = tpm_tis_mmio_read,
     .write = tpm_tis_mmio_write,
@@ -793,7 +815,7 @@ enum TPMVersion tpm_tis_get_tpm_version(TPMState *s)
  * This function is called when the machine starts, resets or due to
  * S3 resume.
  */
-void tpm_tis_reset(TPMState *s)
+void tpm_tis_reset(TPMState *s, bool ppi_enabled)
 {
     int c;
 
@@ -801,7 +823,7 @@ void tpm_tis_reset(TPMState *s)
     s->be_buffer_size = MIN(tpm_backend_get_buffer_size(s->be_driver),
                             TPM_TIS_BUFFER_MAX);
 
-    if (s->ppi_enabled) {
+    if (ppi_enabled) {
         tpm_ppi_reset(&s->ppi);
     }
     tpm_backend_reset(s->be_driver);
@@ -859,7 +881,7 @@ int tpm_tis_pre_save(TPMState *s)
 const VMStateDescription vmstate_locty = {
     .name = "tpm-tis/locty",
     .version_id = 0,
-    .fields      = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(state, TPMLocality),
         VMSTATE_UINT32(inte, TPMLocality),
         VMSTATE_UINT32(ints, TPMLocality),

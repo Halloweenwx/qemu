@@ -24,16 +24,21 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/ppc/mac.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/misc/macio/macio.h"
 #include "hw/misc/macio/gpio.h"
-#include "hw/nmi.h"
+#include "hw/core/irq.h"
+#include "hw/core/nmi.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "trace.h"
 
+enum MacioGPIORegisterBits {
+    OUT_DATA   = 1,
+    IN_DATA    = 2,
+    OUT_ENABLE = 4,
+};
 
 void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 {
@@ -41,14 +46,14 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 
     trace_macio_set_gpio(gpio, state);
 
-    if (s->gpio_regs[gpio] & 4) {
+    if (s->gpio_regs[gpio] & OUT_ENABLE) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "GPIO: Setting GPIO %d while it's an output\n", gpio);
     }
 
-    new_reg = s->gpio_regs[gpio] & ~2;
+    new_reg = s->gpio_regs[gpio] & ~IN_DATA;
     if (state) {
-        new_reg |= 2;
+        new_reg |= IN_DATA;
     }
 
     if (new_reg == s->gpio_regs[gpio]) {
@@ -57,10 +62,7 @@ void macio_set_gpio(MacIOGPIOState *s, uint32_t gpio, bool state)
 
     s->gpio_regs[gpio] = new_reg;
 
-    /* This is will work until we fix the binding between MacIO and
-     * the MPIC properly so we can route all GPIOs and avoid going
-     * via the top level platform code.
-     *
+    /*
      * Note that we probably need to get access to the MPIC config to
      * decode polarity since qemu always use "raise" regardless.
      *
@@ -110,12 +112,12 @@ static void macio_gpio_write(void *opaque, hwaddr addr, uint64_t value,
 
     addr -= 8;
     if (addr < 36) {
-        value &= ~2;
+        value &= ~IN_DATA;
 
-        if (value & 4) {
-            ibit = (value & 1) << 1;
+        if (value & OUT_ENABLE) {
+            ibit = (value & OUT_DATA) << 1;
         } else {
-            ibit = s->gpio_regs[addr] & 2;
+            ibit = s->gpio_regs[addr] & IN_DATA;
         }
 
         s->gpio_regs[addr] = value | ibit;
@@ -138,7 +140,7 @@ static uint64_t macio_gpio_read(void *opaque, hwaddr addr, unsigned size)
         }
     }
 
-    trace_macio_gpio_write(addr, val);
+    trace_macio_gpio_read(addr, val);
     return val;
 }
 
@@ -152,25 +154,15 @@ static const MemoryRegionOps macio_gpio_ops = {
     },
 };
 
-static void macio_gpio_realize(DeviceState *dev, Error **errp)
-{
-    MacIOGPIOState *s = MACIO_GPIO(dev);
-
-    s->gpio_extirqs[1] = qdev_get_gpio_in(DEVICE(s->pic),
-                                          NEWWORLD_EXTING_GPIO1);
-    s->gpio_extirqs[9] = qdev_get_gpio_in(DEVICE(s->pic),
-                                          NEWWORLD_EXTING_GPIO9);
-}
-
 static void macio_gpio_init(Object *obj)
 {
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
     MacIOGPIOState *s = MACIO_GPIO(obj);
+    int i;
 
-    object_property_add_link(obj, "pic", TYPE_OPENPIC,
-                             (Object **) &s->pic,
-                             qdev_prop_allow_set_link_before_realize,
-                             0, NULL);
+    for (i = 0; i < 10; i++) {
+        sysbus_init_irq(sbd, &s->gpio_extirqs[i]);
+    }
 
     memory_region_init_io(&s->gpiomem, OBJECT(s), &macio_gpio_ops, obj,
                           "gpio", 0x30);
@@ -181,7 +173,7 @@ static const VMStateDescription vmstate_macio_gpio = {
     .name = "macio_gpio",
     .version_id = 0,
     .minimum_version_id = 0,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT8_ARRAY(gpio_levels, MacIOGPIOState, 8),
         VMSTATE_UINT8_ARRAY(gpio_regs, MacIOGPIOState, 36),
         VMSTATE_END_OF_LIST()
@@ -196,21 +188,20 @@ static void macio_gpio_reset(DeviceState *dev)
     macio_set_gpio(s, 1, true);
 }
 
-static void macio_gpio_nmi(NMIState *n, int cpu_index, Error **errp)
+static void macio_gpio_nmi(NMIState *n)
 {
     macio_set_gpio(MACIO_GPIO(n), 9, true);
     macio_set_gpio(MACIO_GPIO(n), 9, false);
 }
 
-static void macio_gpio_class_init(ObjectClass *oc, void *data)
+static void macio_gpio_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     NMIClass *nc = NMI_CLASS(oc);
 
-    dc->realize = macio_gpio_realize;
-    dc->reset = macio_gpio_reset;
+    device_class_set_legacy_reset(dc, macio_gpio_reset);
     dc->vmsd = &vmstate_macio_gpio;
-    nc->nmi_monitor_handler = macio_gpio_nmi;
+    nc->raise_nmi = macio_gpio_nmi;
 }
 
 static const TypeInfo macio_gpio_init_info = {
@@ -219,7 +210,7 @@ static const TypeInfo macio_gpio_init_info = {
     .instance_size = sizeof(MacIOGPIOState),
     .instance_init = macio_gpio_init,
     .class_init    = macio_gpio_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_NMI },
         { }
     },

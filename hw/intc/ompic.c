@@ -7,17 +7,17 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/log.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
-#include "hw/irq.h"
-#include "hw/qdev-properties.h"
-#include "hw/sysbus.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
-#include "exec/memory.h"
+#include "system/memory.h"
+#include "qom/object.h"
 
 #define TYPE_OR1K_OMPIC "or1k-ompic"
-#define OR1K_OMPIC(obj) OBJECT_CHECK(OR1KOMPICState, (obj), TYPE_OR1K_OMPIC)
+OBJECT_DECLARE_SIMPLE_TYPE(OR1KOMPICState, OR1K_OMPIC)
 
 #define OMPIC_CTRL_IRQ_ACK  (1 << 31)
 #define OMPIC_CTRL_IRQ_GEN  (1 << 30)
@@ -37,7 +37,6 @@
 #define OMPIC_MAX_CPUS 4 /* Real max is much higher, but dont waste memory */
 #define OMPIC_ADDRSPACE_SZ (OMPIC_MAX_CPUS * 2 * 4) /* 2 32-bit regs per cpu */
 
-typedef struct OR1KOMPICState OR1KOMPICState;
 typedef struct OR1KOMPICCPUState OR1KOMPICCPUState;
 
 struct OR1KOMPICCPUState {
@@ -97,7 +96,7 @@ static void ompic_write(void *opaque, hwaddr addr, uint64_t data, unsigned size)
 static const MemoryRegionOps ompic_ops = {
     .read = ompic_read,
     .write = ompic_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .impl = {
         .max_access_size = 8,
     },
@@ -129,16 +128,15 @@ static void or1k_ompic_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static Property or1k_ompic_properties[] = {
+static const Property or1k_ompic_properties[] = {
     DEFINE_PROP_UINT32("num-cpus", OR1KOMPICState, num_cpus, 1),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static const VMStateDescription vmstate_or1k_ompic_cpu = {
     .name = "or1k_ompic_cpu",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
          VMSTATE_UINT32(status, OR1KOMPICCPUState),
          VMSTATE_UINT32(control, OR1KOMPICCPUState),
          VMSTATE_END_OF_LIST()
@@ -149,7 +147,7 @@ static const VMStateDescription vmstate_or1k_ompic = {
     .name = TYPE_OR1K_OMPIC,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
          VMSTATE_STRUCT_ARRAY(cpus, OR1KOMPICState, OMPIC_MAX_CPUS, 1,
              vmstate_or1k_ompic_cpu, OR1KOMPICCPUState),
          VMSTATE_UINT32(num_cpus, OR1KOMPICState),
@@ -157,7 +155,7 @@ static const VMStateDescription vmstate_or1k_ompic = {
     }
 };
 
-static void or1k_ompic_class_init(ObjectClass *klass, void *data)
+static void or1k_ompic_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

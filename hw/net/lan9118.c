@@ -11,32 +11,41 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "net/net.h"
 #include "net/eth.h"
-#include "hw/hw.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
+#include "hw/net/lan9118_phy.h"
 #include "hw/net/lan9118.h"
-#include "hw/ptimer.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/ptimer.h"
+#include "hw/core/qdev-properties.h"
+#include "qapi/error.h"
+#include "qemu/bswap.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-/* For crc32 */
-#include <zlib.h>
+#include <zlib.h> /* for crc32 */
+#include "qom/object.h"
 
 //#define DEBUG_LAN9118
 
 #ifdef DEBUG_LAN9118
 #define DPRINTF(fmt, ...) \
 do { printf("lan9118: " fmt , ## __VA_ARGS__); } while (0)
-#define BADF(fmt, ...) \
-do { hw_error("lan9118: error: " fmt , ## __VA_ARGS__);} while (0)
 #else
 #define DPRINTF(fmt, ...) do {} while(0)
-#define BADF(fmt, ...) \
-do { fprintf(stderr, "lan9118: error: " fmt , ## __VA_ARGS__);} while (0)
 #endif
+
+/* The tx and rx fifo ports are a range of aliased 32-bit registers */
+#define RX_DATA_FIFO_PORT_FIRST 0x00
+#define RX_DATA_FIFO_PORT_LAST 0x1f
+#define TX_DATA_FIFO_PORT_FIRST 0x20
+#define TX_DATA_FIFO_PORT_LAST 0x3f
+
+#define RX_STATUS_FIFO_PORT 0x40
+#define RX_STATUS_FIFO_PEEK 0x44
+#define TX_STATUS_FIFO_PORT 0x48
+#define TX_STATUS_FIFO_PEEK 0x4c
 
 #define CSR_ID_REV      0x50
 #define CSR_IRQ_CFG     0x54
@@ -132,15 +141,13 @@ do { fprintf(stderr, "lan9118: error: " fmt , ## __VA_ARGS__);} while (0)
 #define MAC_CR_RXEN     0x00000004
 #define MAC_CR_RESERVED 0x7f404213
 
-#define PHY_INT_ENERGYON            0x80
-#define PHY_INT_AUTONEG_COMPLETE    0x40
-#define PHY_INT_FAULT               0x20
-#define PHY_INT_DOWN                0x10
-#define PHY_INT_AUTONEG_LP          0x08
-#define PHY_INT_PARFAULT            0x04
-#define PHY_INT_AUTONEG_PAGE        0x02
-
 #define GPT_TIMER_EN    0x20000000
+
+/*
+ * The MAC Interface Layer (MIL), within the MAC, contains a 2K Byte transmit
+ * and a 128 Byte receive FIFO which is separate from the TX and RX FIFOs.
+ */
+#define MIL_TXFIFO_SIZE         2048
 
 enum tx_state {
     TX_IDLE,
@@ -158,14 +165,14 @@ typedef struct {
     int32_t pad;
     int32_t fifo_used;
     int32_t len;
-    uint8_t data[2048];
+    uint8_t data[MIL_TXFIFO_SIZE];
 } LAN9118Packet;
 
 static const VMStateDescription vmstate_lan9118_packet = {
     .name = "lan9118_packet",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(state, LAN9118Packet),
         VMSTATE_UINT32(cmd_a, LAN9118Packet),
         VMSTATE_UINT32(cmd_b, LAN9118Packet),
@@ -174,14 +181,14 @@ static const VMStateDescription vmstate_lan9118_packet = {
         VMSTATE_INT32(pad, LAN9118Packet),
         VMSTATE_INT32(fifo_used, LAN9118Packet),
         VMSTATE_INT32(len, LAN9118Packet),
-        VMSTATE_UINT8_ARRAY(data, LAN9118Packet, 2048),
+        VMSTATE_UINT8_ARRAY(data, LAN9118Packet, MIL_TXFIFO_SIZE),
         VMSTATE_END_OF_LIST()
     }
 };
 
-#define LAN9118(obj) OBJECT_CHECK(lan9118_state, (obj), TYPE_LAN9118)
+OBJECT_DECLARE_SIMPLE_TYPE(lan9118_state, LAN9118)
 
-typedef struct {
+struct lan9118_state {
     SysBusDevice parent_obj;
 
     NICState *nic;
@@ -215,11 +222,8 @@ typedef struct {
     uint32_t mac_mii_data;
     uint32_t mac_flow;
 
-    uint32_t phy_status;
-    uint32_t phy_control;
-    uint32_t phy_advertise;
-    uint32_t phy_int;
-    uint32_t phy_int_mask;
+    Lan9118PhyState mii;
+    IRQState mii_irq;
 
     int32_t eeprom_writable;
     uint8_t eeprom[128];
@@ -257,13 +261,13 @@ typedef struct {
     uint32_t read_long;
 
     uint32_t mode_16bit;
-} lan9118_state;
+};
 
 static const VMStateDescription vmstate_lan9118 = {
     .name = "lan9118",
-    .version_id = 2,
-    .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .version_id = 3,
+    .minimum_version_id = 3,
+    .fields = (const VMStateField[]) {
         VMSTATE_PTIMER(timer, lan9118_state),
         VMSTATE_UINT32(irq_cfg, lan9118_state),
         VMSTATE_UINT32(int_sts, lan9118_state),
@@ -288,11 +292,6 @@ static const VMStateDescription vmstate_lan9118 = {
         VMSTATE_UINT32(mac_mii_acc, lan9118_state),
         VMSTATE_UINT32(mac_mii_data, lan9118_state),
         VMSTATE_UINT32(mac_flow, lan9118_state),
-        VMSTATE_UINT32(phy_status, lan9118_state),
-        VMSTATE_UINT32(phy_control, lan9118_state),
-        VMSTATE_UINT32(phy_advertise, lan9118_state),
-        VMSTATE_UINT32(phy_int, lan9118_state),
-        VMSTATE_UINT32(phy_int_mask, lan9118_state),
         VMSTATE_INT32(eeprom_writable, lan9118_state),
         VMSTATE_UINT8_ARRAY(eeprom, lan9118_state, 128),
         VMSTATE_INT32(tx_fifo_size, lan9118_state),
@@ -372,9 +371,11 @@ static void lan9118_reload_eeprom(lan9118_state *s)
     lan9118_mac_changed(s);
 }
 
-static void phy_update_irq(lan9118_state *s)
+static void lan9118_update_irq(void *opaque, int n, int level)
 {
-    if (s->phy_int & s->phy_int_mask) {
+    lan9118_state *s = opaque;
+
+    if (level) {
         s->int_sts |= PHY_INT;
     } else {
         s->int_sts &= ~PHY_INT;
@@ -382,33 +383,10 @@ static void phy_update_irq(lan9118_state *s)
     lan9118_update(s);
 }
 
-static void phy_update_link(lan9118_state *s)
-{
-    /* Autonegotiation status mirrors link status.  */
-    if (qemu_get_queue(s->nic)->link_down) {
-        s->phy_status &= ~0x0024;
-        s->phy_int |= PHY_INT_DOWN;
-    } else {
-        s->phy_status |= 0x0024;
-        s->phy_int |= PHY_INT_ENERGYON;
-        s->phy_int |= PHY_INT_AUTONEG_COMPLETE;
-    }
-    phy_update_irq(s);
-}
-
 static void lan9118_set_link(NetClientState *nc)
 {
-    phy_update_link(qemu_get_nic_opaque(nc));
-}
-
-static void phy_reset(lan9118_state *s)
-{
-    s->phy_status = 0x7809;
-    s->phy_control = 0x3000;
-    s->phy_advertise = 0x01e1;
-    s->phy_int_mask = 0;
-    s->phy_int = 0;
-    phy_update_link(s);
+    lan9118_phy_update_link(&LAN9118(qemu_get_nic_opaque(nc))->mii,
+                            nc->link_down);
 }
 
 static void lan9118_reset(DeviceState *d)
@@ -464,8 +442,6 @@ static void lan9118_reset(DeviceState *d)
 
     s->read_word_n = 0;
     s->write_word_n = 0;
-
-    phy_reset(s);
 
     s->eeprom_writable = 0;
     lan9118_reload_eeprom(s);
@@ -536,7 +512,7 @@ static ssize_t lan9118_receive(NetClientState *nc, const uint8_t *buf,
         return -1;
     }
 
-    if (size >= 2048 || size < 14) {
+    if (size >= MIL_TXFIFO_SIZE || size < 14) {
         return -1;
     }
 
@@ -665,9 +641,9 @@ static void do_tx_packet(lan9118_state *s)
     uint32_t status;
 
     /* FIXME: Honor TX disable, and allow queueing of packets.  */
-    if (s->phy_control & 0x4000)  {
+    if (s->mii.control & 0x4000) {
         /* This assumes the receive routine doesn't touch the VLANClient.  */
-        lan9118_receive(qemu_get_queue(s->nic), s->txp->data, s->txp->len);
+        qemu_receive_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);
     } else {
         qemu_send_packet(qemu_get_queue(s->nic), s->txp->data, s->txp->len);
     }
@@ -683,6 +659,14 @@ static void do_tx_packet(lan9118_state *s)
     n = (s->tx_status_fifo_head + s->tx_status_fifo_used) & 511;
     s->tx_status_fifo[n] = status;
     s->tx_status_fifo_used++;
+
+    /*
+     * Generate TSFL interrupt if TX FIFO level exceeds the level
+     * specified in the FIFO_INT TX Status Level field.
+     */
+    if (s->tx_status_fifo_used > ((s->fifo_int >> 16) & 0xff)) {
+        s->int_sts |= TSFL_INT;
+    }
     if (s->tx_status_fifo_used == 512) {
         s->int_sts |= TSFF_INT;
         /* TODO: Stop transmission.  */
@@ -777,8 +761,22 @@ static void tx_fifo_push(lan9118_state *s, uint32_t val)
             /* Documentation is somewhat unclear on the ordering of bytes
                in FIFO words.  Empirical results show it to be little-endian.
                */
-            /* TODO: FIFO overflow checking.  */
             while (n--) {
+                if (s->txp->len == MIL_TXFIFO_SIZE) {
+                    /*
+                     * No more space in the FIFO. The datasheet is not
+                     * precise about this case. We choose what is easiest
+                     * to model: the packet is truncated, and TXE is raised.
+                     *
+                     * Note, it could be a fragmented packet, but we currently
+                     * do not handle that (see earlier TX_B case).
+                     */
+                    qemu_log_mask(LOG_GUEST_ERROR,
+                                  "MIL TX FIFO overrun, discarding %u byte%s\n",
+                                  n, n > 1 ? "s" : "");
+                    s->int_sts |= TXE_INT;
+                    break;
+                }
                 s->txp->data[s->txp->len] = val & 0xff;
                 s->txp->len++;
                 val >>= 8;
@@ -796,66 +794,6 @@ static void tx_fifo_push(lan9118_state *s, uint32_t val)
             s->txp->state = TX_IDLE;
         }
         break;
-    }
-}
-
-static uint32_t do_phy_read(lan9118_state *s, int reg)
-{
-    uint32_t val;
-
-    switch (reg) {
-    case 0: /* Basic Control */
-        return s->phy_control;
-    case 1: /* Basic Status */
-        return s->phy_status;
-    case 2: /* ID1 */
-        return 0x0007;
-    case 3: /* ID2 */
-        return 0xc0d1;
-    case 4: /* Auto-neg advertisement */
-        return s->phy_advertise;
-    case 5: /* Auto-neg Link Partner Ability */
-        return 0x0f71;
-    case 6: /* Auto-neg Expansion */
-        return 1;
-        /* TODO 17, 18, 27, 29, 30, 31 */
-    case 29: /* Interrupt source.  */
-        val = s->phy_int;
-        s->phy_int = 0;
-        phy_update_irq(s);
-        return val;
-    case 30: /* Interrupt mask */
-        return s->phy_int_mask;
-    default:
-        BADF("PHY read reg %d\n", reg);
-        return 0;
-    }
-}
-
-static void do_phy_write(lan9118_state *s, int reg, uint32_t val)
-{
-    switch (reg) {
-    case 0: /* Basic Control */
-        if (val & 0x8000) {
-            phy_reset(s);
-            break;
-        }
-        s->phy_control = val & 0x7980;
-        /* Complete autonegotiation immediately.  */
-        if (val & 0x1000) {
-            s->phy_status |= 0x0020;
-        }
-        break;
-    case 4: /* Auto-neg advertisement */
-        s->phy_advertise = (val & 0x2d7f) | 0x80;
-        break;
-        /* TODO 17, 18, 27, 31 */
-    case 30: /* Interrupt mask */
-        s->phy_int_mask = val & 0xff;
-        phy_update_irq(s);
-        break;
-    default:
-        BADF("PHY write reg %d = 0x%04x\n", reg, val);
     }
 }
 
@@ -892,9 +830,9 @@ static void do_mac_write(lan9118_state *s, int reg, uint32_t val)
         if (val & 2) {
             DPRINTF("PHY write %d = 0x%04x\n",
                     (val >> 6) & 0x1f, s->mac_mii_data);
-            do_phy_write(s, (val >> 6) & 0x1f, s->mac_mii_data);
+            lan9118_phy_write(&s->mii, (val >> 6) & 0x1f, s->mac_mii_data);
         } else {
-            s->mac_mii_data = do_phy_read(s, (val >> 6) & 0x1f);
+            s->mac_mii_data = lan9118_phy_read(&s->mii, (val >> 6) & 0x1f);
             DPRINTF("PHY read %d = 0x%04x\n",
                     (val >> 6) & 0x1f, s->mac_mii_data);
         }
@@ -930,10 +868,8 @@ static uint32_t do_mac_read(lan9118_state *s, int reg)
                | (s->conf.macaddr.a[2] << 16) | (s->conf.macaddr.a[3] << 24);
     case MAC_HASHH:
         return s->mac_hashh;
-        break;
     case MAC_HASHL:
         return s->mac_hashl;
-        break;
     case MAC_MII_ACC:
         return s->mac_mii_acc;
     case MAC_MII_DATA:
@@ -1020,7 +956,8 @@ static void lan9118_writel(void *opaque, hwaddr offset,
     offset &= 0xff;
 
     //DPRINTF("Write reg 0x%02x = 0x%08x\n", (int)offset, val);
-    if (offset >= 0x20 && offset < 0x40) {
+    if (offset >= TX_DATA_FIFO_PORT_FIRST &&
+        offset <= TX_DATA_FIFO_PORT_LAST) {
         /* TX FIFO */
         tx_fifo_push(s, val);
         return;
@@ -1090,7 +1027,7 @@ static void lan9118_writel(void *opaque, hwaddr offset,
         break;
     case CSR_PMT_CTRL:
         if (val & 0x400) {
-            phy_reset(s);
+            lan9118_phy_reset(&s->mii);
         }
         s->pmt_ctrl &= ~0x34e;
         s->pmt_ctrl |= (val & 0x34e);
@@ -1189,7 +1126,8 @@ static void lan9118_16bit_mode_write(void *opaque, hwaddr offset,
         return;
     }
 
-    hw_error("lan9118_write: Bad size 0x%x\n", size);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "lan9118_16bit_mode_write: Bad size 0x%x\n", size);
 }
 
 static uint64_t lan9118_readl(void *opaque, hwaddr offset,
@@ -1198,18 +1136,18 @@ static uint64_t lan9118_readl(void *opaque, hwaddr offset,
     lan9118_state *s = (lan9118_state *)opaque;
 
     //DPRINTF("Read reg 0x%02x\n", (int)offset);
-    if (offset < 0x20) {
+    if (offset <= RX_DATA_FIFO_PORT_LAST) {
         /* RX FIFO */
         return rx_fifo_pop(s);
     }
     switch (offset) {
-    case 0x40:
+    case RX_STATUS_FIFO_PORT:
         return rx_status_fifo_pop(s);
-    case 0x44:
-        return s->rx_status_fifo[s->tx_status_fifo_head];
-    case 0x48:
+    case RX_STATUS_FIFO_PEEK:
+        return s->rx_status_fifo[s->rx_status_fifo_head];
+    case TX_STATUS_FIFO_PORT:
         return tx_status_fifo_pop(s);
-    case 0x4c:
+    case TX_STATUS_FIFO_PEEK:
         return s->tx_status_fifo[s->tx_status_fifo_head];
     case CSR_ID_REV:
         return 0x01180001;
@@ -1304,7 +1242,8 @@ static uint64_t lan9118_16bit_mode_read(void *opaque, hwaddr offset,
         return lan9118_readl(opaque, offset, size);
     }
 
-    hw_error("lan9118_read: Bad size 0x%x\n", size);
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "lan9118_16bit_mode_read: Bad size 0x%x\n", size);
     return 0;
 }
 
@@ -1335,6 +1274,13 @@ static void lan9118_realize(DeviceState *dev, Error **errp)
     const MemoryRegionOps *mem_ops =
             s->mode_16bit ? &lan9118_16bit_mem_ops : &lan9118_mem_ops;
 
+    qemu_init_irq(&s->mii_irq, lan9118_update_irq, s, 0);
+    object_initialize_child(OBJECT(s), "mii", &s->mii, TYPE_LAN9118_PHY);
+    if (!sysbus_realize_and_unref(SYS_BUS_DEVICE(&s->mii), errp)) {
+        return;
+    }
+    qdev_connect_gpio_out(DEVICE(&s->mii), 0, &s->mii_irq);
+
     memory_region_init_io(&s->mmio, OBJECT(dev), mem_ops, s,
                           "lan9118-mmio", 0x100);
     sysbus_init_mmio(sbd, &s->mmio);
@@ -1342,7 +1288,8 @@ static void lan9118_realize(DeviceState *dev, Error **errp)
     qemu_macaddr_default_if_unset(&s->conf.macaddr);
 
     s->nic = qemu_new_nic(&net_lan9118_info, &s->conf,
-                          object_get_typename(OBJECT(dev)), dev->id, s);
+                          object_get_typename(OBJECT(dev)), dev->id,
+                          &dev->mem_reentrancy_guard, s);
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
     s->eeprom[0] = 0xa5;
     for (i = 0; i < 6; i++) {
@@ -1351,24 +1298,23 @@ static void lan9118_realize(DeviceState *dev, Error **errp)
     s->pmt_ctrl = 1;
     s->txp = &s->tx_packet;
 
-    s->timer = ptimer_init(lan9118_tick, s, PTIMER_POLICY_DEFAULT);
+    s->timer = ptimer_init(lan9118_tick, s, PTIMER_POLICY_LEGACY);
     ptimer_transaction_begin(s->timer);
     ptimer_set_freq(s->timer, 10000);
     ptimer_set_limit(s->timer, 0xffff, 1);
     ptimer_transaction_commit(s->timer);
 }
 
-static Property lan9118_properties[] = {
+static const Property lan9118_properties[] = {
     DEFINE_NIC_PROPERTIES(lan9118_state, conf),
     DEFINE_PROP_UINT32("mode_16bit", lan9118_state, mode_16bit, 0),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void lan9118_class_init(ObjectClass *klass, void *data)
+static void lan9118_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = lan9118_reset;
+    device_class_set_legacy_reset(dc, lan9118_reset);
     device_class_set_props(dc, lan9118_properties);
     dc->vmsd = &vmstate_lan9118;
     dc->realize = lan9118_realize;
@@ -1388,16 +1334,15 @@ static void lan9118_register_types(void)
 
 /* Legacy helper function.  Should go away when machine config files are
    implemented.  */
-void lan9118_init(NICInfo *nd, uint32_t base, qemu_irq irq)
+void lan9118_init(uint32_t base, qemu_irq irq)
 {
     DeviceState *dev;
     SysBusDevice *s;
 
-    qemu_check_nic_model(nd, "lan9118");
-    dev = qdev_create(NULL, TYPE_LAN9118);
-    qdev_set_nic_properties(dev, nd);
-    qdev_init_nofail(dev);
+    dev = qdev_new(TYPE_LAN9118);
+    qemu_configure_nic_device(dev, true, NULL);
     s = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(s, &error_fatal);
     sysbus_mmio_map(s, 0, base);
     sysbus_connect_irq(s, 0, irq);
 }

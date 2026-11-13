@@ -23,11 +23,13 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/timer/i8254.h"
 #include "hw/timer/i8254_internal.h"
+#include "qom/object.h"
+#include "trace.h"
 
 //#define DEBUG_PIT
 
@@ -36,14 +38,15 @@
 #define RW_STATE_WORD0 3
 #define RW_STATE_WORD1 4
 
-#define PIT_CLASS(class) OBJECT_CLASS_CHECK(PITClass, (class), TYPE_I8254)
-#define PIT_GET_CLASS(obj) OBJECT_GET_CLASS(PITClass, (obj), TYPE_I8254)
+typedef struct PITClass PITClass;
+DECLARE_CLASS_CHECKERS(PITClass, PIT,
+                       TYPE_I8254)
 
-typedef struct PITClass {
+struct PITClass {
     PITCommonClass parent_class;
 
     DeviceRealize parent_realize;
-} PITClass;
+};
 
 static void pit_irq_timer_update(PITChannelState *s, int64_t current_time);
 
@@ -127,6 +130,8 @@ static void pit_ioport_write(void *opaque, hwaddr addr,
     PITCommonState *pit = opaque;
     int channel, access;
     PITChannelState *s;
+
+    trace_pit_ioport_write(addr, val);
 
     addr &= 3;
     if (addr == 3) {
@@ -246,6 +251,9 @@ static uint64_t pit_ioport_read(void *opaque, hwaddr addr,
             break;
         }
     }
+
+    trace_pit_ioport_read(addr, ret);
+
     return ret;
 }
 
@@ -322,7 +330,7 @@ static void pit_post_load(PITCommonState *s)
 {
     PITChannelState *sc = &s->channels[0];
 
-    if (sc->next_transition_time != -1) {
+    if (sc->next_transition_time != -1 && !sc->irq_disabled) {
         timer_mod(sc->irq_timer, sc->next_transition_time);
     } else {
         timer_del(sc->irq_timer);
@@ -348,12 +356,7 @@ static void pit_realizefn(DeviceState *dev, Error **errp)
     pc->parent_realize(dev, errp);
 }
 
-static Property pit_properties[] = {
-    DEFINE_PROP_UINT32("iobase", PITCommonState, iobase,  -1),
-    DEFINE_PROP_END_OF_LIST(),
-};
-
-static void pit_class_initfn(ObjectClass *klass, void *data)
+static void pit_class_initfn(ObjectClass *klass, const void *data)
 {
     PITClass *pc = PIT_CLASS(klass);
     PITCommonClass *k = PIT_COMMON_CLASS(klass);
@@ -363,8 +366,7 @@ static void pit_class_initfn(ObjectClass *klass, void *data)
     k->set_channel_gate = pit_set_channel_gate;
     k->get_channel_info = pit_get_channel_info_common;
     k->post_load = pit_post_load;
-    dc->reset = pit_reset;
-    device_class_set_props(dc, pit_properties);
+    device_class_set_legacy_reset(dc, pit_reset);
 }
 
 static const TypeInfo pit_info = {

@@ -18,415 +18,370 @@
 
 #include "qemu/osdep.h"
 #include "exec/gdbstub.h"
+#include "gdbstub/helpers.h"
 #include "cpu.h"
+#include "internals.h"
+#include "target/riscv/tcg/csr.h"
 
-/*
- * The GDB CSR xml files list them in documentation order, not numerical order,
- * and are missing entries for unnamed CSRs.  So we need to map the gdb numbers
- * to the hardware numbers.
- */
-
-static int csr_register_map[] = {
-    CSR_USTATUS,
-    CSR_UIE,
-    CSR_UTVEC,
-    CSR_USCRATCH,
-    CSR_UEPC,
-    CSR_UCAUSE,
-    CSR_UTVAL,
-    CSR_UIP,
-    CSR_FFLAGS,
-    CSR_FRM,
-    CSR_FCSR,
-    CSR_CYCLE,
-    CSR_TIME,
-    CSR_INSTRET,
-    CSR_HPMCOUNTER3,
-    CSR_HPMCOUNTER4,
-    CSR_HPMCOUNTER5,
-    CSR_HPMCOUNTER6,
-    CSR_HPMCOUNTER7,
-    CSR_HPMCOUNTER8,
-    CSR_HPMCOUNTER9,
-    CSR_HPMCOUNTER10,
-    CSR_HPMCOUNTER11,
-    CSR_HPMCOUNTER12,
-    CSR_HPMCOUNTER13,
-    CSR_HPMCOUNTER14,
-    CSR_HPMCOUNTER15,
-    CSR_HPMCOUNTER16,
-    CSR_HPMCOUNTER17,
-    CSR_HPMCOUNTER18,
-    CSR_HPMCOUNTER19,
-    CSR_HPMCOUNTER20,
-    CSR_HPMCOUNTER21,
-    CSR_HPMCOUNTER22,
-    CSR_HPMCOUNTER23,
-    CSR_HPMCOUNTER24,
-    CSR_HPMCOUNTER25,
-    CSR_HPMCOUNTER26,
-    CSR_HPMCOUNTER27,
-    CSR_HPMCOUNTER28,
-    CSR_HPMCOUNTER29,
-    CSR_HPMCOUNTER30,
-    CSR_HPMCOUNTER31,
-    CSR_CYCLEH,
-    CSR_TIMEH,
-    CSR_INSTRETH,
-    CSR_HPMCOUNTER3H,
-    CSR_HPMCOUNTER4H,
-    CSR_HPMCOUNTER5H,
-    CSR_HPMCOUNTER6H,
-    CSR_HPMCOUNTER7H,
-    CSR_HPMCOUNTER8H,
-    CSR_HPMCOUNTER9H,
-    CSR_HPMCOUNTER10H,
-    CSR_HPMCOUNTER11H,
-    CSR_HPMCOUNTER12H,
-    CSR_HPMCOUNTER13H,
-    CSR_HPMCOUNTER14H,
-    CSR_HPMCOUNTER15H,
-    CSR_HPMCOUNTER16H,
-    CSR_HPMCOUNTER17H,
-    CSR_HPMCOUNTER18H,
-    CSR_HPMCOUNTER19H,
-    CSR_HPMCOUNTER20H,
-    CSR_HPMCOUNTER21H,
-    CSR_HPMCOUNTER22H,
-    CSR_HPMCOUNTER23H,
-    CSR_HPMCOUNTER24H,
-    CSR_HPMCOUNTER25H,
-    CSR_HPMCOUNTER26H,
-    CSR_HPMCOUNTER27H,
-    CSR_HPMCOUNTER28H,
-    CSR_HPMCOUNTER29H,
-    CSR_HPMCOUNTER30H,
-    CSR_HPMCOUNTER31H,
-    CSR_SSTATUS,
-    CSR_SEDELEG,
-    CSR_SIDELEG,
-    CSR_SIE,
-    CSR_STVEC,
-    CSR_SCOUNTEREN,
-    CSR_SSCRATCH,
-    CSR_SEPC,
-    CSR_SCAUSE,
-    CSR_STVAL,
-    CSR_SIP,
-    CSR_SATP,
-    CSR_MVENDORID,
-    CSR_MARCHID,
-    CSR_MIMPID,
-    CSR_MHARTID,
-    CSR_MSTATUS,
-    CSR_MISA,
-    CSR_MEDELEG,
-    CSR_MIDELEG,
-    CSR_MIE,
-    CSR_MTVEC,
-    CSR_MCOUNTEREN,
-    CSR_MSCRATCH,
-    CSR_MEPC,
-    CSR_MCAUSE,
-    CSR_MTVAL,
-    CSR_MIP,
-    CSR_MTINST,
-    CSR_MTVAL2,
-    CSR_PMPCFG0,
-    CSR_PMPCFG1,
-    CSR_PMPCFG2,
-    CSR_PMPCFG3,
-    CSR_PMPADDR0,
-    CSR_PMPADDR1,
-    CSR_PMPADDR2,
-    CSR_PMPADDR3,
-    CSR_PMPADDR4,
-    CSR_PMPADDR5,
-    CSR_PMPADDR6,
-    CSR_PMPADDR7,
-    CSR_PMPADDR8,
-    CSR_PMPADDR9,
-    CSR_PMPADDR10,
-    CSR_PMPADDR11,
-    CSR_PMPADDR12,
-    CSR_PMPADDR13,
-    CSR_PMPADDR14,
-    CSR_PMPADDR15,
-    CSR_MCYCLE,
-    CSR_MINSTRET,
-    CSR_MHPMCOUNTER3,
-    CSR_MHPMCOUNTER4,
-    CSR_MHPMCOUNTER5,
-    CSR_MHPMCOUNTER6,
-    CSR_MHPMCOUNTER7,
-    CSR_MHPMCOUNTER8,
-    CSR_MHPMCOUNTER9,
-    CSR_MHPMCOUNTER10,
-    CSR_MHPMCOUNTER11,
-    CSR_MHPMCOUNTER12,
-    CSR_MHPMCOUNTER13,
-    CSR_MHPMCOUNTER14,
-    CSR_MHPMCOUNTER15,
-    CSR_MHPMCOUNTER16,
-    CSR_MHPMCOUNTER17,
-    CSR_MHPMCOUNTER18,
-    CSR_MHPMCOUNTER19,
-    CSR_MHPMCOUNTER20,
-    CSR_MHPMCOUNTER21,
-    CSR_MHPMCOUNTER22,
-    CSR_MHPMCOUNTER23,
-    CSR_MHPMCOUNTER24,
-    CSR_MHPMCOUNTER25,
-    CSR_MHPMCOUNTER26,
-    CSR_MHPMCOUNTER27,
-    CSR_MHPMCOUNTER28,
-    CSR_MHPMCOUNTER29,
-    CSR_MHPMCOUNTER30,
-    CSR_MHPMCOUNTER31,
-    CSR_MCYCLEH,
-    CSR_MINSTRETH,
-    CSR_MHPMCOUNTER3H,
-    CSR_MHPMCOUNTER4H,
-    CSR_MHPMCOUNTER5H,
-    CSR_MHPMCOUNTER6H,
-    CSR_MHPMCOUNTER7H,
-    CSR_MHPMCOUNTER8H,
-    CSR_MHPMCOUNTER9H,
-    CSR_MHPMCOUNTER10H,
-    CSR_MHPMCOUNTER11H,
-    CSR_MHPMCOUNTER12H,
-    CSR_MHPMCOUNTER13H,
-    CSR_MHPMCOUNTER14H,
-    CSR_MHPMCOUNTER15H,
-    CSR_MHPMCOUNTER16H,
-    CSR_MHPMCOUNTER17H,
-    CSR_MHPMCOUNTER18H,
-    CSR_MHPMCOUNTER19H,
-    CSR_MHPMCOUNTER20H,
-    CSR_MHPMCOUNTER21H,
-    CSR_MHPMCOUNTER22H,
-    CSR_MHPMCOUNTER23H,
-    CSR_MHPMCOUNTER24H,
-    CSR_MHPMCOUNTER25H,
-    CSR_MHPMCOUNTER26H,
-    CSR_MHPMCOUNTER27H,
-    CSR_MHPMCOUNTER28H,
-    CSR_MHPMCOUNTER29H,
-    CSR_MHPMCOUNTER30H,
-    CSR_MHPMCOUNTER31H,
-    CSR_MHPMEVENT3,
-    CSR_MHPMEVENT4,
-    CSR_MHPMEVENT5,
-    CSR_MHPMEVENT6,
-    CSR_MHPMEVENT7,
-    CSR_MHPMEVENT8,
-    CSR_MHPMEVENT9,
-    CSR_MHPMEVENT10,
-    CSR_MHPMEVENT11,
-    CSR_MHPMEVENT12,
-    CSR_MHPMEVENT13,
-    CSR_MHPMEVENT14,
-    CSR_MHPMEVENT15,
-    CSR_MHPMEVENT16,
-    CSR_MHPMEVENT17,
-    CSR_MHPMEVENT18,
-    CSR_MHPMEVENT19,
-    CSR_MHPMEVENT20,
-    CSR_MHPMEVENT21,
-    CSR_MHPMEVENT22,
-    CSR_MHPMEVENT23,
-    CSR_MHPMEVENT24,
-    CSR_MHPMEVENT25,
-    CSR_MHPMEVENT26,
-    CSR_MHPMEVENT27,
-    CSR_MHPMEVENT28,
-    CSR_MHPMEVENT29,
-    CSR_MHPMEVENT30,
-    CSR_MHPMEVENT31,
-    CSR_TSELECT,
-    CSR_TDATA1,
-    CSR_TDATA2,
-    CSR_TDATA3,
-    CSR_DCSR,
-    CSR_DPC,
-    CSR_DSCRATCH,
-    CSR_HSTATUS,
-    CSR_HEDELEG,
-    CSR_HIDELEG,
-    CSR_HIE,
-    CSR_HCOUNTEREN,
-    CSR_HTVAL,
-    CSR_HIP,
-    CSR_HTINST,
-    CSR_HGATP,
-    CSR_MBASE,
-    CSR_MBOUND,
-    CSR_MIBASE,
-    CSR_MIBOUND,
-    CSR_MDBASE,
-    CSR_MDBOUND,
-    CSR_MUCOUNTEREN,
-    CSR_MSCOUNTEREN,
-    CSR_MHCOUNTEREN,
+struct TypeSize {
+    const char *gdb_type;
+    const char *id;
+    int size;
+    const char suffix;
 };
 
-int riscv_cpu_gdb_read_register(CPUState *cs, uint8_t *mem_buf, int n)
+static const struct TypeSize vec_lanes[] = {
+    /* quads */
+    { "uint128", "quads", 128, 'q' },
+    /* 64 bit */
+    { "uint64", "longs", 64, 'l' },
+    /* 32 bit */
+    { "uint32", "words", 32, 'w' },
+    /* 16 bit */
+    { "uint16", "shorts", 16, 's' },
+    /*
+     * TODO: currently there is no reliable way of telling
+     * if the remote gdb actually understands ieee_half so
+     * we don't expose it in the target description for now.
+     * { "ieee_half", 16, 'h', 'f' },
+     */
+    /* bytes */
+    { "uint8", "bytes", 8, 'b' },
+};
+
+static uint64_t ldn(CPURISCVState *env, uint8_t *mem_buf, size_t regsz)
+{
+    return (mo_endian_env(env) == MO_LE ? ldn_le_p : ldn_be_p)(mem_buf, regsz);
+}
+
+static int riscv_gdb_get_reg_mxl(CPUState *cs,
+                                 GByteArray *buf, uint64_t val)
+{
+    RISCVCPUClass *mcc = RISCV_CPU_GET_CLASS(cs);
+
+    switch (mcc->def->misa_mxl_max) {
+    case MXL_RV32:
+        return gdb_get_reg32(buf, val);
+    case MXL_RV64:
+    case MXL_RV128:
+        return gdb_get_reg64(buf, val);
+    default:
+        g_assert_not_reached();
+    }
+    return 0;
+}
+
+int riscv_cpu_gdb_read_register(CPUState *cs, GByteArray *mem_buf, int n)
 {
     RISCVCPU *cpu = RISCV_CPU(cs);
     CPURISCVState *env = &cpu->env;
+    uint64_t tmp;
 
     if (n < 32) {
-        return gdb_get_regl(mem_buf, env->gpr[n]);
+        tmp = env->gpr[n];
     } else if (n == 32) {
-        return gdb_get_regl(mem_buf, env->pc);
+        tmp = env->pc;
+    } else {
+        return 0;
     }
-    return 0;
+
+    return riscv_gdb_get_reg_mxl(cs, mem_buf, tmp);
 }
 
 int riscv_cpu_gdb_write_register(CPUState *cs, uint8_t *mem_buf, int n)
 {
+    RISCVCPUClass *mcc = RISCV_CPU_GET_CLASS(cs);
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    CPURISCVState *env = &cpu->env;
+    const size_t regsize = mcc->def->misa_mxl_max == MXL_RV32 ? 4 : 8;
+    uint64_t tmp = ldn(env, mem_buf, regsize);
+
+    if (env->xl < MXL_RV64) {
+        tmp = (int32_t)tmp;
+    }
+
+    if (n > 0 && n < 32) {
+        env->gpr[n] = tmp;
+    } else if (n == 32) {
+        env->pc = tmp;
+    }
+
+    return regsize;
+}
+
+static int riscv_gdb_get_fpu(CPUState *cs, GByteArray *buf, int n)
+{
     RISCVCPU *cpu = RISCV_CPU(cs);
     CPURISCVState *env = &cpu->env;
 
-    if (n == 0) {
-        /* discard writes to x0 */
-        return sizeof(target_ulong);
-    } else if (n < 32) {
-        env->gpr[n] = ldtul_p(mem_buf);
-        return sizeof(target_ulong);
-    } else if (n == 32) {
-        env->pc = ldtul_p(mem_buf);
-        return sizeof(target_ulong);
-    }
-    return 0;
-}
-
-static int riscv_gdb_get_fpu(CPURISCVState *env, uint8_t *mem_buf, int n)
-{
     if (n < 32) {
-        if (env->misa & RVD) {
-            return gdb_get_reg64(mem_buf, env->fpr[n]);
+        if (env->misa_ext & RVD) {
+            return gdb_get_reg64(buf, env->fpr[n]);
         }
-        if (env->misa & RVF) {
-            return gdb_get_reg32(mem_buf, env->fpr[n]);
-        }
-    /* there is hole between ft11 and fflags in fpu.xml */
-    } else if (n < 36 && n > 32) {
-        target_ulong val = 0;
-        int result;
-        /*
-         * CSR_FFLAGS is at index 8 in csr_register, and gdb says it is FP
-         * register 33, so we recalculate the map index.
-         * This also works for CSR_FRM and CSR_FCSR.
-         */
-        result = riscv_csrrw_debug(env, n - 33 + csr_register_map[8], &val,
-                                   0, 0);
-        if (result == 0) {
-            return gdb_get_regl(mem_buf, val);
+        if (env->misa_ext & RVF) {
+            return gdb_get_reg32(buf, env->fpr[n]);
         }
     }
     return 0;
 }
 
-static int riscv_gdb_set_fpu(CPURISCVState *env, uint8_t *mem_buf, int n)
+static int riscv_gdb_set_fpu(CPUState *cs, uint8_t *mem_buf, int n)
 {
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    CPURISCVState *env = &cpu->env;
+
     if (n < 32) {
-        env->fpr[n] = ldq_p(mem_buf); /* always 64-bit */
+        env->fpr[n] = ldn(env, mem_buf, 8); /* always 64-bit */
         return sizeof(uint64_t);
-    /* there is hole between ft11 and fflags in fpu.xml */
-    } else if (n < 36 && n > 32) {
-        target_ulong val = ldtul_p(mem_buf);
-        int result;
-        /*
-         * CSR_FFLAGS is at index 8 in csr_register, and gdb says it is FP
-         * register 33, so we recalculate the map index.
-         * This also works for CSR_FRM and CSR_FCSR.
-         */
-        result = riscv_csrrw_debug(env, n - 33 + csr_register_map[8], NULL,
-                                   val, -1);
-        if (result == 0) {
-            return sizeof(target_ulong);
-        }
     }
     return 0;
 }
 
-static int riscv_gdb_get_csr(CPURISCVState *env, uint8_t *mem_buf, int n)
+static int riscv_gdb_get_vector(CPUState *cs, GByteArray *buf, int n)
 {
-    if (n < ARRAY_SIZE(csr_register_map)) {
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    CPURISCVState *env = &cpu->env;
+    uint16_t vlenb = cpu->cfg.vlenb;
+    if (n < 32) {
+        int i;
+        int cnt = 0;
+        for (i = 0; i < vlenb; i += 8) {
+            cnt += gdb_get_reg64(buf,
+                                 env->vreg[(n * vlenb + i) / 8]);
+        }
+        return cnt;
+    }
+
+    return 0;
+}
+
+static int riscv_gdb_set_vector(CPUState *cs, uint8_t *mem_buf, int n)
+{
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    CPURISCVState *env = &cpu->env;
+    uint16_t vlenb = cpu->cfg.vlenb;
+    if (n < 32) {
+        int i;
+        for (i = 0; i < vlenb; i += 8) {
+            env->vreg[(n * vlenb + i) / 8] = ldn(env, mem_buf + i, 8);
+        }
+        return vlenb;
+    }
+
+    return 0;
+}
+
+#ifdef CONFIG_TCG
+static int riscv_gdb_get_csr(CPUState *cs, GByteArray *buf, int n)
+{
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    CPURISCVState *env = &cpu->env;
+
+    if (n < CSR_TABLE_SIZE) {
         target_ulong val = 0;
         int result;
 
-        result = riscv_csrrw_debug(env, csr_register_map[n], &val, 0, 0);
-        if (result == 0) {
-            return gdb_get_regl(mem_buf, val);
+        result = riscv_csrrw_debug(env, n, &val, 0, 0);
+        if (result == RISCV_EXCP_NONE) {
+            return riscv_gdb_get_reg_mxl(cs, buf, val);
         }
     }
     return 0;
 }
 
-static int riscv_gdb_set_csr(CPURISCVState *env, uint8_t *mem_buf, int n)
+static int riscv_gdb_set_csr(CPUState *cs, uint8_t *mem_buf, int n)
 {
-    if (n < ARRAY_SIZE(csr_register_map)) {
-        target_ulong val = ldtul_p(mem_buf);
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    CPURISCVState *env = &cpu->env;
+    const unsigned regsz = riscv_cpu_is_32bit(cpu) ? 4 : 8;
+
+    if (n < CSR_TABLE_SIZE) {
+        uint64_t val = ldn(env, mem_buf, regsz);
         int result;
 
-        result = riscv_csrrw_debug(env, csr_register_map[n], NULL, val, -1);
-        if (result == 0) {
-            return sizeof(target_ulong);
+        result = riscv_csrrw_debug(env, n, NULL, val, -1);
+        if (result == RISCV_EXCP_NONE) {
+            return regsz;
         }
     }
     return 0;
 }
 
-static int riscv_gdb_get_virtual(CPURISCVState *cs, uint8_t *mem_buf, int n)
+static int riscv_gdb_get_virtual(CPUState *cs, GByteArray *buf, int n)
 {
     if (n == 0) {
 #ifdef CONFIG_USER_ONLY
-        return gdb_get_regl(mem_buf, 0);
+        return riscv_gdb_get_reg_mxl(cs, buf, 0);
 #else
-        return gdb_get_regl(mem_buf, cs->priv);
+        RISCVCPU *cpu = RISCV_CPU(cs);
+        CPURISCVState *env = &cpu->env;
+
+        /* Per RiscV debug spec v1.0.0 rc4 */
+        uint32_t vbit = (env->virt_enabled) ? BIT(2) : 0;
+
+        return riscv_gdb_get_reg_mxl(cs, buf, env->priv | vbit);
 #endif
     }
     return 0;
 }
 
-static int riscv_gdb_set_virtual(CPURISCVState *cs, uint8_t *mem_buf, int n)
+static int riscv_gdb_set_virtual(CPUState *cs, uint8_t *mem_buf, int n)
 {
     if (n == 0) {
+        RISCVCPU *cpu = RISCV_CPU(cs);
+        const unsigned regsz = riscv_cpu_is_32bit(cpu) ? 4 : 8;
 #ifndef CONFIG_USER_ONLY
-        cs->priv = ldtul_p(mem_buf) & 0x3;
-        if (cs->priv == PRV_H) {
-            cs->priv = PRV_S;
+        CPURISCVState *env = &cpu->env;
+        privilege_mode_t new_priv = ldn(env, mem_buf, regsz) & 0x3;
+        bool new_virt = 0;
+
+        if (new_priv == PRV_RESERVED) {
+            new_priv = PRV_S;
         }
+
+        if (new_priv != PRV_M) {
+            new_virt = (ldn(env, mem_buf, regsz) & BIT(2)) >> 2;
+        }
+
+        if (riscv_has_ext(env, RVH) && new_virt != env->virt_enabled) {
+            riscv_cpu_swap_hypervisor_regs(env);
+        }
+
+        riscv_cpu_set_mode(env, new_priv, new_virt);
 #endif
-        return sizeof(target_ulong);
+        return regsz;
     }
     return 0;
+}
+
+static GDBFeature *riscv_gen_dynamic_csr_feature(CPUState *cs, int base_reg)
+{
+    RISCVCPUClass *mcc = RISCV_CPU_GET_CLASS(cs);
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    CPURISCVState *env = &cpu->env;
+    GDBFeatureBuilder builder;
+    riscv_csr_predicate_fn predicate;
+    int bitsize = riscv_cpu_max_xlen(mcc);
+    const char *name;
+    int i;
+
+#if !defined(CONFIG_USER_ONLY)
+    env->debugger = true;
+#endif
+
+    /* Until gdb knows about 128-bit registers */
+    if (bitsize > 64) {
+        bitsize = 64;
+    }
+
+    gdb_feature_builder_init(&builder, &cpu->dyn_csr_feature,
+                             "org.gnu.gdb.riscv.csr", "riscv-csr.xml",
+                             base_reg);
+
+    for (i = 0; i < CSR_TABLE_SIZE; i++) {
+        if (env->priv_ver < csr_ops[i].min_priv_ver) {
+            continue;
+        }
+        predicate = csr_ops[i].predicate;
+        if (predicate && (predicate(env, i) == RISCV_EXCP_NONE)) {
+            name = csr_ops[i].name;
+            if (!name) {
+                name = g_strdup_printf("csr%03x", i);
+            }
+
+            gdb_feature_builder_append_reg(&builder, name, bitsize, i,
+                                           "int", NULL);
+        }
+    }
+
+    gdb_feature_builder_end(&builder);
+
+#if !defined(CONFIG_USER_ONLY)
+    env->debugger = false;
+#endif
+
+    return &cpu->dyn_csr_feature;
+}
+#endif /* CONFIG_TCG */
+
+static GDBFeature *ricsv_gen_dynamic_vector_feature(CPUState *cs, int base_reg)
+{
+    RISCVCPU *cpu = RISCV_CPU(cs);
+    int bitsize = cpu->cfg.vlenb << 3;
+    GDBFeatureBuilder builder;
+    int i;
+
+    gdb_feature_builder_init(&builder, &cpu->dyn_vreg_feature,
+                             "org.gnu.gdb.riscv.vector", "riscv-vector.xml",
+                             base_reg);
+
+    /* First define types and totals in a whole VL */
+    for (i = 0; i < ARRAY_SIZE(vec_lanes); i++) {
+        int count = bitsize / vec_lanes[i].size;
+        gdb_feature_builder_append_tag(
+            &builder, "<vector id=\"%s\" type=\"%s\" count=\"%d\"/>",
+            vec_lanes[i].id, vec_lanes[i].gdb_type, count);
+    }
+
+    /* Define unions */
+    gdb_feature_builder_append_tag(&builder, "<union id=\"riscv_vector\">");
+    for (i = 0; i < ARRAY_SIZE(vec_lanes); i++) {
+        gdb_feature_builder_append_tag(&builder,
+                                       "<field name=\"%c\" type=\"%s\"/>",
+                                       vec_lanes[i].suffix, vec_lanes[i].id);
+    }
+    gdb_feature_builder_append_tag(&builder, "</union>");
+
+    /* Define vector registers */
+    for (i = 0; i < 32; i++) {
+        gdb_feature_builder_append_reg(&builder, g_strdup_printf("v%d", i),
+                                       bitsize, i, "riscv_vector", "vector");
+    }
+
+    gdb_feature_builder_end(&builder);
+
+    return &cpu->dyn_vreg_feature;
 }
 
 void riscv_cpu_register_gdb_regs_for_features(CPUState *cs)
 {
     RISCVCPU *cpu = RISCV_CPU(cs);
     CPURISCVState *env = &cpu->env;
-    if (env->misa & RVD) {
+    if (env->misa_ext & RVD) {
         gdb_register_coprocessor(cs, riscv_gdb_get_fpu, riscv_gdb_set_fpu,
-                                 36, "riscv-64bit-fpu.xml", 0);
-    } else if (env->misa & RVF) {
+                                 gdb_find_static_feature("riscv-64bit-fpu.xml"));
+    } else if (env->misa_ext & RVF) {
         gdb_register_coprocessor(cs, riscv_gdb_get_fpu, riscv_gdb_set_fpu,
-                                 36, "riscv-32bit-fpu.xml", 0);
+                                 gdb_find_static_feature("riscv-32bit-fpu.xml"));
     }
-#if defined(TARGET_RISCV32)
-    gdb_register_coprocessor(cs, riscv_gdb_get_csr, riscv_gdb_set_csr,
-                             240, "riscv-32bit-csr.xml", 0);
+    if (cpu->cfg.ext_zve32x) {
+        gdb_register_coprocessor(cs, riscv_gdb_get_vector,
+                                 riscv_gdb_set_vector,
+                                 ricsv_gen_dynamic_vector_feature(cs, cs->gdb_num_regs));
+    }
 
-    gdb_register_coprocessor(cs, riscv_gdb_get_virtual, riscv_gdb_set_virtual,
-                             1, "riscv-32bit-virtual.xml", 0);
-#elif defined(TARGET_RISCV64)
-    gdb_register_coprocessor(cs, riscv_gdb_get_csr, riscv_gdb_set_csr,
-                             240, "riscv-64bit-csr.xml", 0);
+#ifdef CONFIG_TCG
+    RISCVCPUClass *mcc = RISCV_CPU_GET_CLASS(cs);
 
-    gdb_register_coprocessor(cs, riscv_gdb_get_virtual, riscv_gdb_set_virtual,
-                             1, "riscv-64bit-virtual.xml", 0);
+    switch (mcc->def->misa_mxl_max) {
+    case MXL_RV32:
+        gdb_register_coprocessor(cs, riscv_gdb_get_virtual,
+                                 riscv_gdb_set_virtual,
+                                 gdb_find_static_feature("riscv-32bit-virtual.xml"));
+        break;
+    case MXL_RV64:
+    case MXL_RV128:
+        gdb_register_coprocessor(cs, riscv_gdb_get_virtual,
+                                 riscv_gdb_set_virtual,
+                                 gdb_find_static_feature("riscv-64bit-virtual.xml"));
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    if (cpu->cfg.ext_zicsr) {
+        gdb_register_coprocessor(cs, riscv_gdb_get_csr, riscv_gdb_set_csr,
+                                 riscv_gen_dynamic_csr_feature(cs, cs->gdb_num_regs));
+    }
 #endif
 }

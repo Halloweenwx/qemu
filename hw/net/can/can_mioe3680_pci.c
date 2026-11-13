@@ -26,24 +26,22 @@
  */
 
 #include "qemu/osdep.h"
-#include "qemu/event_notifier.h"
 #include "qemu/module.h"
-#include "qemu/thread.h"
-#include "qemu/sockets.h"
 #include "qapi/error.h"
-#include "chardev/char.h"
-#include "hw/irq.h"
-#include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/pci/pci_device.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "net/can_emu.h"
 
 #include "can_sja1000.h"
+#include "qom/object.h"
 
 #define TYPE_CAN_PCI_DEV "mioe3680_pci"
 
-#define MIOe3680_PCI_DEV(obj) \
-    OBJECT_CHECK(Mioe3680PCIState, (obj), TYPE_CAN_PCI_DEV)
+typedef struct Mioe3680PCIState Mioe3680PCIState;
+DECLARE_INSTANCE_CHECKER(Mioe3680PCIState, MIOe3680_PCI_DEV,
+                         TYPE_CAN_PCI_DEV)
 
 /* the PCI device and vendor IDs */
 #ifndef MIOe3680_PCI_VENDOR_ID1
@@ -59,7 +57,7 @@
 
 #define MIOe3680_PCI_BYTES_PER_SJA 0x80
 
-typedef struct Mioe3680PCIState {
+struct Mioe3680PCIState {
     /*< private >*/
     PCIDevice       dev;
     /*< public >*/
@@ -70,7 +68,7 @@ typedef struct Mioe3680PCIState {
 
     char            *model; /* The model that support, only SJA1000 now. */
     CanBusState     *canbus[MIOe3680_PCI_SJA_COUNT];
-} Mioe3680PCIState;
+};
 
 static void mioe3680_pci_reset(DeviceState *dev)
 {
@@ -201,8 +199,7 @@ static const VMStateDescription vmstate_mioe3680_pci = {
     .name = "mioe3680_pci",
     .version_id = 1,
     .minimum_version_id = 1,
-    .minimum_version_id_old = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, Mioe3680PCIState),
         VMSTATE_STRUCT(sja_state[0], Mioe3680PCIState, 0, vmstate_can_sja,
                        CanSJA1000State),
@@ -219,14 +216,14 @@ static void mioe3680_pci_instance_init(Object *obj)
     object_property_add_link(obj, "canbus0", TYPE_CAN_BUS,
                              (Object **)&d->canbus[0],
                              qdev_prop_allow_set_link_before_realize,
-                             0, &error_abort);
+                             0);
     object_property_add_link(obj, "canbus1", TYPE_CAN_BUS,
                              (Object **)&d->canbus[1],
                              qdev_prop_allow_set_link_before_realize,
-                             0, &error_abort);
+                             0);
 }
 
-static void mioe3680_pci_class_init(ObjectClass *klass, void *data)
+static void mioe3680_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -242,7 +239,7 @@ static void mioe3680_pci_class_init(ObjectClass *klass, void *data)
     dc->desc = "Mioe3680 PCICANx";
     dc->vmsd = &vmstate_mioe3680_pci;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
-    dc->reset = mioe3680_pci_reset;
+    device_class_set_legacy_reset(dc, mioe3680_pci_reset);
 }
 
 static const TypeInfo mioe3680_pci_info = {
@@ -251,7 +248,7 @@ static const TypeInfo mioe3680_pci_info = {
     .instance_size = sizeof(Mioe3680PCIState),
     .class_init    = mioe3680_pci_class_init,
     .instance_init = mioe3680_pci_instance_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
     },

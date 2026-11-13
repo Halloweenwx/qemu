@@ -6,6 +6,7 @@
  * top-level directory.
  */
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu/host-utils.h"
 #include "qemu/sockets.h"
 
@@ -135,6 +136,7 @@ ivshmem_server_handle_new_conn(IvshmemServer *server)
     socklen_t unaddr_len;
     int newfd;
     unsigned i;
+    Error *local_err = NULL;
 
     /* accept the incoming connection */
     unaddr_len = sizeof(unaddr);
@@ -146,8 +148,13 @@ ivshmem_server_handle_new_conn(IvshmemServer *server)
         return -1;
     }
 
-    qemu_set_nonblock(newfd);
     IVSHMEM_SERVER_DEBUG(server, "accept()=%d\n", newfd);
+
+    if (!qemu_set_blocking(newfd, false, &local_err)) {
+        error_report_err(local_err);
+        close(newfd);
+        return -1;
+    }
 
     /* allocate new structure for this peer */
     peer = g_malloc0(sizeof(*peer));
@@ -288,7 +295,7 @@ ivshmem_server_init(IvshmemServer *server, const char *unix_sock_path,
 int
 ivshmem_server_start(IvshmemServer *server)
 {
-    struct sockaddr_un sun;
+    struct sockaddr_un s_un;
     int shm_fd, sock_fd, ret;
 
     /* open shm file */
@@ -327,15 +334,15 @@ ivshmem_server_start(IvshmemServer *server)
         goto err_close_shm;
     }
 
-    sun.sun_family = AF_UNIX;
-    ret = snprintf(sun.sun_path, sizeof(sun.sun_path), "%s",
+    s_un.sun_family = AF_UNIX;
+    ret = snprintf(s_un.sun_path, sizeof(s_un.sun_path), "%s",
                    server->unix_sock_path);
-    if (ret < 0 || ret >= sizeof(sun.sun_path)) {
+    if (ret < 0 || ret >= sizeof(s_un.sun_path)) {
         IVSHMEM_SERVER_DEBUG(server, "could not copy unix socket path\n");
         goto err_close_sock;
     }
-    if (bind(sock_fd, (struct sockaddr *)&sun, sizeof(sun)) < 0) {
-        IVSHMEM_SERVER_DEBUG(server, "cannot connect to %s: %s\n", sun.sun_path,
+    if (bind(sock_fd, (struct sockaddr *)&s_un, sizeof(s_un)) < 0) {
+        IVSHMEM_SERVER_DEBUG(server, "cannot connect to %s: %s\n", s_un.sun_path,
                              strerror(errno));
         goto err_close_sock;
     }

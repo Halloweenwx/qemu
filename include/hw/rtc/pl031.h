@@ -14,13 +14,14 @@
 #ifndef HW_RTC_PL031_H
 #define HW_RTC_PL031_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "qemu/timer.h"
+#include "qom/object.h"
 
 #define TYPE_PL031 "pl031"
-#define PL031(obj) OBJECT_CHECK(PL031State, (obj), TYPE_PL031)
+OBJECT_DECLARE_SIMPLE_TYPE(PL031State, PL031)
 
-typedef struct PL031State {
+struct PL031State {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
@@ -35,13 +36,12 @@ typedef struct PL031State {
     uint32_t tick_offset_vmstate;
     uint32_t tick_offset;
     bool tick_offset_migrated;
-    bool migrate_tick_offset;
 
     uint32_t mr;
     uint32_t lr;
     uint32_t cr;
     uint32_t im;
     uint32_t is;
-} PL031State;
+};
 
 #endif

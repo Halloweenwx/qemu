@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -22,6 +22,7 @@
 #include "io/task.h"
 #include "qapi/error.h"
 #include "qemu/thread.h"
+#include "qom/object.h"
 #include "trace.h"
 
 struct QIOTaskThreadData {
@@ -69,8 +70,12 @@ QIOTask *qio_task_new(Object *source,
     return task;
 }
 
-static void qio_task_free(QIOTask *task)
+void qio_task_free(QIOTask *task)
 {
+    if (!task) {
+        return;
+    }
+
     qemu_mutex_lock(&task->thread_lock);
     if (task->thread) {
         if (task->thread->destroy) {
@@ -90,9 +95,7 @@ static void qio_task_free(QIOTask *task)
     if (task->destroyResult) {
         task->destroyResult(task->result);
     }
-    if (task->err) {
-        error_free(task->err);
-    }
+    error_free(task->err);
     object_unref(task->source);
 
     qemu_mutex_unlock(&task->thread_lock);
@@ -109,6 +112,7 @@ static gboolean qio_task_thread_result(gpointer opaque)
 
     trace_qio_task_thread_result(task);
     qio_task_complete(task);
+    qio_task_free(task);
 
     return FALSE;
 }
@@ -195,7 +199,6 @@ void qio_task_complete(QIOTask *task)
 {
     task->func(task, task->opaque);
     trace_qio_task_complete(task);
-    qio_task_free(task);
 }
 
 

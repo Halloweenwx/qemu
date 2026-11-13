@@ -23,18 +23,18 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "migration/vmstate.h"
 #include "hw/i2c/i2c.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
+#include "qom/object.h"
 
 #ifndef EXYNOS4_I2C_DEBUG
 #define EXYNOS4_I2C_DEBUG                 0
 #endif
 
 #define TYPE_EXYNOS4_I2C                  "exynos4210.i2c"
-#define EXYNOS4_I2C(obj)                  \
-    OBJECT_CHECK(Exynos4210I2CState, (obj), TYPE_EXYNOS4_I2C)
+OBJECT_DECLARE_SIMPLE_TYPE(Exynos4210I2CState, EXYNOS4_I2C)
 
 /* Exynos4210 I2C memory map */
 #define EXYNOS4_I2C_MEM_SIZE              0x14
@@ -83,7 +83,7 @@ static const char *exynos4_i2c_get_regname(unsigned offset)
 #define DPRINT(fmt, args...)              do { } while (0)
 #endif
 
-typedef struct Exynos4210I2CState {
+struct Exynos4210I2CState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
@@ -96,7 +96,7 @@ typedef struct Exynos4210I2CState {
     uint8_t i2cds;
     uint8_t i2clc;
     bool scl_free;
-} Exynos4210I2CState;
+};
 
 static inline void exynos4210_i2c_raise_interrupt(Exynos4210I2CState *s)
 {
@@ -273,7 +273,7 @@ static const VMStateDescription exynos4210_i2c_vmstate = {
     .name = "exynos4210.i2c",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT8(i2ccon, Exynos4210I2CState),
         VMSTATE_UINT8(i2cstat, Exynos4210I2CState),
         VMSTATE_UINT8(i2cds, Exynos4210I2CState),
@@ -309,12 +309,12 @@ static void exynos4210_i2c_init(Object *obj)
     s->bus = i2c_init_bus(dev, "i2c");
 }
 
-static void exynos4210_i2c_class_init(ObjectClass *klass, void *data)
+static void exynos4210_i2c_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->vmsd = &exynos4210_i2c_vmstate;
-    dc->reset = exynos4210_i2c_reset;
+    device_class_set_legacy_reset(dc, exynos4210_i2c_reset);
 }
 
 static const TypeInfo exynos4210_i2c_type_info = {

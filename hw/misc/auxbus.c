@@ -33,6 +33,7 @@
 #include "hw/misc/auxbus.h"
 #include "hw/i2c/i2c.h"
 #include "monitor/monitor.h"
+#include "monitor/hmp.h"
 #include "qapi/error.h"
 
 #ifndef DEBUG_AUX
@@ -45,32 +46,33 @@
     }                                                                          \
 } while (0)
 
-#define TYPE_AUXTOI2C "aux-to-i2c-bridge"
-#define AUXTOI2C(obj) OBJECT_CHECK(AUXTOI2CState, (obj), TYPE_AUXTOI2C)
 
-static void aux_slave_dev_print(Monitor *mon, DeviceState *dev, int indent);
+#ifdef CONFIG_HMP
+static void aux_slave_dev_print(MonitorHMP *hmp, DeviceState *dev, int indent);
+#endif
 static inline I2CBus *aux_bridge_get_i2c_bus(AUXTOI2CState *bridge);
 
 /* aux-bus implementation (internal not public) */
-static void aux_bus_class_init(ObjectClass *klass, void *data)
+static void aux_bus_class_init(ObjectClass *klass, const void *data)
 {
+#ifdef CONFIG_HMP
     BusClass *k = BUS_CLASS(klass);
 
     /* AUXSlave has an MMIO so we need to change the way we print information
      * in monitor.
      */
     k->print_dev = aux_slave_dev_print;
+#endif
 }
 
-AUXBus *aux_init_bus(DeviceState *parent, const char *name)
+AUXBus *aux_bus_init(DeviceState *parent, const char *name)
 {
     AUXBus *bus;
     Object *auxtoi2c;
 
-    bus = AUX_BUS(qbus_create(TYPE_AUX_BUS, parent, name));
+    bus = AUX_BUS(qbus_new(TYPE_AUX_BUS, parent, name));
     auxtoi2c = object_new_with_props(TYPE_AUXTOI2C, OBJECT(bus), "i2c",
                                      &error_abort, NULL);
-    qdev_set_parent_bus(DEVICE(auxtoi2c), BUS(bus));
 
     bus->bridge = AUXTOI2C(auxtoi2c);
 
@@ -81,16 +83,16 @@ AUXBus *aux_init_bus(DeviceState *parent, const char *name)
     return bus;
 }
 
+void aux_bus_realize(AUXBus *bus)
+{
+    qdev_realize(DEVICE(bus->bridge), BUS(bus), &error_fatal);
+}
+
 void aux_map_slave(AUXSlave *aux_dev, hwaddr addr)
 {
     DeviceState *dev = DEVICE(aux_dev);
     AUXBus *bus = AUX_BUS(qdev_get_parent_bus(dev));
     memory_region_add_subregion(bus->aux_io, addr, aux_dev->mmio);
-}
-
-static bool aux_bus_is_bridge(AUXBus *bus, DeviceState *dev)
-{
-    return (dev == DEVICE(bus->bridge));
 }
 
 I2CBus *aux_get_i2c_bus(AUXBus *bus)
@@ -104,7 +106,6 @@ AUXReply aux_request(AUXBus *bus, AUXCommand cmd, uint32_t address,
     AUXReply ret = AUX_NACK;
     I2CBus *i2c_bus = aux_get_i2c_bus(bus);
     size_t i;
-    bool is_write = false;
 
     DPRINTF("request at address 0x%" PRIX32 ", command %u, len %u\n", address,
             cmd, len);
@@ -115,11 +116,10 @@ AUXReply aux_request(AUXBus *bus, AUXCommand cmd, uint32_t address,
      */
     case WRITE_AUX:
     case READ_AUX:
-        is_write = cmd == READ_AUX ? false : true;
         for (i = 0; i < len; i++) {
             if (!address_space_rw(&bus->aux_addr_space, address++,
                                   MEMTXATTRS_UNSPECIFIED, data++, 1,
-                                  is_write)) {
+                                  cmd == WRITE_AUX)) {
                 ret = AUX_I2C_ACK;
             } else {
                 ret = AUX_NACK;
@@ -131,24 +131,37 @@ AUXReply aux_request(AUXBus *bus, AUXCommand cmd, uint32_t address,
      * Classic I2C transactions..
      */
     case READ_I2C:
-    case WRITE_I2C:
-        is_write = cmd == READ_I2C ? false : true;
         if (i2c_bus_busy(i2c_bus)) {
             i2c_end_transfer(i2c_bus);
         }
 
-        if (i2c_start_transfer(i2c_bus, address, is_write)) {
+        if (i2c_start_recv(i2c_bus, address)) {
             ret = AUX_I2C_NACK;
             break;
         }
 
         ret = AUX_I2C_ACK;
-        while (len > 0) {
-            if (i2c_send_recv(i2c_bus, data++, is_write) < 0) {
+        for (i = 0; i < len; i++) {
+            data[i] = i2c_recv(i2c_bus);
+        }
+        i2c_end_transfer(i2c_bus);
+        break;
+    case WRITE_I2C:
+        if (i2c_bus_busy(i2c_bus)) {
+            i2c_end_transfer(i2c_bus);
+        }
+
+        if (i2c_start_send(i2c_bus, address)) {
+            ret = AUX_I2C_NACK;
+            break;
+        }
+
+        ret = AUX_I2C_ACK;
+        for (i = 0; i < len; i++) {
+            if (i2c_send(i2c_bus, data[i]) < 0) {
                 ret = AUX_I2C_NACK;
                 break;
             }
-            len--;
         }
         i2c_end_transfer(i2c_bus);
         break;
@@ -161,14 +174,12 @@ AUXReply aux_request(AUXBus *bus, AUXCommand cmd, uint32_t address,
      *  - We changed the address.
      */
     case WRITE_I2C_MOT:
-    case READ_I2C_MOT:
-        is_write = cmd == READ_I2C_MOT ? false : true;
         ret = AUX_I2C_NACK;
         if (!i2c_bus_busy(i2c_bus)) {
             /*
              * No transactions started..
              */
-            if (i2c_start_transfer(i2c_bus, address, is_write)) {
+            if (i2c_start_send(i2c_bus, address)) {
                 break;
             }
         } else if ((address != bus->last_i2c_address) ||
@@ -177,26 +188,51 @@ AUXReply aux_request(AUXBus *bus, AUXCommand cmd, uint32_t address,
              * Transaction started but we need to restart..
              */
             i2c_end_transfer(i2c_bus);
-            if (i2c_start_transfer(i2c_bus, address, is_write)) {
+            if (i2c_start_send(i2c_bus, address)) {
                 break;
             }
         }
 
         bus->last_transaction = cmd;
         bus->last_i2c_address = address;
-        while (len > 0) {
-            if (i2c_send_recv(i2c_bus, data++, is_write) < 0) {
+        ret = AUX_I2C_ACK;
+        for (i = 0; i < len; i++) {
+            if (i2c_send(i2c_bus, data[i]) < 0) {
                 i2c_end_transfer(i2c_bus);
+                ret = AUX_I2C_NACK;
                 break;
             }
-            len--;
-        }
-        if (len == 0) {
-            ret = AUX_I2C_ACK;
         }
         break;
+    case READ_I2C_MOT:
+        ret = AUX_I2C_NACK;
+        if (!i2c_bus_busy(i2c_bus)) {
+            /*
+             * No transactions started..
+             */
+            if (i2c_start_recv(i2c_bus, address)) {
+                break;
+            }
+        } else if ((address != bus->last_i2c_address) ||
+                   (bus->last_transaction != cmd)) {
+            /*
+             * Transaction started but we need to restart..
+             */
+            i2c_end_transfer(i2c_bus);
+            if (i2c_start_recv(i2c_bus, address)) {
+                break;
+            }
+        }
+
+        bus->last_transaction = cmd;
+        bus->last_i2c_address = address;
+        for (i = 0; i < len; i++) {
+            data[i] = i2c_recv(i2c_bus);
+        }
+        ret = AUX_I2C_ACK;
+        break;
     default:
-        DPRINTF("Not implemented!\n");
+        qemu_log_mask(LOG_UNIMP, "AUX cmd=%u not implemented\n", cmd);
         return AUX_NACK;
     }
 
@@ -220,12 +256,12 @@ struct AUXTOI2CState {
     I2CBus *i2c_bus;
 };
 
-static void aux_bridge_class_init(ObjectClass *oc, void *data)
+static void aux_bridge_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
 
     /* This device is private and is created only once for each
-     * aux-bus in aux_init_bus(..). So don't allow the user to add one.
+     * aux-bus in aux_bus_init(..). So don't allow the user to add one.
      */
     dc->user_creatable = false;
 }
@@ -244,14 +280,20 @@ static inline I2CBus *aux_bridge_get_i2c_bus(AUXTOI2CState *bridge)
 
 static const TypeInfo aux_to_i2c_type_info = {
     .name = TYPE_AUXTOI2C,
-    .parent = TYPE_DEVICE,
+    .parent = TYPE_AUX_SLAVE,
     .class_init = aux_bridge_class_init,
     .instance_size = sizeof(AUXTOI2CState),
     .instance_init = aux_bridge_init
 };
 
 /* aux-slave implementation */
-static void aux_slave_dev_print(Monitor *mon, DeviceState *dev, int indent)
+#ifdef CONFIG_HMP
+static bool aux_bus_is_bridge(AUXBus *bus, DeviceState *dev)
+{
+    return (dev == DEVICE(bus->bridge));
+}
+
+static void aux_slave_dev_print(MonitorHMP *hmp, DeviceState *dev, int indent)
 {
     AUXBus *bus = AUX_BUS(qdev_get_parent_bus(dev));
     AUXSlave *s;
@@ -263,21 +305,12 @@ static void aux_slave_dev_print(Monitor *mon, DeviceState *dev, int indent)
 
     s = AUX_SLAVE(dev);
 
-    monitor_printf(mon, "%*smemory " TARGET_FMT_plx "/" TARGET_FMT_plx "\n",
-                   indent, "",
-                   object_property_get_uint(OBJECT(s->mmio), "addr", NULL),
-                   memory_region_size(s->mmio));
+    monitor_hmp_printf(hmp, "%*smemory " HWADDR_FMT_plx "/" HWADDR_FMT_plx "\n",
+                       indent, "",
+                       object_property_get_uint(OBJECT(s->mmio), "addr", NULL),
+                       memory_region_size(s->mmio));
 }
-
-DeviceState *aux_create_slave(AUXBus *bus, const char *type)
-{
-    DeviceState *dev;
-
-    dev = DEVICE(object_new(type));
-    assert(dev);
-    qdev_set_parent_bus(dev, &bus->qbus);
-    return dev;
-}
+#endif
 
 void aux_init_mmio(AUXSlave *aux_slave, MemoryRegion *mmio)
 {
@@ -285,7 +318,7 @@ void aux_init_mmio(AUXSlave *aux_slave, MemoryRegion *mmio)
     aux_slave->mmio = mmio;
 }
 
-static void aux_slave_class_init(ObjectClass *klass, void *data)
+static void aux_slave_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *k = DEVICE_CLASS(klass);
 

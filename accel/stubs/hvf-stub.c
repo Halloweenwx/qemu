@@ -1,30 +1,24 @@
 /*
- * QEMU HVF support
+ * HVF stubs for QEMU
  *
- * Copyright 2017 Red Hat, Inc.
+ *  Copyright (c) Linaro
  *
- * This software is licensed under the terms of the GNU General Public
- * License version 2 or later, as published by the Free Software Foundation,
- * and may be copied, distributed, and modified under those terms.
- *
- * See the COPYING file in the top-level directory.
- *
+ * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include "qemu/osdep.h"
-#include "cpu.h"
-#include "sysemu/hvf.h"
+#include "system/hvf.h"
 
-int hvf_init_vcpu(CPUState *cpu)
-{
-    return -ENOSYS;
-}
+bool hvf_allowed;
+bool hvf_kernel_irqchip;
+bool hvf_nested_virt;
 
-int hvf_vcpu_exec(CPUState *cpu)
+void hvf_nested_virt_enable(bool nested_virt)
 {
-    return -ENOSYS;
-}
-
-void hvf_vcpu_destroy(CPUState *cpu)
-{
+    /*
+     * This is called unconditionally from hw/arm/virt.c
+     * because we don't know if HVF is going to be used
+     * as that step of initialisation happens later.
+     * As such, do nothing here instead of marking as unreachable.
+     */
 }

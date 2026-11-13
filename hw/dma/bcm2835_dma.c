@@ -1,12 +1,14 @@
 /*
  * Raspberry Pi emulation (c) 2012 Gregory Estrade
- * This code is licensed under the GNU GPLv2 and later.
+ *
+ * This work is licensed under the terms of the GNU GPL, version 2 or later.
+ * See the COPYING file in the top-level directory.
  */
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "hw/dma/bcm2835_dma.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -83,6 +85,23 @@ static void bcm2835_dma_update(BCM2835DMAState *s, unsigned c)
             src_stride = 0;
         }
         xlen_td = xlen;
+
+        if (ch->ti & BCM2708_DMA_D_WIDTH) {
+            qemu_log_mask(LOG_UNIMP, "%s: 128bit transfers not yet supported", __func__);
+            ch->cs |= BCM2708_DMA_ERR;
+            break;
+        }
+
+        /*
+         * Datasheet implies 32bit or 128bit transfers only
+         *
+         * TODO: test on real HW and report back.
+         */
+        if (xlen & 0x3) {
+            qemu_log_mask(LOG_GUEST_ERROR, "%s: bad transfer size\n", __func__);
+            ch->cs |= BCM2708_DMA_ERR;
+            break;
+        }
 
         while (ylen != 0) {
             /* Normal transfer mode */
@@ -309,7 +328,7 @@ static const VMStateDescription vmstate_bcm2835_dma_chan = {
     .name = TYPE_BCM2835_DMA "-chan",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(cs, BCM2835DMAChan),
         VMSTATE_UINT32(conblk_ad, BCM2835DMAChan),
         VMSTATE_UINT32(ti, BCM2835DMAChan),
@@ -327,7 +346,7 @@ static const VMStateDescription vmstate_bcm2835_dma = {
     .name = TYPE_BCM2835_DMA,
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(chan, BCM2835DMAState, BCM2835_DMA_NCHANS, 1,
                              vmstate_bcm2835_dma_chan, BCM2835DMAChan),
         VMSTATE_UINT32(int_status, BCM2835DMAState),
@@ -374,32 +393,25 @@ static void bcm2835_dma_reset(DeviceState *dev)
 static void bcm2835_dma_realize(DeviceState *dev, Error **errp)
 {
     BCM2835DMAState *s = BCM2835_DMA(dev);
-    Error *err = NULL;
     Object *obj;
 
-    obj = object_property_get_link(OBJECT(dev), "dma-mr", &err);
-    if (obj == NULL) {
-        error_setg(errp, "%s: required dma-mr link not found: %s",
-                   __func__, error_get_pretty(err));
-        return;
-    }
-
+    obj = object_property_get_link(OBJECT(dev), "dma-mr", &error_abort);
     s->dma_mr = MEMORY_REGION(obj);
     address_space_init(&s->dma_as, s->dma_mr, TYPE_BCM2835_DMA "-memory");
 
     bcm2835_dma_reset(dev);
 }
 
-static void bcm2835_dma_class_init(ObjectClass *klass, void *data)
+static void bcm2835_dma_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = bcm2835_dma_realize;
-    dc->reset = bcm2835_dma_reset;
+    device_class_set_legacy_reset(dc, bcm2835_dma_reset);
     dc->vmsd = &vmstate_bcm2835_dma;
 }
 
-static TypeInfo bcm2835_dma_info = {
+static const TypeInfo bcm2835_dma_info = {
     .name          = TYPE_BCM2835_DMA,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(BCM2835DMAState),

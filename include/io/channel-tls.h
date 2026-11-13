@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -24,12 +24,11 @@
 #include "io/channel.h"
 #include "io/task.h"
 #include "crypto/tlssession.h"
+#include "qom/object.h"
 
 #define TYPE_QIO_CHANNEL_TLS "qio-channel-tls"
-#define QIO_CHANNEL_TLS(obj)                                     \
-    OBJECT_CHECK(QIOChannelTLS, (obj), TYPE_QIO_CHANNEL_TLS)
+OBJECT_DECLARE_SIMPLE_TYPE(QIOChannelTLS, QIO_CHANNEL_TLS)
 
-typedef struct QIOChannelTLS QIOChannelTLS;
 
 /**
  * QIOChannelTLS
@@ -49,7 +48,21 @@ struct QIOChannelTLS {
     QIOChannel *master;
     QCryptoTLSSession *session;
     QIOChannelShutdown shutdown;
+    guint hs_ioc_tag;
+    guint bye_ioc_tag;
+    size_t corked;
 };
+
+/**
+ * qio_channel_tls_bye:
+ * @ioc: the TLS channel object
+ * @errp: pointer to a NULL-initialized error object
+ *
+ * Perform the TLS session termination. This method will return
+ * immediately and the termination will continue in the background,
+ * provided the main loop is running.
+ */
+void qio_channel_tls_bye(QIOChannelTLS *ioc, Error **errp);
 
 /**
  * qio_channel_tls_new_server:

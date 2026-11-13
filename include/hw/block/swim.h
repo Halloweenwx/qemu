@@ -11,17 +11,16 @@
 #ifndef SWIM_H
 #define SWIM_H
 
-#include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/block/block.h"
+#include "hw/core/sysbus.h"
+#include "qom/object.h"
 
 #define SWIM_MAX_FD            2
 
-typedef struct SWIMDrive SWIMDrive;
-typedef struct SWIMBus SWIMBus;
 typedef struct SWIMCtrl SWIMCtrl;
 
 #define TYPE_SWIM_DRIVE "swim-drive"
-#define SWIM_DRIVE(obj) OBJECT_CHECK(SWIMDrive, (obj), TYPE_SWIM_DRIVE)
+OBJECT_DECLARE_SIMPLE_TYPE(SWIMDrive, SWIM_DRIVE)
 
 struct SWIMDrive {
     DeviceState qdev;
@@ -30,7 +29,7 @@ struct SWIMDrive {
 };
 
 #define TYPE_SWIM_BUS "swim-bus"
-#define SWIM_BUS(obj) OBJECT_CHECK(SWIMBus, (obj), TYPE_SWIM_BUS)
+OBJECT_DECLARE_SIMPLE_TYPE(SWIMBus, SWIM_BUS)
 
 struct SWIMBus {
     BusState bus;
@@ -44,33 +43,30 @@ typedef struct FDrive {
 } FDrive;
 
 struct SWIMCtrl {
-    MemoryRegion iomem;
+    MemoryRegion swim;
+    MemoryRegion iwm;
+    MemoryRegion ism;
     FDrive drives[SWIM_MAX_FD];
     int mode;
     /* IWM mode */
     int iwm_switch;
-    uint16_t regs[8];
-#define IWM_PH0   0
-#define IWM_PH1   1
-#define IWM_PH2   2
-#define IWM_PH3   3
-#define IWM_MTR   4
-#define IWM_DRIVE 5
-#define IWM_Q6    6
-#define IWM_Q7    7
-    uint8_t iwm_data;
-    uint8_t iwm_mode;
+    uint8_t iwm_latches;
+    uint8_t iwmregs[8];
     /* SWIM mode */
+    uint8_t ismregs[16];
     uint8_t swim_phase;
     uint8_t swim_mode;
+    uint8_t swim_status;
+    uint8_t pram[16];
+    uint8_t pram_idx;
     SWIMBus bus;
 };
 
 #define TYPE_SWIM "swim"
-#define SWIM(obj) OBJECT_CHECK(SWIM, (obj), TYPE_SWIM)
+OBJECT_DECLARE_SIMPLE_TYPE(Swim, SWIM)
 
-typedef struct SWIM {
+struct Swim {
     SysBusDevice parent_obj;
     SWIMCtrl     ctrl;
-} SWIM;
+};
 #endif

@@ -23,9 +23,11 @@
 
 #include "hw/pci/pci_bridge.h"
 #include "hw/pci/pci_bus.h"
+#include "hw/pci/pci_device.h"
+#include "qom/object.h"
 
 #define TYPE_PCIE_PORT "pcie-port"
-#define PCIE_PORT(obj) OBJECT_CHECK(PCIEPort, (obj), TYPE_PCIE_PORT)
+OBJECT_DECLARE_SIMPLE_TYPE(PCIEPort, PCIE_PORT)
 
 struct PCIEPort {
     /*< private >*/
@@ -38,8 +40,12 @@ struct PCIEPort {
 
 void pcie_port_init_reg(PCIDevice *d);
 
+PCIDevice *pcie_find_port_by_pn(PCIBus *bus, uint8_t pn);
+PCIDevice *pcie_find_port_first(PCIBus *bus);
+int pcie_count_ds_ports(PCIBus *bus);
+
 #define TYPE_PCIE_SLOT "pcie-slot"
-#define PCIE_SLOT(obj) OBJECT_CHECK(PCIESlot, (obj), TYPE_PCIE_SLOT)
+OBJECT_DECLARE_SIMPLE_TYPE(PCIESlot, PCIE_SLOT)
 
 struct PCIESlot {
     /*< private >*/
@@ -52,30 +58,30 @@ struct PCIESlot {
 
     PCIExpLinkSpeed speed;
     PCIExpLinkWidth width;
+    bool flitmode;
 
-    /* Disable ACS (really for a pcie_root_port) */
-    bool        disable_acs;
-
-    /* Indicates whether hot-plug is enabled on the slot */
+    /* Indicates whether any type of hot-plug is allowed on the slot */
     bool        hotplug;
+
+    /* broken ACPI hotplug compat knob to preserve 6.1 ABI intact */
+    bool        hide_native_hotplug_cap;
+
     QLIST_ENTRY(PCIESlot) next;
 };
 
 void pcie_chassis_create(uint8_t chassis_number);
-PCIESlot *pcie_chassis_find_slot(uint8_t chassis, uint16_t slot);
 int pcie_chassis_add_slot(struct PCIESlot *slot);
 void pcie_chassis_del_slot(PCIESlot *s);
 
 #define TYPE_PCIE_ROOT_PORT         "pcie-root-port-base"
-#define PCIE_ROOT_PORT_CLASS(klass) \
-     OBJECT_CLASS_CHECK(PCIERootPortClass, (klass), TYPE_PCIE_ROOT_PORT)
-#define PCIE_ROOT_PORT_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(PCIERootPortClass, (obj), TYPE_PCIE_ROOT_PORT)
+typedef struct PCIERootPortClass PCIERootPortClass;
+DECLARE_CLASS_CHECKERS(PCIERootPortClass, PCIE_ROOT_PORT,
+                       TYPE_PCIE_ROOT_PORT)
 
-typedef struct PCIERootPortClass {
+struct PCIERootPortClass {
     PCIDeviceClass parent_class;
     DeviceRealize parent_realize;
-    DeviceReset parent_reset;
+    ResettablePhases parent_phases;
 
     uint8_t (*aer_vector)(const PCIDevice *dev);
     int (*interrupts_init)(PCIDevice *dev, Error **errp);
@@ -86,6 +92,6 @@ typedef struct PCIERootPortClass {
     int ssvid_offset;
     int acs_offset;    /* If nonzero, optional ACS capability offset */
     int ssid;
-} PCIERootPortClass;
+};
 
 #endif /* QEMU_PCIE_PORT_H */

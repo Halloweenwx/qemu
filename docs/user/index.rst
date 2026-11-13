@@ -1,14 +1,13 @@
-.. This is the top level page for the 'user' manual.
+.. _User Mode Emulation:
 
+-------------------
+User Mode Emulation
+-------------------
 
-QEMU User Mode Emulation User's Guide
-=====================================
-
-This manual is the overall guide for users using QEMU
-for user-mode emulation.  In this mode, QEMU can launch
-processes compiled for one CPU on another CPU.
-
-Contents:
+This section of the manual is the overall guide for users using QEMU
+for user-mode emulation. In this mode, QEMU can launch programs
+compiled for one CPU architecture on the same Operating System (OS)
+but running on a different CPU architecture.
 
 .. toctree::
    :maxdepth: 2

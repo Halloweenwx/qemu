@@ -17,6 +17,7 @@
 #include "qemu/queue.h"
 #include "hw/isa/isa.h"
 #include "hw/hyperv/hyperv.h"
+#include "qom/object.h"
 
 typedef struct TestSintRoute {
     QLIST_ENTRY(TestSintRoute) le;
@@ -46,11 +47,9 @@ struct HypervTestDev {
     QLIST_HEAD(, TestMsgConn) msg_conns;
     QLIST_HEAD(, TestEvtConn) evt_conns;
 };
-typedef struct HypervTestDev HypervTestDev;
 
 #define TYPE_HYPERV_TEST_DEV "hyperv-testdev"
-#define HYPERV_TEST_DEV(obj) \
-        OBJECT_CHECK(HypervTestDev, (obj), TYPE_HYPERV_TEST_DEV)
+OBJECT_DECLARE_SIMPLE_TYPE(HypervTestDev, HYPERV_TEST_DEV)
 
 enum {
     HV_TEST_DEV_SINT_ROUTE_CREATE = 1,
@@ -89,8 +88,7 @@ static TestSintRoute *sint_route_find(HypervTestDev *dev,
             return sint_route;
         }
     }
-    assert(false);
-    return NULL;
+    g_assert_not_reached();
 }
 
 static void sint_route_destroy(HypervTestDev *dev,
@@ -188,7 +186,7 @@ static void msg_conn_destroy(HypervTestDev *dev, uint8_t conn_id)
             return;
         }
     }
-    assert(false);
+    g_assert_not_reached();
 }
 
 static void evt_conn_handler(EventNotifier *notifier)
@@ -238,7 +236,7 @@ static void evt_conn_destroy(HypervTestDev *dev, uint8_t conn_id)
             return;
         }
     }
-    assert(false);
+    g_assert_not_reached();
 }
 
 static uint64_t hv_test_dev_read(void *opaque, hwaddr addr, unsigned size)
@@ -305,7 +303,7 @@ static void hv_test_dev_realizefn(DeviceState *d, Error **errp)
     memory_region_add_subregion(io, 0x3000, &dev->sint_control);
 }
 
-static void hv_test_dev_class_init(ObjectClass *klass, void *data)
+static void hv_test_dev_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

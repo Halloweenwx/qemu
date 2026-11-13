@@ -25,8 +25,9 @@
 #ifndef HW_IPMI_H
 #define HW_IPMI_H
 
-#include "exec/memory.h"
-#include "hw/qdev-core.h"
+#include "system/memory.h"
+#include "hw/core/qdev.h"
+#include "qom/object.h"
 
 #define MAX_IPMI_MSG_SIZE 300
 
@@ -39,6 +40,16 @@ enum ipmi_op {
     IPMI_SHUTDOWN_VIA_ACPI_OVERTEMP,
     IPMI_SEND_NMI
 };
+
+/* Channel properties */
+#define IPMI_CHANNEL_IPMB                0x00
+#define IPMI_CHANNEL_SYSTEM              0x0f
+#define IPMI_CHANNEL_MEDIUM_IPMB         0x01
+#define IPMI_CHANNEL_MEDIUM_802_3_LAN    0x04
+#define IPMI_CHANNEL_MEDIUM_SYSTEM       0x0c
+#define IPMI_CHANNEL_PROTOCOL_IPMB       0x01
+#define IPMI_CHANNEL_PROTOCOL_KCS        0x05
+#define IPMI_CHANNEL_PROTOCOL_BT_15      0x08
 
 #define IPMI_CC_INVALID_CMD                              0xc1
 #define IPMI_CC_COMMAND_INVALID_FOR_LUN                  0xc2
@@ -53,6 +64,7 @@ enum ipmi_op {
 #define IPMI_CC_INVALID_DATA_FIELD                       0xcc
 #define IPMI_CC_BMC_INIT_IN_PROGRESS                     0xd2
 #define IPMI_CC_COMMAND_NOT_SUPPORTED                    0xd5
+#define IPMI_CC_UNSPECIFIED                              0xff
 
 #define IPMI_NETFN_APP                0x06
 #define IPMI_NETFN_OEM                0x3a
@@ -74,6 +86,7 @@ typedef struct IPMIFwInfo {
     int interface_type;
     uint8_t ipmi_spec_major_revision;
     uint8_t ipmi_spec_minor_revision;
+    uint8_t ipmi_channel_protocol;
     uint8_t i2c_slave_address;
     uint32_t uuid;
 
@@ -88,6 +101,11 @@ typedef struct IPMIFwInfo {
     } memspace;
 
     int interrupt_number;
+    enum {
+        IPMI_NO_IRQ = 0,
+        IPMI_ISA_IRQ,
+        IPMI_PCI_IRQ,
+    } irq_source;
     enum {
         IPMI_LEVEL_IRQ,
         IPMI_EDGE_IRQ
@@ -109,14 +127,13 @@ uint32_t ipmi_next_uuid(void);
 #define TYPE_IPMI_INTERFACE "ipmi-interface"
 #define IPMI_INTERFACE(obj) \
      INTERFACE_CHECK(IPMIInterface, (obj), TYPE_IPMI_INTERFACE)
-#define IPMI_INTERFACE_CLASS(class) \
-     OBJECT_CLASS_CHECK(IPMIInterfaceClass, (class), TYPE_IPMI_INTERFACE)
-#define IPMI_INTERFACE_GET_CLASS(class) \
-     OBJECT_GET_CLASS(IPMIInterfaceClass, (class), TYPE_IPMI_INTERFACE)
+typedef struct IPMIInterfaceClass IPMIInterfaceClass;
+DECLARE_CLASS_CHECKERS(IPMIInterfaceClass, IPMI_INTERFACE,
+                       TYPE_IPMI_INTERFACE)
 
 typedef struct IPMIInterface IPMIInterface;
 
-typedef struct IPMIInterfaceClass {
+struct IPMIInterfaceClass {
     InterfaceClass parent;
 
     /*
@@ -169,28 +186,24 @@ typedef struct IPMIInterfaceClass {
      * Return the firmware info for a device.
      */
     void (*get_fwinfo)(struct IPMIInterface *s, IPMIFwInfo *info);
-} IPMIInterfaceClass;
+};
 
 /*
  * Define a BMC simulator (or perhaps a connection to a real BMC)
  */
 #define TYPE_IPMI_BMC "ipmi-bmc"
-#define IPMI_BMC(obj) \
-     OBJECT_CHECK(IPMIBmc, (obj), TYPE_IPMI_BMC)
-#define IPMI_BMC_CLASS(obj_class) \
-     OBJECT_CLASS_CHECK(IPMIBmcClass, (obj_class), TYPE_IPMI_BMC)
-#define IPMI_BMC_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(IPMIBmcClass, (obj), TYPE_IPMI_BMC)
+OBJECT_DECLARE_TYPE(IPMIBmc, IPMIBmcClass,
+                    IPMI_BMC)
 
-typedef struct IPMIBmc {
+struct IPMIBmc {
     DeviceState parent;
 
     uint8_t slave_addr;
 
     IPMIInterface *intf;
-} IPMIBmc;
+};
 
-typedef struct IPMIBmcClass {
+struct IPMIBmcClass {
     DeviceClass parent;
 
     /* Called when the system resets to report to the bmc. */
@@ -203,7 +216,7 @@ typedef struct IPMIBmcClass {
                            uint8_t *cmd, unsigned int cmd_len,
                            unsigned int max_cmd_len,
                            uint8_t msg_id);
-} IPMIBmcClass;
+};
 
 /*
  * Add a link property to obj that points to a BMC.
@@ -267,10 +280,8 @@ int ipmi_bmc_sdr_find(IPMIBmc *b, uint16_t recid,
 void ipmi_bmc_gen_event(IPMIBmc *b, uint8_t *evt, bool log);
 
 #define TYPE_IPMI_BMC_SIMULATOR "ipmi-bmc-sim"
-#define IPMI_BMC_SIMULATOR(obj) OBJECT_CHECK(IPMIBmcSim, (obj), \
-                                        TYPE_IPMI_BMC_SIMULATOR)
+OBJECT_DECLARE_SIMPLE_TYPE(IPMIBmcSim, IPMI_BMC_SIMULATOR)
 
-typedef struct IPMIBmcSim IPMIBmcSim;
 
 typedef struct RspBuffer {
     uint8_t buffer[MAX_IPMI_MSG_SIZE];

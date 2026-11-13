@@ -5,26 +5,28 @@
  *
  * Copyright (c) 2016 Artyom Tarasenko
  *
- * This code is licensed under the GNU GPL v3 or (at your option) any later
+ * This code is licensed under the GNU GPL v2 or (at your option) any later
  * version.
  */
 
 #include "qemu/osdep.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
+#include "qapi/error.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
 #include "hw/rtc/sun4v-rtc.h"
 #include "trace.h"
+#include "qom/object.h"
 
 
 #define TYPE_SUN4V_RTC "sun4v_rtc"
-#define SUN4V_RTC(obj) OBJECT_CHECK(Sun4vRtc, (obj), TYPE_SUN4V_RTC)
+OBJECT_DECLARE_SIMPLE_TYPE(Sun4vRtc, SUN4V_RTC)
 
-typedef struct Sun4vRtc {
+struct Sun4vRtc {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
-} Sun4vRtc;
+};
 
 static uint64_t sun4v_rtc_read(void *opaque, hwaddr addr,
                                 unsigned size)
@@ -47,7 +49,7 @@ static void sun4v_rtc_write(void *opaque, hwaddr addr,
 static const MemoryRegionOps sun4v_rtc_ops = {
     .read = sun4v_rtc_read,
     .write = sun4v_rtc_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
 };
 
 void sun4v_rtc_init(hwaddr addr)
@@ -55,10 +57,10 @@ void sun4v_rtc_init(hwaddr addr)
     DeviceState *dev;
     SysBusDevice *s;
 
-    dev = qdev_create(NULL, TYPE_SUN4V_RTC);
+    dev = qdev_new(TYPE_SUN4V_RTC);
     s = SYS_BUS_DEVICE(dev);
 
-    qdev_init_nofail(dev);
+    sysbus_realize_and_unref(s, &error_fatal);
 
     sysbus_mmio_map(s, 0, addr);
 }
@@ -73,7 +75,7 @@ static void sun4v_rtc_realize(DeviceState *dev, Error **errp)
     sysbus_init_mmio(sbd, &s->iomem);
 }
 
-static void sun4v_rtc_class_init(ObjectClass *klass, void *data)
+static void sun4v_rtc_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 

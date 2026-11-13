@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# group: rw auto aio quick
 #
 # Test concurrent cluster allocations
 #
@@ -18,8 +19,6 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 #
 
-# creator
-owner=kwolf@redhat.com
 
 seq=`basename $0`
 echo "QA output created by $seq"
@@ -37,7 +36,7 @@ trap "_cleanup; exit \$status" 0 1 2 3 15
 . ./common.filter
 
 _supported_fmt qcow2
-_supported_proto file
+_supported_proto file fuse
 # data_file does not support compressed clusters
 _unsupported_imgopts data_file
 
@@ -47,6 +46,8 @@ size=128M
 echo
 echo "== creating backing file for COW tests =="
 
+TEST_IMG_SAVE=$TEST_IMG
+TEST_IMG="$TEST_IMG.base"
 _make_test_img $size
 
 backing_io()
@@ -67,9 +68,8 @@ backing_io()
 
 backing_io 0 32 write | $QEMU_IO "$TEST_IMG" | _filter_qemu_io
 
-mv "$TEST_IMG" "$TEST_IMG.base"
-
-_make_test_img -b "$TEST_IMG.base" 6G
+TEST_IMG=$TEST_IMG_SAVE
+_make_test_img -b "$TEST_IMG.base" -F $IMGFMT 6G
 
 echo
 echo "== Some concurrent requests touching the same cluster =="
@@ -123,7 +123,7 @@ aio_flush
 EOF
 
 # Sequential write, but the next cluster is already allocated
-# and phyiscally in the right position
+# and physically in the right position
 cat  <<EOF
 write -P 89 0x80000 0x1000
 write -P 90 0x96000 0x8000
@@ -182,10 +182,73 @@ aio_write -P 160 0x104000 0x18000
 resume A
 aio_flush
 EOF
+
+# Create a pre-allocated zero cluster, then start a write on it and discard it
+# before the L2 update is made
+cat  <<EOF
+write -P 181 0x120000 0x10000
+write -z 0x120000 0x10000
+
+break write_aio A
+aio_write -P 180 0x120000 0x10000
+wait_break A
+aio_discard 0x120000 0x10000
+resume A
+aio_flush
+EOF
+
+# Create a pre-allocated zero cluster, then start a write on it and a
+# concurrent zero write with MAY_UNMAP before the L2 update is made
+cat  <<EOF
+write -P 181 0x130000 0x10000
+write -z 0x130000 0x10000
+
+break write_aio A
+aio_write -P 180 0x130000 0x10000
+wait_break A
+aio_write -z -u 0x130000 0x10000
+resume A
+aio_flush
+EOF
+
+# Create a pre-allocated zero cluster, then start a write on it and a
+# concurrent zero write without MAY_UNMAP before the L2 update is made
+cat  <<EOF
+write -P 181 0x140000 0x10000
+write -z 0x140000 0x10000
+
+break write_aio A
+aio_write -P 180 0x140000 0x10000
+wait_break A
+aio_write -z 0x140000 0x10000
+resume A
+aio_flush
+EOF
+
+# Start an allocating write to a previously unallocated cluster and, before
+# its L2 update is linked, issue a concurrent sub-cluster zero write with
+# MAY_UNMAP that targets a disjoint range within the same cluster. The zero
+# write's head/tail are zero (cluster is unallocated), so qcow2_co_pwrite_zeroes
+# would expand it to the full subcluster. Without waiting for dependencies
+# before the zero write's "unallocated" type check, that check passes,
+# qcow2_subcluster_zeroize then yields in wait_for_dependencies, the allocating
+# write links its L2 entry, and the resumed zeroize unmaps the cluster -
+# silently discarding the just-written data. Waiting first makes the zero write
+# fall back to a bounce-buffered real write, which only touches its own
+# subrange.
+cat <<EOF
+break write_aio A
+aio_write -P 180 0x200000 0x4000
+wait_break A
+aio_write -z -u 0x204000 0x4000
+resume A
+aio_flush
+EOF
 }
 
 overlay_io | $QEMU_IO blkdebug::"$TEST_IMG" | _filter_qemu_io |\
-	sed -e 's/bytes at offset [0-9]*/bytes at offset XXX/g'
+    sed -e 's/[0-9]*\/[0-9]* bytes at offset [0-9]*/XXX\/XXX bytes at offset XXX/g' \
+        -e 's/^[0-9]* KiB/XXX KiB/g'
 
 echo
 echo "== Verify image content =="
@@ -193,8 +256,8 @@ echo "== Verify image content =="
 verify_io()
 {
     if ($QEMU_IMG info -U -f "$IMGFMT" "$TEST_IMG" | grep "compat: 0.10" > /dev/null); then
-        # For v2 images, discarded clusters are read from the backing file
-        # Keep the variable empty so that the backing file value can be used as
+        # In v2 images clusters are not discarded when there is a backing file.
+        # Keep the variable empty so that the previous value can be used as
         # the default below
         discarded=
     else
@@ -230,14 +293,16 @@ verify_io()
     echo read -P 70 0x78000 0x6000
     echo read -P 7  0x7e000 0x2000
 
-    echo read -P ${discarded:-8} 0x80000 0x6000
+    echo read -P ${discarded:-89} 0x80000 0x1000
+    echo read -P ${discarded:-8} 0x81000 0x5000
     echo read -P 80 0x86000 0x2000
     echo read -P ${discarded:-8} 0x88000 0x2000
     echo read -P 81 0x8a000 0xe000
     echo read -P 90 0x98000 0x6000
     echo read -P 9  0x9e000 0x2000
 
-    echo read -P ${discarded:-10} 0xa0000 0x6000
+    echo read -P ${discarded:-109} 0xa0000 0x1000
+    echo read -P ${discarded:-10} 0xa1000 0x5000
     echo read -P 100 0xa6000 0x2000
     echo read -P ${discarded:-10} 0xa8000 0x2000
     echo read -P 101 0xaa000 0xe000
@@ -259,6 +324,13 @@ verify_io()
     # Undefined content for 0x10c000 0x8000
     echo read -P 160 0x114000 0x8000
     echo read -P 17  0x11c000 0x4000
+
+    echo read -P 0   0x120000 0x10000
+    echo read -P 0   0x130000 0x10000
+    echo read -P 0   0x140000 0x10000
+
+    echo read -P 180 0x200000 0x4000
+    echo read -P 0   0x204000 0xc000
 }
 
 verify_io | $QEMU_IO "$TEST_IMG" | _filter_qemu_io

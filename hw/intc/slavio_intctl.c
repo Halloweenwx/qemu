@@ -24,12 +24,12 @@
 
 #include "qemu/osdep.h"
 #include "migration/vmstate.h"
-#include "monitor/monitor.h"
 #include "qemu/module.h"
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
 #include "hw/intc/intc.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "trace.h"
+#include "qom/object.h"
 
 //#define DEBUG_IRQ_COUNT
 
@@ -58,10 +58,9 @@ typedef struct SLAVIO_CPUINTCTLState {
 } SLAVIO_CPUINTCTLState;
 
 #define TYPE_SLAVIO_INTCTL "slavio_intctl"
-#define SLAVIO_INTCTL(obj) \
-    OBJECT_CHECK(SLAVIO_INTCTLState, (obj), TYPE_SLAVIO_INTCTL)
+OBJECT_DECLARE_SIMPLE_TYPE(SLAVIO_INTCTLState, SLAVIO_INTCTL)
 
-typedef struct SLAVIO_INTCTLState {
+struct SLAVIO_INTCTLState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
@@ -73,7 +72,7 @@ typedef struct SLAVIO_INTCTLState {
     uint32_t intregm_pending;
     uint32_t intregm_disabled;
     uint32_t target_cpu;
-} SLAVIO_INTCTLState;
+};
 
 #define INTCTL_MAXADDR 0xf
 #define INTCTL_SIZE (INTCTL_MAXADDR + 1)
@@ -136,7 +135,7 @@ static void slavio_intctl_mem_writel(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_intctl_mem_ops = {
     .read = slavio_intctl_mem_readl,
     .write = slavio_intctl_mem_writel,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -206,7 +205,7 @@ static void slavio_intctlm_mem_writel(void *opaque, hwaddr addr,
 static const MemoryRegionOps slavio_intctlm_mem_ops = {
     .read = slavio_intctlm_mem_readl,
     .write = slavio_intctlm_mem_writel,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_BIG_ENDIAN,
     .valid = {
         .min_access_size = 4,
         .max_access_size = 4,
@@ -353,7 +352,7 @@ static const VMStateDescription vmstate_intctl_cpu = {
     .name ="slavio_intctl_cpu",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32(intreg_pending, SLAVIO_CPUINTCTLState),
         VMSTATE_END_OF_LIST()
     }
@@ -364,7 +363,7 @@ static const VMStateDescription vmstate_intctl = {
     .version_id = 1,
     .minimum_version_id = 1,
     .post_load = vmstate_intctl_post_load,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_STRUCT_ARRAY(slaves, SLAVIO_INTCTLState, MAX_CPUS, 1,
                              vmstate_intctl_cpu, SLAVIO_CPUINTCTLState),
         VMSTATE_UINT32(intregm_pending, SLAVIO_INTCTLState),
@@ -401,17 +400,17 @@ static bool slavio_intctl_get_statistics(InterruptStatsProvider *obj,
 }
 #endif
 
-static void slavio_intctl_print_info(InterruptStatsProvider *obj, Monitor *mon)
+static void slavio_intctl_print_info(InterruptStatsProvider *obj, GString *buf)
 {
     SLAVIO_INTCTLState *s = SLAVIO_INTCTL(obj);
     int i;
 
     for (i = 0; i < MAX_CPUS; i++) {
-        monitor_printf(mon, "per-cpu %d: pending 0x%08x\n", i,
-                       s->slaves[i].intreg_pending);
+        g_string_append_printf(buf, "per-cpu %d: pending 0x%08x\n", i,
+                               s->slaves[i].intreg_pending);
     }
-    monitor_printf(mon, "master: pending 0x%08x, disabled 0x%08x\n",
-                   s->intregm_pending, s->intregm_disabled);
+    g_string_append_printf(buf, "master: pending 0x%08x, disabled 0x%08x\n",
+                           s->intregm_pending, s->intregm_disabled);
 }
 
 static void slavio_intctl_init(Object *obj)
@@ -442,12 +441,12 @@ static void slavio_intctl_init(Object *obj)
     }
 }
 
-static void slavio_intctl_class_init(ObjectClass *klass, void *data)
+static void slavio_intctl_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     InterruptStatsProviderClass *ic = INTERRUPT_STATS_PROVIDER_CLASS(klass);
 
-    dc->reset = slavio_intctl_reset;
+    device_class_set_legacy_reset(dc, slavio_intctl_reset);
     dc->vmsd = &vmstate_intctl;
 #ifdef DEBUG_IRQ_COUNT
     ic->get_statistics = slavio_intctl_get_statistics;
@@ -461,7 +460,7 @@ static const TypeInfo slavio_intctl_info = {
     .instance_size = sizeof(SLAVIO_INTCTLState),
     .instance_init = slavio_intctl_init,
     .class_init    = slavio_intctl_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_INTERRUPT_STATS_PROVIDER },
         { }
     },

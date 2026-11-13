@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -18,43 +18,42 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/memory.h"
 #include "cpu.h"
 #include "mmu-hash64.h"
 #include "mmu-book3s-v3.h"
-#include "mmu-radix64.h"
 
-int ppc64_v3_handle_mmu_fault(PowerPCCPU *cpu, vaddr eaddr, int rwx,
-                              int mmu_idx)
-{
-    if (ppc64_v3_radix(cpu)) { /* Guest uses radix */
-        return ppc_radix64_handle_mmu_fault(cpu, eaddr, rwx, mmu_idx);
-    } else { /* Guest uses hash */
-        return ppc_hash64_handle_mmu_fault(cpu, eaddr, rwx, mmu_idx);
-    }
-}
-
-hwaddr ppc64_v3_get_phys_page_debug(PowerPCCPU *cpu, vaddr eaddr)
-{
-    if (ppc64_v3_radix(cpu)) {
-        return ppc_radix64_get_phys_page_debug(cpu, eaddr);
-    } else {
-        return ppc_hash64_get_phys_page_debug(cpu, eaddr);
-    }
-}
+#define PPC64_V3_PATE_SIZE 16 /* two 64-bit words */
 
 bool ppc64_v3_get_pate(PowerPCCPU *cpu, target_ulong lpid, ppc_v3_pate_t *entry)
 {
     uint64_t patb = cpu->env.spr[SPR_PTCR] & PTCR_PATB;
     uint64_t pats = cpu->env.spr[SPR_PTCR] & PTCR_PATS;
+    uint64_t table_size;
+    uint64_t entries;
+
+    /*
+     * The POWER9 Processor User's Manual, section 4.9.4, specifies that
+     * POWER9 ignores PTCR[PATS] and only supports a 64 KiB partition table.
+     */
+    if (cpu->env.excp_model == POWERPC_EXCP_POWER9) {
+        pats = 4;
+    }
+    table_size = 1ULL << (pats + 12);
+
+    /* Check if partition table is properly aligned */
+    if (patb & (table_size - 1)) {
+        return false;
+    }
 
     /* Calculate number of entries */
-    pats = 1ull << (pats + 12 - 4);
-    if (pats <= lpid) {
+    entries = table_size / PPC64_V3_PATE_SIZE;
+    if (entries <= lpid) {
         return false;
     }
 
     /* Grab entry */
-    patb += 16 * lpid;
+    patb += PPC64_V3_PATE_SIZE * lpid;
     entry->dw0 = ldq_phys(CPU(cpu)->as, patb);
     entry->dw1 = ldq_phys(CPU(cpu)->as, patb + 8);
     return true;

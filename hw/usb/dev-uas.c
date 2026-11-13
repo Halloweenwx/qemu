@@ -16,13 +16,15 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qemu/log.h"
 
-#include "hw/usb.h"
+#include "hw/usb/usb.h"
 #include "migration/vmstate.h"
 #include "desc.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/scsi/scsi.h"
 #include "scsi/constants.h"
+#include "qom/object.h"
 
 /* --------------------------------------------------------------------- */
 
@@ -69,7 +71,7 @@ typedef struct {
     uint8_t    reserved_2;
     uint64_t   lun;
     uint8_t    cdb[16];
-    uint8_t    add_cdb[];
+    uint8_t    add_cdb[1];
 } QEMU_PACKED  uas_iu_command;
 
 typedef struct {
@@ -107,9 +109,11 @@ typedef struct {
 #define UAS_STREAM_BM_ATTR  4
 #define UAS_MAX_STREAMS     (1 << UAS_STREAM_BM_ATTR)
 
-typedef struct UASDevice UASDevice;
 typedef struct UASRequest UASRequest;
 typedef struct UASStatus UASStatus;
+
+#define TYPE_USB_UAS "usb-uas"
+OBJECT_DECLARE_SIMPLE_TYPE(UASDevice, USB_UAS)
 
 struct UASDevice {
     USBDevice                 dev;
@@ -130,9 +134,6 @@ struct UASDevice {
     USBPacket                 *data3[UAS_MAX_STREAMS + 1];
     USBPacket                 *status3[UAS_MAX_STREAMS + 1];
 };
-
-#define TYPE_USB_UAS "usb-uas"
-#define USB_UAS(obj) OBJECT_CHECK(UASDevice, (obj), TYPE_USB_UAS)
 
 struct UASRequest {
     uint16_t     tag;
@@ -358,9 +359,11 @@ static void usb_uas_send_status_bh(void *opaque)
     UASDevice *uas = opaque;
     UASStatus *st;
     USBPacket *p;
+    uint32_t length;
 
     while ((st = QTAILQ_FIRST(&uas->results)) != NULL) {
         if (uas_using_streams(uas)) {
+            assert(st->stream <= UAS_MAX_STREAMS);
             p = uas->status3[st->stream];
             uas->status3[st->stream] = NULL;
         } else {
@@ -371,7 +374,14 @@ static void usb_uas_send_status_bh(void *opaque)
             break;
         }
 
-        usb_packet_copy(p, &st->status, st->length);
+        length = st->length;
+        if (length > p->iov.size) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "usb uas: packet (%zd) too small for status (%d)\n",
+                          p->iov.size, length);
+            length = p->iov.size;
+        }
+        usb_packet_copy(p, &st->status, length);
         QTAILQ_REMOVE(&uas->results, st, next);
         g_free(st);
 
@@ -382,8 +392,14 @@ static void usb_uas_send_status_bh(void *opaque)
 
 static void usb_uas_queue_status(UASDevice *uas, UASStatus *st, int length)
 {
-    USBPacket *p = uas_using_streams(uas) ?
-        uas->status3[st->stream] : uas->status2;
+    USBPacket *p;
+
+    if (uas_using_streams(uas)) {
+        assert(st->stream <= UAS_MAX_STREAMS);
+        p = uas->status3[st->stream];
+    } else {
+        p = uas->status2;
+    }
 
     st->length += length;
     QTAILQ_INSERT_TAIL(&uas->results, st, next);
@@ -596,17 +612,16 @@ static void usb_uas_scsi_transfer_data(SCSIRequest *r, uint32_t len)
     }
 }
 
-static void usb_uas_scsi_command_complete(SCSIRequest *r,
-                                          uint32_t status, size_t resid)
+static void usb_uas_scsi_command_complete(SCSIRequest *r, size_t resid)
 {
     UASRequest *req = r->hba_private;
 
-    trace_usb_uas_scsi_complete(req->uas->dev.addr, req->tag, status, resid);
+    trace_usb_uas_scsi_complete(req->uas->dev.addr, req->tag, r->status, resid);
     req->complete = true;
     if (req->data) {
         usb_uas_complete_data_packet(req);
     }
-    usb_uas_queue_sense(req, status);
+    usb_uas_queue_sense(req, r->status);
     scsi_req_unref(req->req);
 }
 
@@ -698,10 +713,24 @@ static void usb_uas_command(UASDevice *uas, uas_iu *iu)
     UASRequest *req;
     uint32_t len;
     uint16_t tag = be16_to_cpu(iu->hdr.tag);
+    size_t cdb_len = sizeof(iu->command.cdb) + iu->command.add_cdb_length;
 
     if (uas_using_streams(uas) && tag > UAS_MAX_STREAMS) {
-        goto invalid_tag;
+        /*
+         * Our status delivery only works with valid tags, so in case the
+         * stream ID is out of bounds, we have to return immediately here
+         * without sending a fake sense_code_INVALID_TAG to the guest.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "invalid tag 0x%x for USB UAS command\n", tag);
+        return;
     }
+
+    if (iu->command.add_cdb_length > 0) {
+        qemu_log_mask(LOG_UNIMP, "additional adb length not yet supported\n");
+        goto unsupported_len;
+    }
+
     req = usb_uas_find_request(uas, tag);
     if (req) {
         goto overlapped_tag;
@@ -723,7 +752,7 @@ static void usb_uas_command(UASDevice *uas, uas_iu *iu)
 
     req->req = scsi_req_new(req->dev, req->tag,
                             usb_uas_get_lun(req->lun),
-                            iu->command.cdb, req);
+                            iu->command.cdb, cdb_len, req);
     if (uas->requestlog) {
         scsi_req_print(req->req);
     }
@@ -734,8 +763,8 @@ static void usb_uas_command(UASDevice *uas, uas_iu *iu)
     }
     return;
 
-invalid_tag:
-    usb_uas_queue_fake_sense(uas, tag, sense_code_INVALID_TAG);
+unsupported_len:
+    usb_uas_queue_fake_sense(uas, tag, sense_code_INVALID_PARAM_VALUE);
     return;
 
 overlapped_tag:
@@ -780,7 +809,7 @@ static void usb_uas_task(UASDevice *uas, uas_iu *iu)
 
     case UAS_TMF_LOGICAL_UNIT_RESET:
         trace_usb_uas_tmf_logical_unit_reset(uas->dev.addr, tag, lun);
-        qdev_reset_all(&dev->qdev);
+        device_cold_reset(&dev->qdev);
         usb_uas_queue_response(uas, tag, UAS_RC_TMF_COMPLETE);
         break;
 
@@ -830,6 +859,9 @@ static void usb_uas_handle_data(USBDevice *dev, USBPacket *p)
         }
         break;
     case UAS_PIPE_ID_STATUS:
+        if (p->stream > UAS_MAX_STREAMS) {
+            goto err_stream;
+        }
         if (p->stream) {
             QTAILQ_FOREACH(st, &uas->results, next) {
                 if (st->stream == p->stream) {
@@ -851,12 +883,22 @@ static void usb_uas_handle_data(USBDevice *dev, USBPacket *p)
                 break;
             }
         }
-        usb_packet_copy(p, &st->status, st->length);
+        length = st->length;
+        if (length > p->iov.size) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "usb uas: packet (%zd) too small for status (%d)\n",
+                          p->iov.size, length);
+            length = p->iov.size;
+        }
+        usb_packet_copy(p, &st->status, length);
         QTAILQ_REMOVE(&uas->results, st, next);
         g_free(st);
         break;
     case UAS_PIPE_ID_DATA_IN:
     case UAS_PIPE_ID_DATA_OUT:
+        if (p->stream > UAS_MAX_STREAMS) {
+            goto err_stream;
+        }
         if (p->stream) {
             req = usb_uas_find_request(uas, p->stream);
         } else {
@@ -892,9 +934,14 @@ static void usb_uas_handle_data(USBDevice *dev, USBPacket *p)
         p->status = USB_RET_STALL;
         break;
     }
+    return;
+
+err_stream:
+    error_report("%s: invalid stream %d", __func__, p->stream);
+    p->status = USB_RET_STALL;
 }
 
-static void usb_uas_unrealize(USBDevice *dev, Error **errp)
+static void usb_uas_unrealize(USBDevice *dev)
 {
     UASDevice *uas = USB_UAS(dev);
 
@@ -914,27 +961,27 @@ static void usb_uas_realize(USBDevice *dev, Error **errp)
 
     QTAILQ_INIT(&uas->results);
     QTAILQ_INIT(&uas->requests);
-    uas->status_bh = qemu_bh_new(usb_uas_send_status_bh, uas);
+    uas->status_bh = qemu_bh_new_guarded(usb_uas_send_status_bh, uas,
+                                         &d->mem_reentrancy_guard);
 
-    scsi_bus_new(&uas->bus, sizeof(uas->bus), DEVICE(dev),
-                 &usb_uas_scsi_info, NULL);
+    dev->flags |= (1 << USB_DEV_FLAG_IS_SCSI_STORAGE);
+    scsi_bus_init(&uas->bus, sizeof(uas->bus), DEVICE(dev), &usb_uas_scsi_info);
 }
 
 static const VMStateDescription vmstate_usb_uas = {
     .name = "usb-uas",
     .unmigratable = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_USB_DEVICE(dev, UASDevice),
         VMSTATE_END_OF_LIST()
     }
 };
 
-static Property uas_properties[] = {
+static const Property uas_properties[] = {
     DEFINE_PROP_UINT32("log-scsi-req", UASDevice, requestlog, 0),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void usb_uas_class_initfn(ObjectClass *klass, void *data)
+static void usb_uas_class_initfn(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     USBDeviceClass *uc = USB_DEVICE_CLASS(klass);

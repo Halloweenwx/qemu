@@ -4,7 +4,6 @@
  * Written by Andrew Baumann
  *
  * Based on bcm2835_ic.c (Raspberry Pi emulation) (c) 2012 Gregory Estrade
- * This code is licensed under the GNU GPLv2 and later.
  *
  * At present, only implements interrupt routing, and mailboxes (i.e.,
  * not PMU interrupt, or AXI counters).
@@ -13,11 +12,14 @@
  *
  * Ref:
  * https://www.raspberrypi.org/documentation/hardware/raspberrypi/bcm2836/QA7_rev3.4.pdf
+ *
+ * This work is licensed under the terms of the GNU GPL, version 2 or later.
+ * See the COPYING file in the top-level directory.
  */
 
 #include "qemu/osdep.h"
 #include "hw/intc/bcm2836_control.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
@@ -155,22 +157,22 @@ static void bcm2836_control_set_local_irq(void *opaque, int core, int local_irq,
 
 static void bcm2836_control_set_local_irq0(void *opaque, int core, int level)
 {
-    bcm2836_control_set_local_irq(opaque, core, 0, level);
+    bcm2836_control_set_local_irq(opaque, core, IRQ_CNTPSIRQ, level);
 }
 
 static void bcm2836_control_set_local_irq1(void *opaque, int core, int level)
 {
-    bcm2836_control_set_local_irq(opaque, core, 1, level);
+    bcm2836_control_set_local_irq(opaque, core, IRQ_CNTPNSIRQ, level);
 }
 
 static void bcm2836_control_set_local_irq2(void *opaque, int core, int level)
 {
-    bcm2836_control_set_local_irq(opaque, core, 2, level);
+    bcm2836_control_set_local_irq(opaque, core, IRQ_CNTHPIRQ, level);
 }
 
 static void bcm2836_control_set_local_irq3(void *opaque, int core, int level)
 {
-    bcm2836_control_set_local_irq(opaque, core, 3, level);
+    bcm2836_control_set_local_irq(opaque, core, IRQ_CNTVIRQ, level);
 }
 
 static void bcm2836_control_set_gpu_irq(void *opaque, int irq, int level)
@@ -195,12 +197,21 @@ static void bcm2836_control_local_timer_set_next(void *opaque)
 {
     BCM2836ControlState *s = opaque;
     uint64_t next_event;
+    uint64_t reload_value = LOCALTIMER_VALUE(s->local_timer_control);
 
-    assert(LOCALTIMER_VALUE(s->local_timer_control) > 0);
+    if (reload_value == 0) {
+        /*
+         * Spec doesn't say what happens in this case; treat as a
+         * guest error and stop the timer running.
+         */
+        qemu_log_mask(LOG_GUEST_ERROR, "%s: local timer reload value is 0\n",
+                      __func__);
+        timer_del(&s->timer);
+        return;
+    }
 
     next_event = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-        muldiv64(LOCALTIMER_VALUE(s->local_timer_control),
-            NANOSECONDS_PER_SECOND, LOCALTIMER_FREQ);
+        muldiv64(reload_value, NANOSECONDS_PER_SECOND, LOCALTIMER_FREQ);
     timer_mod(&s->timer, next_event);
 }
 
@@ -367,7 +378,7 @@ static const VMStateDescription vmstate_bcm2836_control = {
     .name = TYPE_BCM2836_CONTROL,
     .version_id = 2,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(mailboxes, BCM2836ControlState,
                              BCM2836_NCORES * BCM2836_MBPERCORE),
         VMSTATE_UINT8(route_gpu_irq, BCM2836ControlState),
@@ -382,15 +393,15 @@ static const VMStateDescription vmstate_bcm2836_control = {
     }
 };
 
-static void bcm2836_control_class_init(ObjectClass *klass, void *data)
+static void bcm2836_control_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->reset = bcm2836_control_reset;
+    device_class_set_legacy_reset(dc, bcm2836_control_reset);
     dc->vmsd = &vmstate_bcm2836_control;
 }
 
-static TypeInfo bcm2836_control_info = {
+static const TypeInfo bcm2836_control_info = {
     .name          = TYPE_BCM2836_CONTROL,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(BCM2836ControlState),

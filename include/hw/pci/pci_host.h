@@ -28,15 +28,13 @@
 #ifndef PCI_HOST_H
 #define PCI_HOST_H
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
+#include "qom/object.h"
+
+#define PCI_HOST_BYPASS_IOMMU "bypass-iommu"
 
 #define TYPE_PCI_HOST_BRIDGE "pci-host-bridge"
-#define PCI_HOST_BRIDGE(obj) \
-    OBJECT_CHECK(PCIHostState, (obj), TYPE_PCI_HOST_BRIDGE)
-#define PCI_HOST_BRIDGE_CLASS(klass) \
-     OBJECT_CLASS_CHECK(PCIHostBridgeClass, (klass), TYPE_PCI_HOST_BRIDGE)
-#define PCI_HOST_BRIDGE_GET_CLASS(obj) \
-     OBJECT_GET_CLASS(PCIHostBridgeClass, (obj), TYPE_PCI_HOST_BRIDGE)
+OBJECT_DECLARE_TYPE(PCIHostState, PCIHostBridgeClass, PCI_HOST_BRIDGE)
 
 struct PCIHostState {
     SysBusDevice busdev;
@@ -45,16 +43,18 @@ struct PCIHostState {
     MemoryRegion data_mem;
     MemoryRegion mmcfg;
     uint32_t config_reg;
+    bool mig_enabled;
     PCIBus *bus;
+    bool bypass_iommu;
 
     QLIST_ENTRY(PCIHostState) next;
 };
 
-typedef struct PCIHostBridgeClass {
+struct PCIHostBridgeClass {
     SysBusDeviceClass parent_class;
 
     const char *(*root_bus_path)(PCIHostState *, PCIBus *);
-} PCIHostBridgeClass;
+};
 
 /* common internal helpers for PCI/PCIe hosts, cut off overflows */
 void pci_host_config_write_common(PCIDevice *pci_dev, uint32_t addr,
@@ -68,6 +68,5 @@ uint32_t pci_data_read(PCIBus *s, uint32_t addr, unsigned len);
 extern const MemoryRegionOps pci_host_conf_le_ops;
 extern const MemoryRegionOps pci_host_conf_be_ops;
 extern const MemoryRegionOps pci_host_data_le_ops;
-extern const MemoryRegionOps pci_host_data_be_ops;
 
 #endif /* PCI_HOST_H */

@@ -16,21 +16,23 @@
 #include "qemu/osdep.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 
-#include "sysemu/tpm_backend.h"
-#include "tpm_int.h"
-#include "tpm_util.h"
+#include "system/tpm_backend.h"
+#include "system/tpm_util.h"
+#include "tpm_prop.h"
 
 #include "hw/ppc/spapr.h"
 #include "hw/ppc/spapr_vio.h"
 #include "trace.h"
+#include "qom/object.h"
 
 #define DEBUG_SPAPR 0
 
-#define VIO_SPAPR_VTPM(obj) \
-     OBJECT_CHECK(SpaprTpmState, (obj), TYPE_TPM_SPAPR)
+typedef struct SpaprTpmState SpaprTpmState;
+DECLARE_INSTANCE_CHECKER(SpaprTpmState, VIO_SPAPR_VTPM,
+                         TYPE_TPM_SPAPR)
 
 typedef struct TpmCrq {
     uint8_t valid;  /* 0x80: cmd; 0xc0: init crq */
@@ -64,7 +66,7 @@ typedef struct TpmCrq {
 
 #define TPM_SPAPR_BUFFER_MAX                 4096
 
-typedef struct {
+struct SpaprTpmState {
     SpaprVioDevice vdev;
 
     TpmCrq crq; /* track single TPM command */
@@ -84,16 +86,14 @@ typedef struct {
     TPMVersion be_tpm_version;
 
     size_t be_buffer_size;
-} SpaprTpmState;
+};
 
 /*
  * Send a request to the TPM.
  */
 static void tpm_spapr_tpm_send(SpaprTpmState *s)
 {
-    if (trace_event_get_state_backends(TRACE_TPM_SPAPR_SHOW_BUFFER)) {
-        tpm_util_show_buffer(s->buffer, s->be_buffer_size, "To TPM");
-    }
+    tpm_util_show_buffer(s->buffer, s->be_buffer_size, "To TPM");
 
     s->state = SPAPR_VTPM_STATE_EXECUTION;
     s->cmd = (TPMBackendCmd) {
@@ -206,7 +206,6 @@ static int tpm_spapr_do_crq(struct SpaprVioDevice *dev, uint8_t *crq_data)
                 break;
             default:
                 g_assert_not_reached();
-                break;
             }
             trace_tpm_spapr_do_crq_get_version(be32_to_cpu(local_crq.data));
             spapr_tpm_send_crq(dev, &local_crq);
@@ -253,9 +252,7 @@ static void tpm_spapr_request_completed(TPMIf *ti, int ret)
     rc = spapr_vio_dma_write(&s->vdev, be32_to_cpu(crq->data),
                              s->buffer, len);
 
-    if (trace_event_get_state_backends(TRACE_TPM_SPAPR_SHOW_BUFFER)) {
-        tpm_util_show_buffer(s->buffer, len, "From TPM");
-    }
+    tpm_util_show_buffer(s->buffer, len, "From TPM");
 
     crq->valid = SPAPR_VTPM_MSG_RESULT;
     if (rc == H_SUCCESS) {
@@ -306,7 +303,10 @@ static void tpm_spapr_reset(SpaprVioDevice *dev)
                             TPM_SPAPR_BUFFER_MAX);
 
     tpm_backend_reset(s->be_driver);
-    tpm_spapr_do_startup_tpm(s, s->be_buffer_size);
+
+    if (tpm_spapr_do_startup_tpm(s, s->be_buffer_size) < 0) {
+        exit(1);
+    }
 }
 
 static enum TPMVersion tpm_spapr_get_version(TPMIf *ti)
@@ -352,7 +352,7 @@ static const VMStateDescription vmstate_spapr_vtpm = {
     .name = "tpm-spapr",
     .pre_save = tpm_spapr_pre_save,
     .post_load = tpm_spapr_post_load,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_SPAPR_VIO(vdev, SpaprTpmState),
 
         VMSTATE_UINT8(state, SpaprTpmState),
@@ -364,10 +364,9 @@ static const VMStateDescription vmstate_spapr_vtpm = {
     }
 };
 
-static Property tpm_spapr_properties[] = {
+static const Property tpm_spapr_properties[] = {
     DEFINE_SPAPR_PROPERTIES(SpaprTpmState, vdev),
     DEFINE_PROP_TPMBE("tpmdev", SpaprTpmState, be_driver),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void tpm_spapr_realizefn(SpaprVioDevice *dev, Error **errp)
@@ -388,7 +387,7 @@ static void tpm_spapr_realizefn(SpaprVioDevice *dev, Error **errp)
     s->buffer = g_malloc(TPM_SPAPR_BUFFER_MAX);
 }
 
-static void tpm_spapr_class_init(ObjectClass *klass, void *data)
+static void tpm_spapr_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     SpaprVioDeviceClass *k = VIO_SPAPR_DEVICE_CLASS(klass);
@@ -415,7 +414,7 @@ static const TypeInfo tpm_spapr_info = {
     .parent        = TYPE_VIO_SPAPR_DEVICE,
     .instance_size = sizeof(SpaprTpmState),
     .class_init    = tpm_spapr_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_TPM_IF },
         { }
     }

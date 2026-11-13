@@ -20,35 +20,23 @@
 #define ROCKER_H
 
 #include "qemu/sockets.h"
+#include "qom/object.h"
 
 #if defined(DEBUG_ROCKER)
 #  define DPRINTF(fmt, ...) \
     do {                                                           \
-        struct timeval tv;                                         \
-        char timestr[64];                                          \
-        time_t now;                                                \
-        gettimeofday(&tv, NULL);                                   \
-        now = tv.tv_sec;                                           \
-        strftime(timestr, sizeof(timestr), "%T", localtime(&now)); \
-        fprintf(stderr, "%s.%06ld ", timestr, tv.tv_usec);         \
-        fprintf(stderr, "ROCKER: " fmt, ## __VA_ARGS__);           \
+        g_autoptr(GDateTime) now = g_date_time_new_now_local();    \
+        g_autofree char *nowstr = g_date_time_format(now, "%T.%f");\
+        fprintf(stderr, "%s ROCKER: " fmt, nowstr, ## __VA_ARGS__);\
     } while (0)
 #else
-static inline GCC_FMT_ATTR(1, 2) int DPRINTF(const char *fmt, ...)
+static inline G_GNUC_PRINTF(1, 2) int DPRINTF(const char *fmt, ...)
 {
     return 0;
 }
 #endif
 
-#define __le16 uint16_t
-#define __le32 uint32_t
-#define __le64 uint64_t
-
-#define __be16 uint16_t
-#define __be32 uint32_t
-#define __be64 uint64_t
-
-static inline bool ipv4_addr_is_multicast(__be32 addr)
+static inline bool ipv4_addr_is_multicast(uint32_t addr)
 {
     return (addr & htonl(0xf0000000)) == htonl(0xe0000000);
 }
@@ -56,8 +44,8 @@ static inline bool ipv4_addr_is_multicast(__be32 addr)
 typedef struct ipv6_addr {
     union {
         uint8_t addr8[16];
-        __be16 addr16[8];
-        __be32 addr32[4];
+        uint16_t addr16[8];
+        uint32_t addr32[4];
     };
 } Ipv6Addr;
 
@@ -66,13 +54,16 @@ static inline bool ipv6_addr_is_multicast(const Ipv6Addr *addr)
     return (addr->addr32[0] & htonl(0xFF000000)) == htonl(0xFF000000);
 }
 
-typedef struct rocker Rocker;
 typedef struct world World;
 typedef struct desc_info DescInfo;
 typedef struct desc_ring DescRing;
 
+#define TYPE_ROCKER "rocker"
+typedef struct rocker Rocker;
+DECLARE_INSTANCE_CHECKER(Rocker, ROCKER,
+                         TYPE_ROCKER)
+
 Rocker *rocker_find(const char *name);
-uint32_t rocker_fp_ports(Rocker *r);
 int rocker_event_link_changed(Rocker *r, uint32_t pport, bool link_up);
 int rocker_event_mac_vlan_seen(Rocker *r, uint32_t pport, uint8_t *addr,
                                uint16_t vlan_id);

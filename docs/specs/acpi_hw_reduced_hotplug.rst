@@ -63,7 +63,9 @@ GED IO interface (4 byte access)
     bits:
        0: Memory hotplug event
        1: System power down event
-    2-31: Reserved
+       2: NVDIMM hotplug event
+       3: CPU hotplug event
+    4-31: Reserved
 
 **write_access:**
 

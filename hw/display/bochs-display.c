@@ -8,8 +8,8 @@
 #include "qemu/osdep.h"
 #include "qemu/module.h"
 #include "qemu/units.h"
-#include "hw/pci/pci.h"
-#include "hw/qdev-properties.h"
+#include "hw/pci/pci_device.h"
+#include "hw/core/qdev-properties.h"
 #include "migration/vmstate.h"
 #include "hw/display/bochs-vbe.h"
 #include "hw/display/edid.h"
@@ -18,6 +18,7 @@
 
 #include "ui/console.h"
 #include "ui/qemu-pixman.h"
+#include "qom/object.h"
 
 typedef struct BochsDisplayMode {
     pixman_format_code_t format;
@@ -29,7 +30,7 @@ typedef struct BochsDisplayMode {
     uint64_t             size;
 } BochsDisplayMode;
 
-typedef struct BochsDisplayState {
+struct BochsDisplayState {
     /* parent */
     PCIDevice        pci;
 
@@ -53,15 +54,14 @@ typedef struct BochsDisplayState {
 
     /* device state */
     BochsDisplayMode mode;
-} BochsDisplayState;
+};
 
 #define TYPE_BOCHS_DISPLAY "bochs-display"
-#define BOCHS_DISPLAY(obj) OBJECT_CHECK(BochsDisplayState, (obj), \
-                                        TYPE_BOCHS_DISPLAY)
+OBJECT_DECLARE_SIMPLE_TYPE(BochsDisplayState, BOCHS_DISPLAY)
 
 static const VMStateDescription vmstate_bochs_display = {
     .name = "bochs-display",
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(pci, BochsDisplayState),
         VMSTATE_UINT16_ARRAY(vbe_regs, BochsDisplayState, VBE_DISPI_INDEX_NB),
         VMSTATE_BOOL(big_endian_fb, BochsDisplayState),
@@ -164,7 +164,7 @@ static int bochs_display_get_mode(BochsDisplayState *s,
     memset(mode, 0, sizeof(*mode));
     switch (vbe[VBE_DISPI_INDEX_BPP]) {
     case 16:
-        /* best effort: support native endianess only */
+        /* best effort: support native endianness only */
         mode->format = PIXMAN_r5g6b5;
         mode->bytepp = 2;
         break;
@@ -198,7 +198,7 @@ static int bochs_display_get_mode(BochsDisplayState *s,
     return 0;
 }
 
-static void bochs_display_update(void *opaque)
+static bool bochs_display_update(void *opaque)
 {
     BochsDisplayState *s = opaque;
     DirtyBitmapSnapshot *snap = NULL;
@@ -212,7 +212,7 @@ static void bochs_display_update(void *opaque)
     ret = bochs_display_get_mode(s, &mode);
     if (ret < 0) {
         /* no (valid) video mode */
-        return;
+        return true;
     }
 
     if (memcmp(&s->mode, &mode, sizeof(mode)) != 0) {
@@ -224,12 +224,12 @@ static void bochs_display_update(void *opaque)
                                              mode.format,
                                              mode.stride,
                                              ptr + mode.offset);
-        dpy_gfx_replace_surface(s->con, ds);
+        qemu_console_set_surface(s->con, ds);
         full_update = true;
     }
 
     if (full_update) {
-        dpy_gfx_update_full(s->con);
+        qemu_console_update_full(s->con);
     } else {
         snap = memory_region_snapshot_and_clear_dirty(&s->vram,
                                                       mode.offset, mode.size,
@@ -243,18 +243,18 @@ static void bochs_display_update(void *opaque)
                 ys = y;
             }
             if (!dirty && ys >= 0) {
-                dpy_gfx_update(s->con, 0, ys,
-                               mode.width, y - ys);
+                qemu_console_update(s->con, 0, ys, mode.width, y - ys);
                 ys = -1;
             }
         }
         if (ys >= 0) {
-            dpy_gfx_update(s->con, 0, ys,
-                           mode.width, y - ys);
+            qemu_console_update(s->con, 0, ys, mode.width, y - ys);
         }
 
         g_free(snap);
     }
+
+    return true;
 }
 
 static const GraphicHwOps bochs_display_gfx_ops = {
@@ -267,15 +267,17 @@ static void bochs_display_realize(PCIDevice *dev, Error **errp)
     Object *obj = OBJECT(dev);
     int ret;
 
-    s->con = graphic_console_init(DEVICE(dev), 0, &bochs_display_gfx_ops, s);
-
     if (s->vgamem < 4 * MiB) {
         error_setg(errp, "bochs-display: video memory too small");
+        return;
     }
     if (s->vgamem > 256 * MiB) {
         error_setg(errp, "bochs-display: video memory too big");
+        return;
     }
     s->vgamem = pow2ceil(s->vgamem);
+
+    s->con = qemu_graphic_console_create(DEVICE(dev), 0, &bochs_display_gfx_ops, s);
 
     memory_region_init_ram(&s->vram, obj, "bochs-display-vram", s->vgamem,
                            &error_fatal);
@@ -331,8 +333,7 @@ static void bochs_display_init(Object *obj)
     /* Expose framebuffer byteorder via QOM */
     object_property_add_bool(obj, "big-endian-framebuffer",
                              bochs_display_get_big_endian_fb,
-                             bochs_display_set_big_endian_fb,
-                             NULL);
+                             bochs_display_set_big_endian_fb);
 
     dev->cap_present |= QEMU_PCI_CAP_EXPRESS;
 }
@@ -341,17 +342,16 @@ static void bochs_display_exit(PCIDevice *dev)
 {
     BochsDisplayState *s = BOCHS_DISPLAY(dev);
 
-    graphic_console_close(s->con);
+    qemu_graphic_console_close(s->con);
 }
 
-static Property bochs_display_properties[] = {
+static const Property bochs_display_properties[] = {
     DEFINE_PROP_SIZE("vgamem", BochsDisplayState, vgamem, 16 * MiB),
     DEFINE_PROP_BOOL("edid", BochsDisplayState, enable_edid, true),
     DEFINE_EDID_PROPERTIES(BochsDisplayState, edid_info),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
-static void bochs_display_class_init(ObjectClass *klass, void *data)
+static void bochs_display_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     PCIDeviceClass *k = PCI_DEVICE_CLASS(klass);
@@ -374,7 +374,7 @@ static const TypeInfo bochs_display_type_info = {
     .instance_size  = sizeof(BochsDisplayState),
     .instance_init  = bochs_display_init,
     .class_init     = bochs_display_class_init,
-    .interfaces     = (InterfaceInfo[]) {
+    .interfaces     = (const InterfaceInfo[]) {
         { INTERFACE_PCIE_DEVICE },
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },

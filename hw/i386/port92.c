@@ -7,21 +7,23 @@
  */
 
 #include "qemu/osdep.h"
-#include "sysemu/runstate.h"
+#include "system/runstate.h"
 #include "migration/vmstate.h"
-#include "hw/irq.h"
+#include "hw/core/irq.h"
+#include "hw/isa/isa.h"
 #include "hw/i386/pc.h"
 #include "trace.h"
+#include "qom/object.h"
 
-#define PORT92(obj) OBJECT_CHECK(Port92State, (obj), TYPE_PORT92)
+OBJECT_DECLARE_SIMPLE_TYPE(Port92State, PORT92)
 
-typedef struct Port92State {
+struct Port92State {
     ISADevice parent_obj;
 
     MemoryRegion io;
     uint8_t outport;
     qemu_irq a20_out;
-} Port92State;
+};
 
 static void port92_write(void *opaque, hwaddr addr, uint64_t val,
                          unsigned size)
@@ -53,7 +55,7 @@ static const VMStateDescription vmstate_port92_isa = {
     .name = "port92",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_UINT8(outport, Port92State),
         VMSTATE_END_OF_LIST()
     }
@@ -95,12 +97,12 @@ static void port92_realizefn(DeviceState *dev, Error **errp)
     isa_register_ioport(isadev, &s->io, 0x92);
 }
 
-static void port92_class_initfn(ObjectClass *klass, void *data)
+static void port92_class_initfn(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = port92_realizefn;
-    dc->reset = port92_reset;
+    device_class_set_legacy_reset(dc, port92_reset);
     dc->vmsd = &vmstate_port92_isa;
     /*
      * Reason: unlike ordinary ISA devices, this one needs additional

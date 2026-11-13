@@ -24,45 +24,39 @@
  */
 
 #include "qemu/osdep.h"
-#include "cpu.h"
 #include "hw/rtc/m48t59.h"
-#include "hw/char/serial.h"
 #include "hw/block/fdc.h"
 #include "net/net.h"
-#include "sysemu/sysemu.h"
 #include "hw/isa/isa.h"
 #include "hw/pci/pci.h"
 #include "hw/pci/pci_host.h"
 #include "hw/ppc/ppc.h"
-#include "hw/boards.h"
+#include "hw/core/boards.h"
+#include "qapi/error.h"
 #include "qemu/error-report.h"
 #include "qemu/log.h"
-#include "hw/ide.h"
-#include "hw/irq.h"
-#include "hw/loader.h"
+#include "qemu/datadir.h"
+#include "hw/core/loader.h"
 #include "hw/rtc/mc146818rtc.h"
 #include "hw/isa/pc87312.h"
-#include "hw/qdev-properties.h"
-#include "sysemu/arch_init.h"
-#include "sysemu/kvm.h"
-#include "sysemu/qtest.h"
-#include "sysemu/reset.h"
-#include "exec/address-spaces.h"
+#include "hw/core/qdev-properties.h"
+#include "exec/target_page.h"
+#include "system/kvm.h"
+#include "system/reset.h"
 #include "trace.h"
 #include "elf.h"
 #include "qemu/units.h"
-#include "kvm_ppc.h"
 
 /* SMP is not enabled, for now */
 #define MAX_CPUS 1
-
-#define MAX_IDE_BUS 2
 
 #define CFG_ADDR 0xf0000510
 
 #define KERNEL_LOAD_ADDR 0x01000000
 #define INITRD_LOAD_ADDR 0x01800000
 
+#define BIOS_ADDR         0xfff00000
+#define BIOS_SIZE         (1 * MiB)
 #define NVRAM_SIZE        0x2000
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
@@ -76,6 +70,7 @@ static void ppc_prep_reset(void *opaque)
     PowerPCCPU *cpu = opaque;
 
     cpu_reset(CPU(cpu));
+    cpu_ppc_tb_reset(&cpu->env);
 }
 
 
@@ -220,23 +215,24 @@ static int PPC_NVRAM_set_params (Nvram *nvram, uint16_t NVRAM_size,
 static int prep_set_cmos_checksum(DeviceState *dev, void *opaque)
 {
     uint16_t checksum = *(uint16_t *)opaque;
-    ISADevice *rtc;
 
     if (object_dynamic_cast(OBJECT(dev), TYPE_MC146818_RTC)) {
-        rtc = ISA_DEVICE(dev);
-        rtc_set_memory(rtc, 0x2e, checksum & 0xff);
-        rtc_set_memory(rtc, 0x3e, checksum & 0xff);
-        rtc_set_memory(rtc, 0x2f, checksum >> 8);
-        rtc_set_memory(rtc, 0x3f, checksum >> 8);
+        MC146818RtcState *rtc = MC146818_RTC(dev);
+        mc146818rtc_set_cmos_data(rtc, 0x2e, checksum & 0xff);
+        mc146818rtc_set_cmos_data(rtc, 0x3e, checksum & 0xff);
+        mc146818rtc_set_cmos_data(rtc, 0x2f, checksum >> 8);
+        mc146818rtc_set_cmos_data(rtc, 0x3f, checksum >> 8);
 
         object_property_add_alias(qdev_get_machine(), "rtc-time", OBJECT(rtc),
-                                  "date", NULL);
+                                  "date");
     }
     return 0;
 }
 
 static void ibm_40p_init(MachineState *machine)
 {
+    const char *bios_name = machine->firmware ?: "openbios-ppc";
+    MachineClass *mc = MACHINE_GET_CLASS(machine);
     CPUPPCState *env = NULL;
     uint16_t cmos_checksum;
     PowerPCCPU *cpu;
@@ -244,12 +240,21 @@ static void ibm_40p_init(MachineState *machine)
     SysBusDevice *pcihost, *s;
     Nvram *m48t59 = NULL;
     PCIBus *pci_bus;
+    ISADevice *isa_dev;
     ISABus *isa_bus;
     void *fw_cfg;
-    int i;
+    MemoryRegion *bios = g_new(MemoryRegion, 1);
+    char *filename;
+    ssize_t bios_size = -1;
     uint32_t kernel_base = 0, initrd_base = 0;
     long kernel_size = 0, initrd_size = 0;
     char boot_device;
+
+    if (kvm_enabled()) {
+        error_report("machine %s does not support the KVM accelerator",
+                     MACHINE_GET_CLASS(machine)->name);
+        exit(EXIT_FAILURE);
+    }
 
     /* init CPU */
     cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
@@ -259,25 +264,35 @@ static void ibm_40p_init(MachineState *machine)
         exit(1);
     }
 
-    if (env->flags & POWERPC_FLAG_RTC_CLK) {
-        /* POWER / PowerPC 601 RTC clock frequency is 7.8125 MHz */
-        cpu_ppc_tb_init(env, 7812500UL);
-    } else {
-        /* Set time-base frequency to 100 Mhz */
-        cpu_ppc_tb_init(env, 100UL * 1000UL * 1000UL);
-    }
+    /* Set time-base frequency to 100 Mhz */
+    cpu_ppc_tb_init(env, 100UL * 1000UL * 1000UL);
     qemu_register_reset(ppc_prep_reset, cpu);
 
-    /* PCI host */
-    dev = qdev_create(NULL, "raven-pcihost");
-    if (!bios_name) {
-        bios_name = "openbios-ppc";
+    /* allocate and load firmware */
+    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, bios_name);
+    if (!filename) {
+        error_report("Could not find bios image '%s'", bios_name);
+        exit(1);
     }
-    qdev_prop_set_string(dev, "bios-name", bios_name);
-    qdev_prop_set_uint32(dev, "elf-machine", PPC_ELF_MACHINE);
+    memory_region_init_rom(bios, NULL, "bios", BIOS_SIZE, &error_fatal);
+    memory_region_add_subregion(get_system_memory(), BIOS_ADDR, bios);
+    bios_size = load_elf(filename, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                         ELFDATA2MSB, PPC_ELF_MACHINE, 0, 0);
+    if (bios_size < 0) {
+        bios_size = load_image_targphys(filename, BIOS_ADDR, BIOS_SIZE,
+                                        &error_fatal);
+    }
+    if (bios_size < 0 || bios_size > BIOS_SIZE) {
+        error_report("Could not load bios image '%s'", filename);
+        return;
+    }
+    g_free(filename);
+
+    /* PCI host */
+    dev = qdev_new("raven-pcihost");
     pcihost = SYS_BUS_DEVICE(dev);
-    object_property_add_child(qdev_get_machine(), "raven", OBJECT(dev), NULL);
-    qdev_init_nofail(dev);
+    object_property_add_child(qdev_get_machine(), "raven", OBJECT(dev));
+    sysbus_realize_and_unref(pcihost, &error_fatal);
     pci_bus = PCI_BUS(qdev_get_child_bus(dev, "pci.0"));
     if (!pci_bus) {
         error_report("could not create PCI host controller");
@@ -285,21 +300,32 @@ static void ibm_40p_init(MachineState *machine)
     }
 
     /* PCI -> ISA bridge */
-    i82378_dev = DEVICE(pci_create_simple(pci_bus, PCI_DEVFN(11, 0), "i82378"));
+    i82378_dev = DEVICE(pci_new(PCI_DEVFN(11, 0), "i82378"));
+    qdev_realize_and_unref(i82378_dev, BUS(pci_bus), &error_fatal);
     qdev_connect_gpio_out(i82378_dev, 0,
-                          cpu->env.irq_inputs[PPC6xx_INPUT_INT]);
+                          qdev_get_gpio_in(DEVICE(cpu), PPC6xx_INPUT_INT));
+
     sysbus_connect_irq(pcihost, 0, qdev_get_gpio_in(i82378_dev, 15));
     isa_bus = ISA_BUS(qdev_get_child_bus(i82378_dev, "isa.0"));
 
+    /* system control ports */
+    isa_dev = isa_new("prep-systemio");
+    dev = DEVICE(isa_dev);
+    qdev_prop_set_uint32(dev, "ibm-planar-id", 0xfc);
+    qdev_prop_set_uint32(dev, "equipment", 0xc0);
+    isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
+
     /* Memory controller */
-    dev = DEVICE(isa_create(isa_bus, "rs6000-mc"));
+    isa_dev = isa_new("rs6000-mc");
+    dev = DEVICE(isa_dev);
     qdev_prop_set_uint32(dev, "ram-size", machine->ram_size);
-    qdev_init_nofail(dev);
+    isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
 
     /* RTC */
-    dev = DEVICE(isa_create(isa_bus, TYPE_MC146818_RTC));
+    isa_dev = isa_new(TYPE_MC146818_RTC);
+    dev = DEVICE(isa_dev);
     qdev_prop_set_int32(dev, "base_year", 1900);
-    qdev_init_nofail(dev);
+    isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
 
     /* initialize CMOS checksums */
     cmos_checksum = 0x6aa9;
@@ -310,43 +336,41 @@ static void ibm_40p_init(MachineState *machine)
     if (defaults_enabled()) {
         m48t59 = NVRAM(isa_create_simple(isa_bus, "isa-m48t59"));
 
-        dev = DEVICE(isa_create(isa_bus, "cs4231a"));
+        isa_dev = isa_new("cs4231a");
+        dev = DEVICE(isa_dev);
         qdev_prop_set_uint32(dev, "iobase", 0x830);
         qdev_prop_set_uint32(dev, "irq", 10);
-        qdev_init_nofail(dev);
+        if (machine->audiodev) {
+            qdev_prop_set_string(dev, "audiodev", machine->audiodev);
+        }
+        isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
 
-        dev = DEVICE(isa_create(isa_bus, "pc87312"));
+        isa_dev = isa_new("pc87312");
+        dev = DEVICE(isa_dev);
         qdev_prop_set_uint32(dev, "config", 12);
-        qdev_init_nofail(dev);
+        isa_realize_and_unref(isa_dev, isa_bus, &error_fatal);
 
-        dev = DEVICE(isa_create(isa_bus, "prep-systemio"));
-        qdev_prop_set_uint32(dev, "ibm-planar-id", 0xfc);
-        qdev_prop_set_uint32(dev, "equipment", 0xc0);
-        qdev_init_nofail(dev);
-
-        dev = DEVICE(pci_create_simple(pci_bus, PCI_DEVFN(1, 0),
-                                       "lsi53c810"));
+        dev = DEVICE(pci_create_simple(pci_bus, PCI_DEVFN(1, 0), "lsi53c810"));
         lsi53c8xx_handle_legacy_cmdline(dev);
         qdev_connect_gpio_out(dev, 0, qdev_get_gpio_in(i82378_dev, 13));
 
         /* XXX: s3-trio at PCI_DEVFN(2, 0) */
         pci_vga_init(pci_bus);
 
-        for (i = 0; i < nb_nics; i++) {
-            pci_nic_init_nofail(&nd_table[i], pci_bus, "pcnet",
-                                i == 0 ? "3" : NULL);
-        }
+        /* First PCNET device at PCI_DEVFN(3, 0) */
+        pci_init_nic_in_slot(pci_bus, mc->default_nic, NULL, "3");
+        pci_init_nic_devices(pci_bus, mc->default_nic);
     }
 
     /* Prepare firmware configuration for OpenBIOS */
-    dev = qdev_create(NULL, TYPE_FW_CFG_MEM);
+    dev = qdev_new(TYPE_FW_CFG_MEM);
     fw_cfg = FW_CFG(dev);
     qdev_prop_set_uint32(dev, "data_width", 1);
     qdev_prop_set_bit(dev, "dma_enabled", false);
     object_property_add_child(OBJECT(qdev_get_machine()), TYPE_FW_CFG,
-                              OBJECT(fw_cfg), NULL);
-    qdev_init_nofail(dev);
+                              OBJECT(fw_cfg));
     s = SYS_BUS_DEVICE(dev);
+    sysbus_realize_and_unref(s, &error_fatal);
     sysbus_mmio_map(s, 0, CFG_ADDR);
     sysbus_mmio_map(s, 1, CFG_ADDR + 2);
 
@@ -355,12 +379,8 @@ static void ibm_40p_init(MachineState *machine)
         kernel_base = KERNEL_LOAD_ADDR;
         kernel_size = load_image_targphys(machine->kernel_filename,
                                           kernel_base,
-                                          machine->ram_size - kernel_base);
-        if (kernel_size < 0) {
-            error_report("could not load kernel '%s'",
-                         machine->kernel_filename);
-            exit(1);
-        }
+                                          machine->ram_size - kernel_base,
+                                          &error_fatal);
         fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_ADDR, kernel_base);
         fw_cfg_add_i32(fw_cfg, FW_CFG_KERNEL_SIZE, kernel_size);
         /* load initrd */
@@ -368,12 +388,8 @@ static void ibm_40p_init(MachineState *machine)
             initrd_base = INITRD_LOAD_ADDR;
             initrd_size = load_image_targphys(machine->initrd_filename,
                                               initrd_base,
-                                              machine->ram_size - initrd_base);
-            if (initrd_size < 0) {
-                error_report("could not load initial ram disk '%s'",
-                             machine->initrd_filename);
-                exit(1);
-            }
+                                              machine->ram_size - initrd_base,
+                                              &error_fatal);
             fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_ADDR, initrd_base);
             fw_cfg_add_i32(fw_cfg, FW_CFG_INITRD_SIZE, initrd_size);
         }
@@ -388,35 +404,33 @@ static void ibm_40p_init(MachineState *machine)
         }
         boot_device = 'm';
     } else {
-        boot_device = machine->boot_order[0];
+        boot_device = machine->boot_config.order[0];
     }
 
     fw_cfg_add_i16(fw_cfg, FW_CFG_MAX_CPUS, (uint16_t)machine->smp.max_cpus);
     fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, (uint64_t)machine->ram_size);
     fw_cfg_add_i16(fw_cfg, FW_CFG_MACHINE_ID, ARCH_PREP);
 
+    if (!graphic_width) {
+        graphic_width = 800;
+    }
+    if (!graphic_height) {
+        graphic_height = 600;
+    }
+    if (!graphic_depth) {
+        graphic_depth = 32;
+    }
     fw_cfg_add_i16(fw_cfg, FW_CFG_PPC_WIDTH, graphic_width);
     fw_cfg_add_i16(fw_cfg, FW_CFG_PPC_HEIGHT, graphic_height);
     fw_cfg_add_i16(fw_cfg, FW_CFG_PPC_DEPTH, graphic_depth);
 
-    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_IS_KVM, kvm_enabled());
-    if (kvm_enabled()) {
-        uint8_t *hypercall;
-
-        fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, kvmppc_get_tbfreq());
-        hypercall = g_malloc(16);
-        kvmppc_get_hypercall(env, hypercall, 16);
-        fw_cfg_add_bytes(fw_cfg, FW_CFG_PPC_KVM_HC, hypercall, 16);
-        fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_KVM_PID, getpid());
-    } else {
-        fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, NANOSECONDS_PER_SECOND);
-    }
+    fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_TBFREQ, NANOSECONDS_PER_SECOND);
     fw_cfg_add_i16(fw_cfg, FW_CFG_BOOT_DEVICE, boot_device);
     qemu_register_boot_set(fw_cfg_boot_set, fw_cfg);
 
     /* Prepare firmware configuration for Open Hack'Ware */
     if (m48t59) {
-        PPC_NVRAM_set_params(m48t59, NVRAM_SIZE, "PREP", ram_size,
+        PPC_NVRAM_set_params(m48t59, NVRAM_SIZE, "PREP", machine->ram_size,
                              boot_device,
                              kernel_base, kernel_size,
                              machine->kernel_cmdline,
@@ -437,6 +451,9 @@ static void ibm_40p_machine_init(MachineClass *mc)
     mc->default_boot_order = "c";
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("604");
     mc->default_display = "std";
+    mc->default_nic = "pcnet";
+
+    machine_add_audiodev_property(mc);
 }
 
 DEFINE_MACHINE("40p", ibm_40p_machine_init)

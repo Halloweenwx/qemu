@@ -29,8 +29,9 @@
 
 #include "qemu/queue.h"
 #include "qemu/thread.h"
+#include "ui/clipboard.h"
 #include "ui/console.h"
-#include "audio/audio.h"
+#include "qemu/audio-capture.h"
 #include "qemu/bitmap.h"
 #include "crypto/tlssession.h"
 #include "qemu/buffer.h"
@@ -45,14 +46,6 @@
 #include "vnc-enc-zrle.h"
 #include "ui/kbd-state.h"
 
-// #define _VNC_DEBUG 1
-
-#ifdef _VNC_DEBUG
-#define VNC_DEBUG(fmt, ...) do { fprintf(stderr, fmt, ## __VA_ARGS__); } while (0)
-#else
-#define VNC_DEBUG(fmt, ...) do { } while (0)
-#endif
-
 /*****************************************************************************
  *
  * Core data structures
@@ -61,6 +54,7 @@
 
 typedef struct VncState VncState;
 typedef struct VncJob VncJob;
+typedef struct VncJobQueue VncJobQueue;
 typedef struct VncRect VncRect;
 typedef struct VncRectEntry VncRectEntry;
 
@@ -80,8 +74,8 @@ typedef void VncSendHextileTile(VncState *vs,
 
 /* VNC_MAX_WIDTH must be a multiple of VNC_DIRTY_PIXELS_PER_BIT. */
 
-#define VNC_MAX_WIDTH ROUND_UP(2560, VNC_DIRTY_PIXELS_PER_BIT)
-#define VNC_MAX_HEIGHT 2048
+#define VNC_MAX_WIDTH ROUND_UP(5120, VNC_DIRTY_PIXELS_PER_BIT)
+#define VNC_MAX_HEIGHT 2160
 
 /* VNC_DIRTY_BITS is the number of bits in the dirty bitmap. */
 #define VNC_DIRTY_BITS (VNC_MAX_WIDTH / VNC_DIRTY_PIXELS_PER_BIT)
@@ -91,8 +85,8 @@ typedef void VncSendHextileTile(VncState *vs,
 #define VNC_DIRTY_BPL(x) (sizeof((x)->dirty) / VNC_MAX_HEIGHT * BITS_PER_BYTE)
 
 #define VNC_STAT_RECT  64
-#define VNC_STAT_COLS (VNC_MAX_WIDTH / VNC_STAT_RECT)
-#define VNC_STAT_ROWS (VNC_MAX_HEIGHT / VNC_STAT_RECT)
+#define VNC_STAT_COLS DIV_ROUND_UP(VNC_MAX_WIDTH, VNC_STAT_RECT)
+#define VNC_STAT_ROWS DIV_ROUND_UP(VNC_MAX_HEIGHT, VNC_STAT_RECT)
 
 #define VNC_AUTH_CHALLENGE_SIZE 16
 
@@ -153,21 +147,21 @@ struct VncDisplay
     DisplayChangeListener dcl;
     kbd_layout_t *kbd_layout;
     int lock_key_sync;
-    QEMUPutLEDEntry *led;
+    Notifier led_notifier;
     int ledstate;
     QKbdState *kbd;
     QemuMutex mutex;
+    VncJobQueue *queue;
 
-    QEMUCursor *cursor;
     int cursor_msize;
     uint8_t *cursor_mask;
 
     struct VncSurface guest;   /* guest visible surface (aka ds->surface) */
     pixman_image_t *server;    /* vnc server surface */
+    int true_width; /* server surface width before rounding up */
 
-    const char *id;
+    char *id;
     QTAILQ_ENTRY(VncDisplay) next;
-    bool is_unix;
     char *password;
     time_t expires;
     int auth;
@@ -176,14 +170,17 @@ struct VncDisplay
     int ws_subauth; /* Used by websockets */
     bool lossy;
     bool non_adaptive;
+    bool power_control;
+    bool clipboard_availability;
     QCryptoTLSCreds *tlscreds;
-    QAuthZ *tlsauthz;
     char *tlsauthzid;
 #ifdef CONFIG_VNC_SASL
     VncDisplaySASL sasl;
 #endif
 
-    AudioState *audio_state;
+    AudioBackend *audio_be;
+
+    VMChangeStateEntry *vmstate_handler_entry;
 };
 
 typedef struct VncTight {
@@ -198,7 +195,7 @@ typedef struct VncTight {
 #ifdef CONFIG_VNC_JPEG
     Buffer jpeg;
 #endif
-#ifdef CONFIG_VNC_PNG
+#ifdef CONFIG_PNG
     Buffer png;
 #endif
     int levels[4];
@@ -269,8 +266,6 @@ struct VncState
     gboolean disconnecting;
 
     DECLARE_BITMAP(dirty[VNC_MAX_HEIGHT], VNC_DIRTY_BITS);
-    uint8_t **lossy_rect; /* Not an Array to avoid costly memcpy in
-                           * vnc-jobs-async.c */
 
     VncDisplay *vd;
     VncStateUpdate update; /* Most recent pending request from client */
@@ -322,7 +317,7 @@ struct VncState
     VncWritePixels *write_pixels;
     PixelFormat client_pf;
     pixman_format_code_t client_format;
-    bool client_be;
+    int client_endian; /* G_LITTLE_ENDIAN or G_BIG_ENDIAN */
 
     CaptureVoiceOut *audio_cap;
     struct audsettings as;
@@ -338,16 +333,30 @@ struct VncState
     /* Encoding specific, if you add something here, don't forget to
      *  update vnc_async_encoding_start()
      */
-    VncTight *tight;
-    VncZlib zlib;
     VncHextile hextile;
-    VncZrle *zrle;
     VncZywrle zywrle;
 
     Notifier mouse_mode_notifier;
 
+    QemuClipboardPeer cbpeer;
+    QemuClipboardInfo *cbinfo;
+    uint32_t cbpending;
+
     QTAILQ_ENTRY(VncState) next;
 };
+
+typedef struct VncWorker {
+    uint8_t lossy_rect[VNC_STAT_ROWS][VNC_STAT_COLS];
+
+    VncTight tight;
+    VncZlib zlib;
+    VncZrle zrle;
+} VncWorker;
+
+typedef struct VncConnection {
+    VncState vs;
+    VncWorker worker;
+} VncConnection;
 
 
 /*****************************************************************************
@@ -411,7 +420,12 @@ enum {
 #define VNC_ENCODING_AUDIO                0XFFFFFEFD /* -259 */
 #define VNC_ENCODING_TIGHT_PNG            0xFFFFFEFC /* -260 */
 #define VNC_ENCODING_LED_STATE            0XFFFFFEFB /* -261 */
+#define VNC_ENCODING_DESKTOP_RESIZE_EXT   0XFFFFFECC /* -308 */
+#define VNC_ENCODING_XVP                  0XFFFFFECB /* -309 */
+#define VNC_ENCODING_ALPHA_CURSOR         0XFFFFFEC6 /* -314 */
+#define VNC_ENCODING_CLIPBOARD_AVAILABILITY  0XFFFFFEC2 /* -318 */
 #define VNC_ENCODING_WMVi                 0x574D5669
+#define VNC_ENCODING_CLIPBOARD_EXT        0xc0a1e5ce
 
 /*****************************************************************************
  *
@@ -438,31 +452,25 @@ enum {
  *
  *****************************************************************************/
 
-#define VNC_FEATURE_RESIZE                   0
-#define VNC_FEATURE_HEXTILE                  1
-#define VNC_FEATURE_POINTER_TYPE_CHANGE      2
-#define VNC_FEATURE_WMVI                     3
-#define VNC_FEATURE_TIGHT                    4
-#define VNC_FEATURE_ZLIB                     5
-#define VNC_FEATURE_COPYRECT                 6
-#define VNC_FEATURE_RICH_CURSOR              7
-#define VNC_FEATURE_TIGHT_PNG                8
-#define VNC_FEATURE_ZRLE                     9
-#define VNC_FEATURE_ZYWRLE                  10
-#define VNC_FEATURE_LED_STATE               11
-
-#define VNC_FEATURE_RESIZE_MASK              (1 << VNC_FEATURE_RESIZE)
-#define VNC_FEATURE_HEXTILE_MASK             (1 << VNC_FEATURE_HEXTILE)
-#define VNC_FEATURE_POINTER_TYPE_CHANGE_MASK (1 << VNC_FEATURE_POINTER_TYPE_CHANGE)
-#define VNC_FEATURE_WMVI_MASK                (1 << VNC_FEATURE_WMVI)
-#define VNC_FEATURE_TIGHT_MASK               (1 << VNC_FEATURE_TIGHT)
-#define VNC_FEATURE_ZLIB_MASK                (1 << VNC_FEATURE_ZLIB)
-#define VNC_FEATURE_COPYRECT_MASK            (1 << VNC_FEATURE_COPYRECT)
-#define VNC_FEATURE_RICH_CURSOR_MASK         (1 << VNC_FEATURE_RICH_CURSOR)
-#define VNC_FEATURE_TIGHT_PNG_MASK           (1 << VNC_FEATURE_TIGHT_PNG)
-#define VNC_FEATURE_ZRLE_MASK                (1 << VNC_FEATURE_ZRLE)
-#define VNC_FEATURE_ZYWRLE_MASK              (1 << VNC_FEATURE_ZYWRLE)
-#define VNC_FEATURE_LED_STATE_MASK           (1 << VNC_FEATURE_LED_STATE)
+enum VncFeatures {
+    VNC_FEATURE_RESIZE,
+    VNC_FEATURE_RESIZE_EXT,
+    VNC_FEATURE_HEXTILE,
+    VNC_FEATURE_POINTER_TYPE_CHANGE,
+    VNC_FEATURE_WMVI,
+    VNC_FEATURE_TIGHT,
+    VNC_FEATURE_ZLIB,
+    VNC_FEATURE_RICH_CURSOR,
+    VNC_FEATURE_ALPHA_CURSOR,
+    VNC_FEATURE_TIGHT_PNG,
+    VNC_FEATURE_ZRLE,
+    VNC_FEATURE_ZYWRLE,
+    VNC_FEATURE_LED_STATE,
+    VNC_FEATURE_XVP,
+    VNC_FEATURE_CLIPBOARD_EXT,
+    VNC_FEATURE_CLIPBOARD_AVAILABILITY,
+    VNC_FEATURE_AUDIO,
+};
 
 
 /* Client -> Server message IDs */
@@ -515,6 +523,33 @@ enum {
 #define VNC_MSG_SERVER_QEMU_AUDIO_BEGIN           1
 #define VNC_MSG_SERVER_QEMU_AUDIO_DATA            2
 
+/* XVP server -> client status code */
+#define VNC_XVP_CODE_FAIL 0
+#define VNC_XVP_CODE_INIT 1
+
+/* XVP client -> server action request  */
+#define VNC_XVP_ACTION_SHUTDOWN 2
+#define VNC_XVP_ACTION_REBOOT 3
+#define VNC_XVP_ACTION_RESET 4
+
+/* extended clipboard flags  */
+#define VNC_CLIPBOARD_TEXT     (1 << 0)
+#define VNC_CLIPBOARD_RTF      (1 << 1)
+#define VNC_CLIPBOARD_HTML     (1 << 2)
+#define VNC_CLIPBOARD_DIB      (1 << 3)
+#define VNC_CLIPBOARD_FILES    (1 << 4)
+#define VNC_CLIPBOARD_CAPS     (1 << 24)
+#define VNC_CLIPBOARD_REQUEST  (1 << 25)
+#define VNC_CLIPBOARD_PEEK     (1 << 26)
+#define VNC_CLIPBOARD_NOTIFY   (1 << 27)
+#define VNC_CLIPBOARD_PROVIDE  (1 << 28)
+
+/* ClipboardAvailability pseudo-encoding values */
+#define VNC_CLIPBOARD_UNAVAILABLE  0
+#define VNC_CLIPBOARD_AVAILABLE    1
+
+VncDisplay *vnc_display_new(const char *id, Error **errp);
+void vnc_display_free(VncDisplay *vd);
 
 /*****************************************************************************
  *
@@ -538,7 +573,6 @@ void vnc_write_u16(VncState *vs, uint16_t value);
 void vnc_write_u8(VncState *vs, uint8_t value);
 void vnc_flush(VncState *vs);
 void vnc_read_when(VncState *vs, VncReadEvent *func, size_t expecting);
-void vnc_disconnect_finish(VncState *vs);
 void vnc_start_protocol(VncState *vs);
 
 
@@ -559,6 +593,11 @@ static inline uint32_t vnc_has_feature(VncState *vs, int feature) {
     return (vs->features & (1 << feature));
 }
 
+static inline void vnc_set_feature(VncState *vs, enum VncFeatures feature)
+{
+    vs->features |= (1 << feature);
+}
+
 /* Framebuffer */
 void vnc_framebuffer_update(VncState *vs, int x, int y, int w, int h,
                             int32_t encoding);
@@ -573,10 +612,11 @@ int vnc_server_fb_stride(VncDisplay *vd);
 
 void vnc_convert_pixel(VncState *vs, uint8_t *buf, uint32_t v);
 double vnc_update_freq(VncState *vs, int x, int y, int w, int h);
-void vnc_sent_lossy_rect(VncState *vs, int x, int y, int w, int h);
+void vnc_sent_lossy_rect(VncWorker *worker, int x, int y, int w, int h);
 
 /* Encodings */
-int vnc_send_framebuffer_update(VncState *vs, int x, int y, int w, int h);
+int vnc_send_framebuffer_update(VncState *vs, VncWorker *worker,
+                                int x, int y, int w, int h);
 
 int vnc_raw_send_framebuffer_update(VncState *vs, int x, int y, int w, int h);
 
@@ -586,16 +626,31 @@ void vnc_hextile_set_pixel_conversion(VncState *vs, int generic);
 
 void *vnc_zlib_zalloc(void *x, unsigned items, unsigned size);
 void vnc_zlib_zfree(void *x, void *addr);
-int vnc_zlib_send_framebuffer_update(VncState *vs, int x, int y, int w, int h);
-void vnc_zlib_clear(VncState *vs);
+int vnc_zlib_send_framebuffer_update(VncState *vs, VncWorker *worker,
+                                     int x, int y, int w, int h);
+void vnc_zlib_clear(VncWorker *worker);
 
-int vnc_tight_send_framebuffer_update(VncState *vs, int x, int y, int w, int h);
-int vnc_tight_png_send_framebuffer_update(VncState *vs, int x, int y,
-                                          int w, int h);
-void vnc_tight_clear(VncState *vs);
+int vnc_tight_send_framebuffer_update(VncState *vs, VncWorker *worker,
+                                      int x, int y, int w, int h);
+int vnc_tight_png_send_framebuffer_update(VncState *vs, VncWorker *worker,
+                                          int x, int y, int w, int h);
+void vnc_tight_clear(VncWorker *worker);
 
-int vnc_zrle_send_framebuffer_update(VncState *vs, int x, int y, int w, int h);
-int vnc_zywrle_send_framebuffer_update(VncState *vs, int x, int y, int w, int h);
-void vnc_zrle_clear(VncState *vs);
+int vnc_zrle_send_framebuffer_update(VncState *vs, VncWorker *worker,
+                                     int x, int y, int w, int h);
+int vnc_zywrle_send_framebuffer_update(VncState *vs, VncWorker *worker,
+                                       int x, int y, int w, int h);
+void vnc_zrle_clear(VncWorker *worker);
+
+/* vnc-clipboard.c */
+void vnc_clipboard_peer_register(VncState *vs);
+void vnc_clipboard_availability_send(VncState *vs, bool available);
+void vnc_server_cut_text_caps(VncState *vs);
+void vnc_client_cut_text(VncState *vs, size_t len, uint8_t *text);
+void vnc_client_cut_text_ext(VncState *vs, int32_t len, uint32_t flags, uint8_t *data);
+
+/* XVP events */
+void vnc_action_shutdown(VncState *vs);
+void vnc_action_reset(VncState *vs);
 
 #endif /* QEMU_VNC_H */

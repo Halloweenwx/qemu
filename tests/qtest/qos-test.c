@@ -5,7 +5,7 @@
  *
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
- * License version 2 as published by the Free Software Foundation.
+ * License version 2.1 as published by the Free Software Foundation.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -19,18 +19,19 @@
 #include "qemu/osdep.h"
 #include <getopt.h>
 #include "libqtest-single.h"
-#include "qapi/qmp/qdict.h"
-#include "qapi/qmp/qbool.h"
-#include "qapi/qmp/qstring.h"
+#include "qapi/error.h"
+#include "qobject/qdict.h"
 #include "qemu/module.h"
-#include "qapi/qmp/qlist.h"
-#include "libqos/malloc.h"
+#include "qapi/qobject-input-visitor.h"
+#include "qapi/qapi-visit-machine.h"
+#include "qapi/qapi-visit-qom.h"
+#include "libqos/libqos-malloc.h"
 #include "libqos/qgraph.h"
 #include "libqos/qgraph_internal.h"
 #include "libqos/qos_external.h"
 
 static char *old_path;
-
+static GSList *path_vecs;
 
 
 /**
@@ -51,13 +52,20 @@ static void qos_set_machines_devices_available(void)
 {
     QDict *response;
     QDict *args = qdict_new();
-    QList *list;
+    QObject *ret;
+    Visitor *v;
+    MachineInfoList *mach_info;
+    ObjectTypeInfoList *type_info;
 
     qtest_start("-machine none");
     response = qmp("{ 'execute': 'query-machines' }");
-    list = qdict_get_qlist(response, "return");
+    ret = qdict_get(response, "return");
 
-    apply_to_qlist(list, true);
+    v = qobject_input_visitor_new(ret);
+    visit_type_MachineInfoList(v, NULL, &mach_info, &error_abort);
+    visit_free(v);
+    machines_apply_to_node(mach_info);
+    qapi_free_MachineInfoList(mach_info);
 
     qobject_unref(response);
 
@@ -66,10 +74,13 @@ static void qos_set_machines_devices_available(void)
 
     response = qmp("{'execute': 'qom-list-types',"
                    " 'arguments': %p }", args);
-    g_assert(qdict_haskey(response, "return"));
-    list = qdict_get_qlist(response, "return");
+    ret = qdict_get(response, "return");
 
-    apply_to_qlist(list, false);
+    v = qobject_input_visitor_new(ret);
+    visit_type_ObjectTypeInfoList(v, NULL, &type_info, &error_abort);
+    visit_free(v);
+    types_apply_to_node(type_info);
+    qapi_free_ObjectTypeInfoList(type_info);
 
     qtest_end();
     qobject_unref(response);
@@ -78,6 +89,9 @@ static void qos_set_machines_devices_available(void)
 
 static void restart_qemu_or_continue(char *path)
 {
+    if (g_test_verbose()) {
+        qos_printf("Run QEMU with: '%s'\n", path);
+    }
     /* compares the current command line with the
      * one previously executed: if they are the same,
      * don't restart QEMU, if they differ, stop previous
@@ -90,8 +104,7 @@ static void restart_qemu_or_continue(char *path)
         old_path = g_strdup(path);
         qtest_start(path);
     } else { /* if cmd line is the same, reset the guest */
-        qobject_unref(qmp("{ 'execute': 'system_reset' }"));
-        qmp_eventwait("RESET");
+        qtest_system_reset(global_qtest);
     }
 }
 
@@ -170,9 +183,22 @@ static void run_one_test(const void *arg)
 
 static void subprocess_run_one_test(const void *arg)
 {
-    const gchar *path = arg;
-    g_test_trap_subprocess(path, 0, 0);
+    char **path_vec = (char **) arg;
+    gchar *path = g_strjoinv("/", path_vec + 1);
+    gchar *subprocess_path = g_strdup_printf("/%s/subprocess", path);
+
+    g_test_trap_subprocess(subprocess_path, 180 * G_USEC_PER_SEC,
+                           G_TEST_SUBPROCESS_INHERIT_STDOUT |
+                           G_TEST_SUBPROCESS_INHERIT_STDERR);
     g_test_trap_assert_passed();
+    g_free(path);
+    g_free(subprocess_path);
+}
+
+static void destroy_pathv(void *arg)
+{
+    g_free(((char **)arg)[0]);
+    g_free(arg);
 }
 
 /*
@@ -218,6 +244,7 @@ static void walk_path(QOSGraphNode *orig_path, int len)
     GString *cmd_line = g_string_new("");
     GString *cmd_line2 = g_string_new("");
 
+    path_vecs = g_slist_append(path_vecs, path_vec);
     path = qos_graph_get_node(node_name); /* root */
     node_name = qos_graph_edge_get_dest(path->path_edge); /* machine name */
 
@@ -277,10 +304,13 @@ static void walk_path(QOSGraphNode *orig_path, int len)
     path_vec[0] = g_string_free(cmd_line, false);
 
     if (path->u.test.subprocess) {
-        gchar *subprocess_path = g_strdup_printf("/%s/%s/subprocess",
-                                                 qtest_get_arch(), path_str);
-        qtest_add_data_func(path_str, subprocess_path, subprocess_run_one_test);
-        g_test_add_data_func(subprocess_path, path_vec, run_one_test);
+        gchar *subprocess_path = g_strdup_printf("%s/%s", path_str,
+                                                 "subprocess");
+
+        qtest_add_data_func(path_str, path_vec, subprocess_run_one_test);
+        qtest_add_data_func(subprocess_path, path_vec, run_one_test);
+
+        g_free(subprocess_path);
     } else {
         qtest_add_data_func(path_str, path_vec, run_one_test);
     }
@@ -302,18 +332,37 @@ static void walk_path(QOSGraphNode *orig_path, int len)
  *   machine/drivers/test objects
  * - Cleans up everything
  */
-int main(int argc, char **argv)
+int main(int argc, char **argv, char** envp)
 {
     g_test_init(&argc, &argv, NULL);
+    if (g_test_verbose()) {
+        qos_printf("ENVIRONMENT VARIABLES: {\n");
+        for (char **env = envp; *env != 0; env++) {
+            qos_printf("\t%s\n", *env);
+        }
+        qos_printf("}\n");
+    }
     qos_graph_init();
     module_call_init(MODULE_INIT_QOM);
     module_call_init(MODULE_INIT_LIBQOS);
     qos_set_machines_devices_available();
 
+    /*
+     * Even if this invocation was done to run a single test in a
+     * subprocess (i.e. g_test_subprocess() is true), gtester doesn't
+     * expose the test name, so w still need to execute the whole
+     * thing as normal, including walking the QOS graph to add all
+     * the tests, in order for g_test_run() to find the one /subprocess
+     * test that it is going to execute.
+     */
     qos_graph_foreach_test_path(walk_path);
+    if (g_test_verbose()) {
+        qos_dump_graph();
+    }
     g_test_run();
     qtest_end();
     qos_graph_destroy();
     g_free(old_path);
+    g_slist_free_full(path_vecs, (GDestroyNotify)destroy_pathv);
     return 0;
 }

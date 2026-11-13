@@ -3,31 +3,31 @@
  *
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
+ *
+ * TODO:
+ *
+ *  - Enable SSL
+ *  - Manage SetOptions/ResetOptions commands
  */
 
 #include "qemu/osdep.h"
-#include "sysemu/sysemu.h"
+#include "system/system.h"
 #include "qemu/main-loop.h"
 #include "qemu/sockets.h"
 #include "qapi/error.h"
 #include "qom/object_interfaces.h"
 #include "io/channel-socket.h"
 #include "ui/input.h"
+#include "qom/object.h"
 #include "ui/vnc_keysym.h" /* use name2keysym from VNC as we use X11 values */
 #include "qemu/cutils.h"
 #include "qapi/qmp/qerror.h"
 #include "input-barrier.h"
 
 #define TYPE_INPUT_BARRIER "input-barrier"
-#define INPUT_BARRIER(obj) \
-    OBJECT_CHECK(InputBarrier, (obj), TYPE_INPUT_BARRIER)
-#define INPUT_BARRIER_GET_CLASS(obj) \
-    OBJECT_GET_CLASS(InputBarrierClass, (obj), TYPE_INPUT_BARRIER)
-#define INPUT_BARRIER_CLASS(klass) \
-    OBJECT_CLASS_CHECK(InputBarrierClass, (klass), TYPE_INPUT_BARRIER)
+OBJECT_DECLARE_SIMPLE_TYPE(InputBarrier,
+                           INPUT_BARRIER)
 
-typedef struct InputBarrier InputBarrier;
-typedef struct InputBarrierClass InputBarrierClass;
 
 #define MAX_HELLO_LENGTH 1024
 
@@ -49,9 +49,6 @@ struct InputBarrier {
     char buffer[MAX_HELLO_LENGTH];
 };
 
-struct InputBarrierClass {
-    ObjectClass parent_class;
-};
 
 static const char *cmd_names[] = {
     [barrierCmdCNoop]          = "CNOP",
@@ -87,11 +84,11 @@ static const char *cmd_names[] = {
 
 static kbd_layout_t *kbd_layout;
 
-static int input_barrier_to_qcode(uint16_t keyid, uint16_t keycode)
+static unsigned int input_barrier_to_linux(uint16_t keyid, uint16_t keycode)
 {
     /* keycode is optional, if it is not provided use keyid */
-    if (keycode && keycode <= qemu_input_map_xorgkbd_to_qcode_len) {
-        return qemu_input_map_xorgkbd_to_qcode[keycode];
+    if (keycode && keycode < qemu_input_map_xorgkbd_to_linux_len) {
+        return qemu_input_map_xorgkbd_to_linux[keycode];
     }
 
     if (keyid >= 0xE000 && keyid <= 0xEFFF) {
@@ -102,10 +99,10 @@ static int input_barrier_to_qcode(uint16_t keyid, uint16_t keycode)
     if (kbd_layout) {
         keycode = keysym2scancode(kbd_layout, keyid, NULL, false);
 
-        return qemu_input_key_number_to_qcode(keycode);
+        return qemu_input_key_number_to_linux(keycode);
     }
 
-    return qemu_input_map_x11_to_qcode[keyid];
+    return qemu_input_map_x11_to_linux[keyid];
 }
 
 static int input_barrier_to_mouse(uint8_t buttonid)
@@ -434,23 +431,23 @@ static gboolean writecmd(InputBarrier *ib, struct barrierMsg *msg)
 
     /* keyboard */
     case barrierCmdDKeyDown:
-        qemu_input_event_send_key_qcode(NULL,
-                        input_barrier_to_qcode(msg->key.keyid, msg->key.button),
+        qemu_input_event_send_key_linux(NULL,
+                        input_barrier_to_linux(msg->key.keyid, msg->key.button),
                                         true);
         break;
     case barrierCmdDKeyRepeat:
         for (i = 0; i < msg->repeat.repeat; i++) {
-            qemu_input_event_send_key_qcode(NULL,
-                  input_barrier_to_qcode(msg->repeat.keyid, msg->repeat.button),
+            qemu_input_event_send_key_linux(NULL,
+                  input_barrier_to_linux(msg->repeat.keyid, msg->repeat.button),
                                             false);
-            qemu_input_event_send_key_qcode(NULL,
-                  input_barrier_to_qcode(msg->repeat.keyid, msg->repeat.button),
+            qemu_input_event_send_key_linux(NULL,
+                  input_barrier_to_linux(msg->repeat.keyid, msg->repeat.button),
                                             true);
         }
         break;
     case barrierCmdDKeyUp:
-        qemu_input_event_send_key_qcode(NULL,
-                        input_barrier_to_qcode(msg->key.keyid, msg->key.button),
+        qemu_input_event_send_key_linux(NULL,
+                        input_barrier_to_linux(msg->key.keyid, msg->key.button),
                                         false);
         break;
     default:
@@ -493,7 +490,6 @@ static gboolean input_barrier_event(QIOChannel *ioc G_GNUC_UNUSED,
 static void input_barrier_complete(UserCreatable *uc, Error **errp)
 {
     InputBarrier *ib = INPUT_BARRIER(uc);
-    Error *local_err = NULL;
 
     if (!ib->name) {
         error_setg(errp, QERR_MISSING_PARAMETER, "name");
@@ -509,9 +505,7 @@ static void input_barrier_complete(UserCreatable *uc, Error **errp)
     ib->sioc = qio_channel_socket_new();
     qio_channel_set_name(QIO_CHANNEL(ib->sioc), "barrier-client");
 
-    qio_channel_socket_connect_sync(ib->sioc, &ib->saddr, &local_err);
-    if (local_err) {
-        error_propagate(errp, local_err);
+    if (qio_channel_socket_connect_sync(ib->sioc, &ib->saddr, errp) < 0) {
         return;
     }
 
@@ -524,11 +518,7 @@ static void input_barrier_complete(UserCreatable *uc, Error **errp)
 static void input_barrier_instance_finalize(Object *obj)
 {
     InputBarrier *ib = INPUT_BARRIER(obj);
-
-    if (ib->ioc_tag) {
-        g_source_remove(ib->ioc_tag);
-        ib->ioc_tag = 0;
-    }
+    g_clear_handle_id(&ib->ioc_tag, g_source_remove);
 
     if (ib->sioc) {
         qio_channel_close(QIO_CHANNEL(ib->sioc), NULL);
@@ -685,8 +675,8 @@ static void input_barrier_instance_init(Object *obj)
     /* always use generic keymaps */
     if (keyboard_layout && !kbd_layout) {
         /* We use X11 key id, so use VNC name2keysym */
-        kbd_layout = init_keyboard_layout(name2keysym, keyboard_layout,
-                                          &error_fatal);
+        kbd_layout = kbd_layout_new(name2keysym, keyboard_layout,
+                                    &error_fatal);
     }
 
     ib->saddr.type = SOCKET_ADDRESS_TYPE_INET;
@@ -697,46 +687,45 @@ static void input_barrier_instance_init(Object *obj)
     ib->y_origin = 0;
     ib->width = 1920;
     ib->height = 1080;
-
-    object_property_add_str(obj, "name",
-                            input_barrier_get_name,
-                            input_barrier_set_name, NULL);
-    object_property_add_str(obj, "server",
-                            input_barrier_get_server,
-                            input_barrier_set_server, NULL);
-    object_property_add_str(obj, "port",
-                            input_barrier_get_port,
-                            input_barrier_set_port, NULL);
-    object_property_add_str(obj, "x-origin",
-                            input_barrier_get_x_origin,
-                            input_barrier_set_x_origin, NULL);
-    object_property_add_str(obj, "y-origin",
-                            input_barrier_get_y_origin,
-                            input_barrier_set_y_origin, NULL);
-    object_property_add_str(obj, "width",
-                            input_barrier_get_width,
-                            input_barrier_set_width, NULL);
-    object_property_add_str(obj, "height",
-                            input_barrier_get_height,
-                            input_barrier_set_height, NULL);
 }
 
-static void input_barrier_class_init(ObjectClass *oc, void *data)
+static void input_barrier_class_init(ObjectClass *oc, const void *data)
 {
     UserCreatableClass *ucc = USER_CREATABLE_CLASS(oc);
 
     ucc->complete = input_barrier_complete;
+
+    object_class_property_add_str(oc, "name",
+                                  input_barrier_get_name,
+                                  input_barrier_set_name);
+    object_class_property_add_str(oc, "server",
+                                  input_barrier_get_server,
+                                  input_barrier_set_server);
+    object_class_property_add_str(oc, "port",
+                                  input_barrier_get_port,
+                                  input_barrier_set_port);
+    object_class_property_add_str(oc, "x-origin",
+                                  input_barrier_get_x_origin,
+                                  input_barrier_set_x_origin);
+    object_class_property_add_str(oc, "y-origin",
+                                  input_barrier_get_y_origin,
+                                  input_barrier_set_y_origin);
+    object_class_property_add_str(oc, "width",
+                                  input_barrier_get_width,
+                                  input_barrier_set_width);
+    object_class_property_add_str(oc, "height",
+                                  input_barrier_get_height,
+                                  input_barrier_set_height);
 }
 
 static const TypeInfo input_barrier_info = {
     .name = TYPE_INPUT_BARRIER,
     .parent = TYPE_OBJECT,
-    .class_size = sizeof(InputBarrierClass),
     .class_init = input_barrier_class_init,
     .instance_size = sizeof(InputBarrier),
     .instance_init = input_barrier_instance_init,
     .instance_finalize = input_barrier_instance_finalize,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_USER_CREATABLE },
         { }
     }

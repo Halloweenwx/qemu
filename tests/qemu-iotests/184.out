@@ -26,15 +26,23 @@ Testing:
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
+                "backing-image": {
+                    "virtual-size": 1073741824,
+                    "filename": "null-co://",
+                    "format": "null-co",
+                    "actual-size": 0
+                },
                 "virtual-size": 1073741824,
                 "filename": "json:{\"throttle-group\": \"group0\", \"driver\": \"throttle\", \"file\": {\"driver\": \"null-co\"}}",
-                "format": "throttle"
+                "format": "throttle",
+                "actual-size": 0
             },
             "iops_wr": 0,
             "ro": false,
             "node-name": "throttle0",
-            "backing_file_depth": 0,
+            "backing_file_depth": 1,
             "drv": "throttle",
             "iops": 0,
             "bps_wr": 0,
@@ -47,16 +55,17 @@ Testing:
                 "direct": false,
                 "writeback": true
             },
-            "file": "json:{\"throttle-group\": \"group0\", \"driver\": \"throttle\", \"file\": {\"driver\": \"null-co\"}}",
-            "encryption_key_missing": false
+            "file": "json:{\"throttle-group\": \"group0\", \"driver\": \"throttle\", \"file\": {\"driver\": \"null-co\"}}"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 1073741824,
                 "filename": "null-co://",
-                "format": "null-co"
+                "format": "null-co",
+                "actual-size": 0
             },
             "iops_wr": 0,
             "ro": false,
@@ -74,18 +83,13 @@ Testing:
                 "direct": false,
                 "writeback": true
             },
-            "file": "null-co://",
-            "encryption_key_missing": false
+            "file": "null-co://"
         }
     ]
 }
 {
     "return": [
     ]
-}
-{
-    "return": {
-    }
 }
 {
     "timestamp": {
@@ -96,6 +100,10 @@ Testing:
     "data": {
         "guest": false,
         "reason": "host-qmp-quit"
+    }
+}
+{
+    "return": {
     }
 }
 
@@ -164,10 +172,6 @@ Testing:
     }
 }
 {
-    "return": {
-    }
-}
-{
     "timestamp": {
         "seconds":  TIMESTAMP,
         "microseconds":  TIMESTAMP
@@ -176,6 +180,10 @@ Testing:
     "data": {
         "guest": false,
         "reason": "host-qmp-quit"
+    }
+}
+{
+    "return": {
     }
 }
 
@@ -206,10 +214,6 @@ Testing:
     }
 }
 {
-    "return": {
-    }
-}
-{
     "timestamp": {
         "seconds":  TIMESTAMP,
         "microseconds":  TIMESTAMP
@@ -218,6 +222,10 @@ Testing:
     "data": {
         "guest": false,
         "reason": "host-qmp-quit"
+    }
+}
+{
+    "return": {
     }
 }
 
@@ -242,10 +250,6 @@ Testing:
     }
 }
 {
-    "return": {
-    }
-}
-{
     "timestamp": {
         "seconds":  TIMESTAMP,
         "microseconds":  TIMESTAMP
@@ -254,6 +258,10 @@ Testing:
     "data": {
         "guest": false,
         "reason": "host-qmp-quit"
+    }
+}
+{
+    "return": {
     }
 }
 

@@ -13,9 +13,9 @@
 #include "qemu/units.h"
 #include "e500.h"
 #include "hw/net/fsl_etsec/etsec.h"
-#include "sysemu/device_tree.h"
-#include "sysemu/kvm.h"
-#include "hw/sysbus.h"
+#include "system/device_tree.h"
+#include "system/kvm.h"
+#include "hw/core/sysbus.h"
 #include "hw/pci/pci.h"
 #include "hw/ppc/openpic.h"
 #include "kvm_ppc.h"
@@ -42,23 +42,24 @@ static void e500plat_init(MachineState *machine)
     ppce500_init(machine);
 }
 
-static void e500plat_machine_device_plug_cb(HotplugHandler *hotplug_dev,
+static void e500plat_machine_device_plug_cb(const HotplugHandler *hotplug_dev,
                                             DeviceState *dev, Error **errp)
 {
     PPCE500MachineState *pms = PPCE500_MACHINE(hotplug_dev);
+    MachineClass *mc = MACHINE_GET_CLASS(pms);
 
-    if (pms->pbus_dev) {
-        if (object_dynamic_cast(OBJECT(dev), TYPE_SYS_BUS_DEVICE)) {
-            platform_bus_link_device(pms->pbus_dev, SYS_BUS_DEVICE(dev));
-        }
+    if (device_is_dynamic_sysbus(mc, dev)) {
+        platform_bus_link_device(pms->pbus_dev, SYS_BUS_DEVICE(dev));
     }
 }
 
-static
+static const
 HotplugHandler *e500plat_machine_get_hotpug_handler(MachineState *machine,
                                                     DeviceState *dev)
 {
-    if (object_dynamic_cast(OBJECT(dev), TYPE_SYS_BUS_DEVICE)) {
+    MachineClass *mc = MACHINE_GET_CLASS(machine);
+
+    if (device_is_dynamic_sysbus(mc, dev)) {
         return HOTPLUG_HANDLER(machine);
     }
 
@@ -67,7 +68,7 @@ HotplugHandler *e500plat_machine_get_hotpug_handler(MachineState *machine,
 
 #define TYPE_E500PLAT_MACHINE  MACHINE_TYPE_NAME("ppce500")
 
-static void e500plat_machine_class_init(ObjectClass *oc, void *data)
+static void e500plat_machine_class_init(ObjectClass *oc, const void *data)
 {
     PPCE500MachineClass *pmc = PPCE500_MACHINE_CLASS(oc);
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(oc);
@@ -82,7 +83,7 @@ static void e500plat_machine_class_init(ObjectClass *oc, void *data)
     pmc->fixup_devtree = e500plat_fixup_devtree;
     pmc->mpic_version = OPENPIC_MODEL_FSL_MPIC_42;
     pmc->has_mpc8xxx_gpio = true;
-    pmc->has_platform_bus = true;
+    pmc->has_esdhc = true;
     pmc->platform_bus_base = 0xf00000000ULL;
     pmc->platform_bus_size = 128 * MiB;
     pmc->platform_bus_first_irq = 5;
@@ -92,12 +93,16 @@ static void e500plat_machine_class_init(ObjectClass *oc, void *data)
     pmc->pci_mmio_base = 0xC00000000ULL;
     pmc->pci_mmio_bus_base = 0xE0000000ULL;
     pmc->spin_base = 0xFEF000000ULL;
+    pmc->clock_freq = PLATFORM_CLK_FREQ_HZ;
+    pmc->bus_freq = PLATFORM_CLK_FREQ_HZ;
+    pmc->tb_freq = PLATFORM_CLK_FREQ_HZ;
 
     mc->desc = "generic paravirt e500 platform";
     mc->init = e500plat_init;
     mc->max_cpus = 32;
     mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("e500v2_v30");
     mc->default_ram_id = "mpc8544ds.ram";
+    mc->default_nic = "virtio-net-pci";
     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_ETSEC_COMMON);
  }
 
@@ -105,7 +110,7 @@ static const TypeInfo e500plat_info = {
     .name          = TYPE_E500PLAT_MACHINE,
     .parent        = TYPE_PPCE500_MACHINE,
     .class_init    = e500plat_machine_class_init,
-    .interfaces    = (InterfaceInfo[]) {
+    .interfaces    = (const InterfaceInfo[]) {
          { TYPE_HOTPLUG_HANDLER },
          { }
     }

@@ -10,11 +10,12 @@
  */
 
 #include "qemu/osdep.h"
-#include "sysemu/replay.h"
-#include "sysemu/runstate.h"
+#include "system/replay.h"
+#include "system/runstate.h"
 #include "replay-internal.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
+#include "trace.h"
 
 /* Mutex to protect reading and writing events to the log.
    data_kind and has_unread_data are also protected
@@ -22,6 +23,9 @@
    It also protects replay events queue which stores events to be
    written or read to the log. */
 static QemuMutex lock;
+/* Condition and queue for fair ordering of mutex lock requests. */
+static QemuCond mutex_cond;
+static unsigned long mutex_head, mutex_tail;
 
 /* File for replay writing */
 static bool write_error;
@@ -41,7 +45,7 @@ static void replay_read_error(void)
     exit(1);
 }
 
-void replay_put_byte(uint8_t byte)
+static void replay_putc(uint8_t byte)
 {
     if (replay_file) {
         if (putc(byte, replay_file) == EOF) {
@@ -50,29 +54,45 @@ void replay_put_byte(uint8_t byte)
     }
 }
 
+void replay_put_byte(uint8_t byte)
+{
+    trace_replay_put_byte(byte);
+    replay_putc(byte);
+}
+
 void replay_put_event(uint8_t event)
 {
+    trace_replay_put_event(event);
     assert(event < EVENT_COUNT);
-    replay_put_byte(event);
+    replay_putc(event);
 }
 
 
 void replay_put_word(uint16_t word)
 {
-    replay_put_byte(word >> 8);
-    replay_put_byte(word);
+    trace_replay_put_word(word);
+    replay_putc(word >> 8);
+    replay_putc(word);
 }
 
 void replay_put_dword(uint32_t dword)
 {
-    replay_put_word(dword >> 16);
-    replay_put_word(dword);
+    int i;
+
+    trace_replay_put_dword(dword);
+    for (i = 24; i >= 0; i -= 8) {
+        replay_putc(dword >> i);
+    }
 }
 
 void replay_put_qword(int64_t qword)
 {
-    replay_put_dword(qword >> 32);
-    replay_put_dword(qword);
+    int i;
+
+    trace_replay_put_qword(qword);
+    for (i = 56; i >= 0; i -= 8) {
+        replay_putc(qword >> i);
+    }
 }
 
 void replay_put_array(const uint8_t *buf, size_t size)
@@ -85,7 +105,7 @@ void replay_put_array(const uint8_t *buf, size_t size)
     }
 }
 
-uint8_t replay_get_byte(void)
+static uint8_t replay_getc(void)
 {
     uint8_t byte = 0;
     if (replay_file) {
@@ -98,36 +118,52 @@ uint8_t replay_get_byte(void)
     return byte;
 }
 
+uint8_t replay_get_byte(void)
+{
+    uint8_t byte = replay_getc();
+    trace_replay_get_byte(byte);
+    return byte;
+}
+
 uint16_t replay_get_word(void)
 {
     uint16_t word = 0;
     if (replay_file) {
-        word = replay_get_byte();
-        word = (word << 8) + replay_get_byte();
+        word = replay_getc();
+        word = (word << 8) + replay_getc();
     }
 
+    trace_replay_get_word(word);
     return word;
 }
 
 uint32_t replay_get_dword(void)
 {
     uint32_t dword = 0;
+    int i;
+
     if (replay_file) {
-        dword = replay_get_word();
-        dword = (dword << 16) + replay_get_word();
+        for (i = 24; i >= 0; i -= 8) {
+            dword |= replay_getc() << i;
+        }
     }
 
+    trace_replay_get_dword(dword);
     return dword;
 }
 
 int64_t replay_get_qword(void)
 {
-    int64_t qword = 0;
+    uint64_t qword = 0;
+    int i;
+
     if (replay_file) {
-        qword = replay_get_dword();
-        qword = (qword << 32) + replay_get_dword();
+        for (i = 56; i >= 0; i -= 8) {
+            qword |= (uint64_t)replay_getc() << i;
+        }
     }
 
+    trace_replay_get_qword(qword);
     return qword;
 }
 
@@ -169,14 +205,17 @@ void replay_check_error(void)
 
 void replay_fetch_data_kind(void)
 {
+    trace_replay_fetch_data_kind();
     if (replay_file) {
         if (!replay_state.has_unread_data) {
-            replay_state.data_kind = replay_get_byte();
+            replay_state.data_kind = replay_getc();
+            replay_state.current_event++;
+            trace_replay_get_event(replay_state.current_event, replay_state.data_kind);
             if (replay_state.data_kind == EVENT_INSTRUCTION) {
                 replay_state.instruction_count = replay_get_dword();
             }
             replay_check_error();
-            replay_state.has_unread_data = 1;
+            replay_state.has_unread_data = true;
             if (replay_state.data_kind >= EVENT_COUNT) {
                 error_report("Replay: unknown event kind %d",
                              replay_state.data_kind);
@@ -188,7 +227,7 @@ void replay_fetch_data_kind(void)
 
 void replay_finish_event(void)
 {
-    replay_state.has_unread_data = 0;
+    replay_state.has_unread_data = false;
     replay_fetch_data_kind();
 }
 
@@ -197,9 +236,10 @@ static __thread bool replay_locked;
 void replay_mutex_init(void)
 {
     qemu_mutex_init(&lock);
+    qemu_cond_init(&mutex_cond);
     /* Hold the mutex while we start-up */
-    qemu_mutex_lock(&lock);
     replay_locked = true;
+    ++mutex_tail;
 }
 
 bool replay_mutex_locked(void)
@@ -211,10 +251,16 @@ bool replay_mutex_locked(void)
 void replay_mutex_lock(void)
 {
     if (replay_mode != REPLAY_MODE_NONE) {
-        g_assert(!qemu_mutex_iothread_locked());
+        unsigned long id;
+        g_assert(!bql_locked());
         g_assert(!replay_mutex_locked());
         qemu_mutex_lock(&lock);
+        id = mutex_tail++;
+        while (id != mutex_head) {
+            qemu_cond_wait(&mutex_cond, &lock);
+        }
         replay_locked = true;
+        qemu_mutex_unlock(&lock);
     }
 }
 
@@ -222,7 +268,10 @@ void replay_mutex_unlock(void)
 {
     if (replay_mode != REPLAY_MODE_NONE) {
         g_assert(replay_mutex_locked());
+        qemu_mutex_lock(&lock);
+        ++mutex_head;
         replay_locked = false;
+        qemu_cond_broadcast(&mutex_cond);
         qemu_mutex_unlock(&lock);
     }
 }
@@ -232,12 +281,34 @@ void replay_advance_current_icount(uint64_t current_icount)
     int diff = (int)(current_icount - replay_state.current_icount);
 
     /* Time can only go forward */
+    trace_replay_advance_current_icount(replay_state.current_icount, diff);
     assert(diff >= 0);
 
-    if (diff > 0) {
-        replay_put_event(EVENT_INSTRUCTION);
-        replay_put_dword(diff);
-        replay_state.current_icount += diff;
+    if (replay_mode == REPLAY_MODE_RECORD) {
+        if (diff > 0) {
+            replay_put_event(EVENT_INSTRUCTION);
+            replay_put_dword(diff);
+            replay_state.current_icount += diff;
+        }
+    } else if (replay_mode == REPLAY_MODE_PLAY) {
+        if (diff > 0) {
+            replay_state.instruction_count -= diff;
+            replay_state.current_icount += diff;
+            if (replay_state.instruction_count == 0) {
+                assert(replay_state.data_kind == EVENT_INSTRUCTION);
+                replay_finish_event();
+                /* Wake up iothread. This is required because
+                    timers will not expire until clock counters
+                    will be read from the log. */
+                qemu_notify_event();
+            }
+        }
+        /* Execution reached the break step */
+        if (replay_break_icount == replay_state.current_icount) {
+            /* Cannot make callback directly from the vCPU thread */
+            timer_mod_ns(replay_break_timer,
+                qemu_clock_get_ns(QEMU_CLOCK_REALTIME));
+        }
     }
 }
 

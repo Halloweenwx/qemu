@@ -19,6 +19,7 @@
 #include "migration/vmstate.h"
 #include "hw/display/i2c-ddc.h"
 #include "trace.h"
+#include "qom/object.h"
 
 #define SII9022_SYS_CTRL_DATA 0x1a
 #define SII9022_SYS_CTRL_PWR_DWN 0x10
@@ -35,22 +36,22 @@
 #define SII9022_INT_STATUS_PLUGGED 0x04;
 
 #define TYPE_SII9022 "sii9022"
-#define SII9022(obj) OBJECT_CHECK(sii9022_state, (obj), TYPE_SII9022)
+OBJECT_DECLARE_SIMPLE_TYPE(sii9022_state, SII9022)
 
-typedef struct sii9022_state {
+struct sii9022_state {
     I2CSlave parent_obj;
     uint8_t ptr;
     bool addr_byte;
     bool ddc_req;
     bool ddc_skip_finish;
     bool ddc;
-} sii9022_state;
+};
 
 static const VMStateDescription vmstate_sii9022 = {
     .name = "sii9022",
     .version_id = 1,
     .minimum_version_id = 1,
-    .fields = (VMStateField[]) {
+    .fields = (const VMStateField[]) {
         VMSTATE_I2C_SLAVE(parent_obj, sii9022_state),
         VMSTATE_UINT8(ptr, sii9022_state),
         VMSTATE_BOOL(addr_byte, sii9022_state),
@@ -75,6 +76,8 @@ static int sii9022_event(I2CSlave *i2c, enum i2c_event event)
         break;
     case I2C_NACK:
         break;
+    default:
+        return -1;
     }
 
     return 0;
@@ -161,10 +164,10 @@ static void sii9022_realize(DeviceState *dev, Error **errp)
     I2CBus *bus;
 
     bus = I2C_BUS(qdev_get_parent_bus(dev));
-    i2c_create_slave(bus, TYPE_I2CDDC, 0x50);
+    i2c_slave_create_simple(bus, TYPE_I2CDDC, 0x50);
 }
 
-static void sii9022_class_init(ObjectClass *klass, void *data)
+static void sii9022_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     I2CSlaveClass *k = I2C_SLAVE_CLASS(klass);
@@ -172,7 +175,7 @@ static void sii9022_class_init(ObjectClass *klass, void *data)
     k->event = sii9022_event;
     k->recv = sii9022_rx;
     k->send = sii9022_tx;
-    dc->reset = sii9022_reset;
+    device_class_set_legacy_reset(dc, sii9022_reset);
     dc->realize = sii9022_realize;
     dc->vmsd = &vmstate_sii9022;
 }

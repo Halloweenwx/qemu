@@ -23,13 +23,16 @@
 
 #ifndef IMX_FEC_H
 #define IMX_FEC_H
+#include "qom/object.h"
 
 #define TYPE_IMX_FEC "imx.fec"
-#define IMX_FEC(obj) OBJECT_CHECK(IMXFECState, (obj), TYPE_IMX_FEC)
+OBJECT_DECLARE_SIMPLE_TYPE(IMXFECState, IMX_FEC)
 
 #define TYPE_IMX_ENET "imx.enet"
 
-#include "hw/sysbus.h"
+#include "hw/core/sysbus.h"
+#include "hw/net/lan9118_phy.h"
+#include "hw/core/irq.h"
 #include "net/net.h"
 
 #define ENET_EIR               1
@@ -247,7 +250,7 @@ typedef struct {
 
 #define FSL_IMX25_FEC_SIZE      0x4000
 
-typedef struct IMXFECState {
+struct IMXFECState {
     /*< private >*/
     SysBusDevice parent_obj;
 
@@ -263,16 +266,16 @@ typedef struct IMXFECState {
     uint32_t tx_descriptor[ENET_TX_RING_NUM];
     uint32_t tx_ring_num;
 
-    uint32_t phy_status;
-    uint32_t phy_control;
-    uint32_t phy_advertise;
-    uint32_t phy_int;
-    uint32_t phy_int_mask;
+    Lan9118PhyState mii;
+    IRQState mii_irq;
+    uint32_t phy_num;
+    bool phy_connected;
+    struct IMXFECState *phy_consumer;
 
     bool is_fec;
 
     /* Buffer used to assemble a Tx frame */
     uint8_t frame[ENET_MAX_FRAME_SIZE];
-} IMXFECState;
+};
 
 #endif

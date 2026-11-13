@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -28,9 +28,8 @@
 #include "qemu/filemonitor.h"
 #include "qom/object_interfaces.h"
 #include "qapi/qapi-visit-authz.h"
-#include "qapi/qmp/qjson.h"
-#include "qapi/qmp/qobject.h"
-#include "qapi/qmp/qerror.h"
+#include "qobject/qjson.h"
+#include "qobject/qobject.h"
 #include "qapi/qobject-input-visitor.h"
 
 
@@ -73,14 +72,15 @@ qauthz_list_file_load(QAuthZListFile *fauthz, Error **errp)
 
     pdict = qobject_to(QDict, obj);
     if (!pdict) {
-        error_setg(errp, QERR_INVALID_PARAMETER_TYPE, "obj", "dict");
+        error_setg(errp, "File '%s' must contain a JSON object",
+                   fauthz->filename);
         goto cleanup;
     }
 
     v = qobject_input_visitor_new(obj);
 
-    ret = (QAuthZ *)user_creatable_add_type(TYPE_QAUTHZ_LIST,
-                                            NULL, pdict, v, errp);
+    ret = QAUTHZ(object_new_with_props_from_qdict_parentless(
+                     TYPE_QAUTHZ_LIST, pdict, v, errp));
 
  cleanup:
     visit_free(v);
@@ -122,7 +122,15 @@ qauthz_list_file_complete(UserCreatable *uc, Error **errp)
     QAuthZListFile *fauthz = QAUTHZ_LIST_FILE(uc);
     gchar *dir = NULL, *file = NULL;
 
+    if (!fauthz->filename) {
+        error_setg(errp, "filename not provided");
+        return;
+    }
+
     fauthz->list = qauthz_list_file_load(fauthz, errp);
+    if (!fauthz->list) {
+        return;
+    }
 
     if (!fauthz->refresh) {
         return;
@@ -212,7 +220,7 @@ qauthz_list_file_finalize(Object *obj)
 
 
 static void
-qauthz_list_file_class_init(ObjectClass *oc, void *data)
+qauthz_list_file_class_init(ObjectClass *oc, const void *data)
 {
     UserCreatableClass *ucc = USER_CREATABLE_CLASS(oc);
     QAuthZClass *authz = QAUTHZ_CLASS(oc);
@@ -221,12 +229,10 @@ qauthz_list_file_class_init(ObjectClass *oc, void *data)
 
     object_class_property_add_str(oc, "filename",
                                   qauthz_list_file_prop_get_filename,
-                                  qauthz_list_file_prop_set_filename,
-                                  NULL);
+                                  qauthz_list_file_prop_set_filename);
     object_class_property_add_bool(oc, "refresh",
                                    qauthz_list_file_prop_get_refresh,
-                                   qauthz_list_file_prop_set_refresh,
-                                   NULL);
+                                   qauthz_list_file_prop_set_refresh);
 
     authz->is_allowed = qauthz_list_file_is_allowed;
 }
@@ -265,9 +271,8 @@ static const TypeInfo qauthz_list_file_info = {
     .instance_init = qauthz_list_file_init,
     .instance_size = sizeof(QAuthZListFile),
     .instance_finalize = qauthz_list_file_finalize,
-    .class_size = sizeof(QAuthZListFileClass),
     .class_init = qauthz_list_file_class_init,
-    .interfaces = (InterfaceInfo[]) {
+    .interfaces = (const InterfaceInfo[]) {
         { TYPE_USER_CREATABLE },
         { }
     }

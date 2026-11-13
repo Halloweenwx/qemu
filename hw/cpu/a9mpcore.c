@@ -12,9 +12,10 @@
 #include "qapi/error.h"
 #include "qemu/module.h"
 #include "hw/cpu/a9mpcore.h"
-#include "hw/irq.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/irq.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/core/cpu.h"
+#include "target/arm/cpu-qom.h"
 
 #define A9_GIC_NUM_PRIORITY_BITS    5
 
@@ -32,18 +33,15 @@ static void a9mp_priv_initfn(Object *obj)
     memory_region_init(&s->container, obj, "a9mp-priv-container", 0x2000);
     sysbus_init_mmio(SYS_BUS_DEVICE(obj), &s->container);
 
-    sysbus_init_child_obj(obj, "scu", &s->scu, sizeof(s->scu), TYPE_A9_SCU);
+    object_initialize_child(obj, "scu", &s->scu, TYPE_A9_SCU);
 
-    sysbus_init_child_obj(obj, "gic", &s->gic, sizeof(s->gic), TYPE_ARM_GIC);
+    object_initialize_child(obj, "gic", &s->gic, TYPE_ARM_GIC);
 
-    sysbus_init_child_obj(obj, "gtimer", &s->gtimer, sizeof(s->gtimer),
-                          TYPE_A9_GTIMER);
+    object_initialize_child(obj, "gtimer", &s->gtimer, TYPE_A9_GTIMER);
 
-    sysbus_init_child_obj(obj, "mptimer", &s->mptimer, sizeof(s->mptimer),
-                          TYPE_ARM_MPTIMER);
+    object_initialize_child(obj, "mptimer", &s->mptimer, TYPE_ARM_MPTIMER);
 
-    sysbus_init_child_obj(obj, "wdt", &s->wdt, sizeof(s->wdt),
-                          TYPE_ARM_MPTIMER);
+    object_initialize_child(obj, "wdt", &s->wdt, TYPE_ARM_MPTIMER);
 }
 
 static void a9mp_priv_realize(DeviceState *dev, Error **errp)
@@ -53,16 +51,28 @@ static void a9mp_priv_realize(DeviceState *dev, Error **errp)
     DeviceState *scudev, *gicdev, *gtimerdev, *mptimerdev, *wdtdev;
     SysBusDevice *scubusdev, *gicbusdev, *gtimerbusdev, *mptimerbusdev,
                  *wdtbusdev;
-    Error *err = NULL;
     int i;
     bool has_el3;
+    CPUState *cpu0;
     Object *cpuobj;
+
+    if (s->num_irq < 32 || s->num_irq > 256) {
+        error_setg(errp, "Property 'num-irq' must be between 32 and 256");
+        return;
+    }
+
+    cpu0 = qemu_get_cpu(0);
+    cpuobj = OBJECT(cpu0);
+    if (strcmp(object_get_typename(cpuobj), ARM_CPU_TYPE_NAME("cortex-a9"))) {
+        /* We might allow Cortex-A5 once we model it */
+        error_setg(errp,
+                   "Cortex-A9MPCore peripheral can only use Cortex-A9 CPU");
+        return;
+    }
 
     scudev = DEVICE(&s->scu);
     qdev_prop_set_uint32(scudev, "num-cpu", s->num_cpu);
-    object_property_set_bool(OBJECT(&s->scu), true, "realized", &err);
-    if (err != NULL) {
-        error_propagate(errp, err);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->scu), errp)) {
         return;
     }
     scubusdev = SYS_BUS_DEVICE(&s->scu);
@@ -76,14 +86,11 @@ static void a9mp_priv_realize(DeviceState *dev, Error **errp)
     /* Make the GIC's TZ support match the CPUs. We assume that
      * either all the CPUs have TZ, or none do.
      */
-    cpuobj = OBJECT(qemu_get_cpu(0));
-    has_el3 = object_property_find(cpuobj, "has_el3", NULL) &&
+    has_el3 = object_property_find(cpuobj, "has_el3") &&
         object_property_get_bool(cpuobj, "has_el3", &error_abort);
     qdev_prop_set_bit(gicdev, "has-security-extensions", has_el3);
 
-    object_property_set_bool(OBJECT(&s->gic), true, "realized", &err);
-    if (err != NULL) {
-        error_propagate(errp, err);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->gic), errp)) {
         return;
     }
     gicbusdev = SYS_BUS_DEVICE(&s->gic);
@@ -96,27 +103,21 @@ static void a9mp_priv_realize(DeviceState *dev, Error **errp)
 
     gtimerdev = DEVICE(&s->gtimer);
     qdev_prop_set_uint32(gtimerdev, "num-cpu", s->num_cpu);
-    object_property_set_bool(OBJECT(&s->gtimer), true, "realized", &err);
-    if (err != NULL) {
-        error_propagate(errp, err);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->gtimer), errp)) {
         return;
     }
     gtimerbusdev = SYS_BUS_DEVICE(&s->gtimer);
 
     mptimerdev = DEVICE(&s->mptimer);
     qdev_prop_set_uint32(mptimerdev, "num-cpu", s->num_cpu);
-    object_property_set_bool(OBJECT(&s->mptimer), true, "realized", &err);
-    if (err != NULL) {
-        error_propagate(errp, err);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->mptimer), errp)) {
         return;
     }
     mptimerbusdev = SYS_BUS_DEVICE(&s->mptimer);
 
     wdtdev = DEVICE(&s->wdt);
     qdev_prop_set_uint32(wdtdev, "num-cpu", s->num_cpu);
-    object_property_set_bool(OBJECT(&s->wdt), true, "realized", &err);
-    if (err != NULL) {
-        error_propagate(errp, err);
+    if (!sysbus_realize(SYS_BUS_DEVICE(&s->wdt), errp)) {
         return;
     }
     wdtbusdev = SYS_BUS_DEVICE(&s->wdt);
@@ -162,19 +163,19 @@ static void a9mp_priv_realize(DeviceState *dev, Error **errp)
     }
 }
 
-static Property a9mp_priv_properties[] = {
+static const Property a9mp_priv_properties[] = {
     DEFINE_PROP_UINT32("num-cpu", A9MPPrivState, num_cpu, 1),
-    /* The Cortex-A9MP may have anything from 0 to 224 external interrupt
-     * IRQ lines (with another 32 internal). We default to 64+32, which
-     * is the number provided by the Cortex-A9MP test chip in the
-     * Realview PBX-A9 and Versatile Express A9 development boards.
-     * Other boards may differ and should set this property appropriately.
+    /*
+     * The Cortex-A9MP may have anything from 0 to 224 external interrupt
+     * lines, plus always 32 internal IRQs. This property sets the total
+     * of internal + external, so the valid range is from 32 to 256.
+     * The board model must set this to whatever the configuration
+     * used for the CPU on that board or SoC is.
      */
-    DEFINE_PROP_UINT32("num-irq", A9MPPrivState, num_irq, 96),
-    DEFINE_PROP_END_OF_LIST(),
+    DEFINE_PROP_UINT32("num-irq", A9MPPrivState, num_irq, 0),
 };
 
-static void a9mp_priv_class_init(ObjectClass *klass, void *data)
+static void a9mp_priv_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
@@ -182,17 +183,14 @@ static void a9mp_priv_class_init(ObjectClass *klass, void *data)
     device_class_set_props(dc, a9mp_priv_properties);
 }
 
-static const TypeInfo a9mp_priv_info = {
-    .name          = TYPE_A9MPCORE_PRIV,
-    .parent        = TYPE_SYS_BUS_DEVICE,
-    .instance_size = sizeof(A9MPPrivState),
-    .instance_init = a9mp_priv_initfn,
-    .class_init    = a9mp_priv_class_init,
+static const TypeInfo a9mp_types[] = {
+    {
+        .name           = TYPE_A9MPCORE_PRIV,
+        .parent         = TYPE_SYS_BUS_DEVICE,
+        .instance_size  =  sizeof(A9MPPrivState),
+        .instance_init  = a9mp_priv_initfn,
+        .class_init     = a9mp_priv_class_init,
+    },
 };
 
-static void a9mp_register_types(void)
-{
-    type_register_static(&a9mp_priv_info);
-}
-
-type_init(a9mp_register_types)
+DEFINE_TYPES(a9mp_types)

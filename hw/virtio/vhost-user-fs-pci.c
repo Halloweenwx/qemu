@@ -12,9 +12,10 @@
  */
 
 #include "qemu/osdep.h"
-#include "hw/qdev-properties.h"
+#include "hw/core/qdev-properties.h"
 #include "hw/virtio/vhost-user-fs.h"
-#include "virtio-pci.h"
+#include "hw/virtio/virtio-pci.h"
+#include "qom/object.h"
 
 struct VHostUserFSPCI {
     VirtIOPCIProxy parent_obj;
@@ -25,13 +26,12 @@ typedef struct VHostUserFSPCI VHostUserFSPCI;
 
 #define TYPE_VHOST_USER_FS_PCI "vhost-user-fs-pci-base"
 
-#define VHOST_USER_FS_PCI(obj) \
-        OBJECT_CHECK(VHostUserFSPCI, (obj), TYPE_VHOST_USER_FS_PCI)
+DECLARE_INSTANCE_CHECKER(VHostUserFSPCI, VHOST_USER_FS_PCI,
+                         TYPE_VHOST_USER_FS_PCI)
 
-static Property vhost_user_fs_pci_properties[] = {
+static const Property vhost_user_fs_pci_properties[] = {
     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors,
                        DEV_NVECTORS_UNSPECIFIED),
-    DEFINE_PROP_END_OF_LIST(),
 };
 
 static void vhost_user_fs_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
@@ -44,11 +44,10 @@ static void vhost_user_fs_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
         vpci_dev->nvectors = dev->vdev.conf.num_request_queues + 2;
     }
 
-    qdev_set_parent_bus(vdev, BUS(&vpci_dev->bus));
-    object_property_set_bool(OBJECT(vdev), true, "realized", errp);
+    qdev_realize(vdev, BUS(&vpci_dev->bus), errp);
 }
 
-static void vhost_user_fs_pci_class_init(ObjectClass *klass, void *data)
+static void vhost_user_fs_pci_class_init(ObjectClass *klass, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);
@@ -68,6 +67,8 @@ static void vhost_user_fs_pci_instance_init(Object *obj)
 
     virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
                                 TYPE_VHOST_USER_FS);
+    object_property_add_alias(obj, "bootindex", OBJECT(&dev->vdev),
+                              "bootindex");
 }
 
 static const VirtioPCIDeviceTypeInfo vhost_user_fs_pci_info = {

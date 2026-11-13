@@ -1,7 +1,6 @@
-module None
+module ./builtin
 object q_empty
 enum QType
-    prefix QTYPE
     member none
     member qnull
     member qnum
@@ -12,14 +11,18 @@ enum QType
 module doc-good.json
 enum Enum
     member one
-        if ['defined(IFONE)']
+        if IFONE
+        feature enum-member-feat
     member two
-    if ['defined(IFCOND)']
+    if IFCOND
+    feature enum-feat
 object Base
     member base1: Enum optional=False
+    if {'all': ['IFALL1', 'IFALL2']}
 object Variant1
     member var1: str optional=False
-        if ['defined(IFSTR)']
+        if IFSTR
+        feature member-feat
     feature variant1-feat
 object Variant2
 object Object
@@ -27,25 +30,14 @@ object Object
     tag base1
     case one: Variant1
     case two: Variant2
-        if ['IFTWO']
-object q_obj_Variant1-wrapper
-    member data: Variant1 optional=False
-object q_obj_Variant2-wrapper
-    member data: Variant2 optional=False
-enum SugaredUnionKind
-    member one
-    member two
-        if ['IFTWO']
-object SugaredUnion
-    member type: SugaredUnionKind optional=False
-    tag type
-    case one: q_obj_Variant1-wrapper
-    case two: q_obj_Variant2-wrapper
-        if ['IFTWO']
+        if {'any': ['IFONE', 'IFTWO']}
+    feature union-feat1
 alternate Alternate
     tag type
     case i: int
     case b: bool
+    if {'not': {'any': ['IFONE', 'IFTWO']}}
+    feature alt-feat
 object q_obj_cmd-arg
     member arg1: int optional=False
     member arg2: str optional=True
@@ -58,35 +50,43 @@ command cmd-boxed Object -> None
     gen=True success_response=True boxed=True oob=False preconfig=False
     feature cmd-feat1
     feature cmd-feat2
-event EVT-BOXED Object
+event EVT_BOXED Object
     boxed=True
+    feature feat3
 doc freeform
-    body=
-= Section
+    Plain
+*******
+Section
+*******
+doc freeform
+    Plain
+Just text, no heading.
+doc freeform
+    Plain
+Subsection
+==========
 
-== Subsection
-
-*strong* _with emphasis_
+*with emphasis*
 @var {in braces}
-* List item one
-- Two, multiple
-lines
 
-3. Three
-Still in list
+* List item one
+* Two, multiple
+  lines
+
+* Three
+  Still in list
 
 Not in list
+
 - Second list
-Note: still in list
+  Note: still in list
 
 Note: not in list
+
 1. Third list
-is numbered
+   is numbered
 
-- another item
-
-| example
-| multiple lines
+2. another item
 
 Returns: the King
 Since: the first age
@@ -106,94 +106,125 @@ Examples:
 - *verbatim*
 - {braces}
 doc symbol=Enum
-    body=
+    Intro
 
-    arg=one
-The _one_ {and only}
-    arg=two
+    Member=one
+The _one_ {and only}, description on the same line
+    Member=two
 
-    section=None
+    Feature=enum-feat
+Also _one_ {and only}
+    Feature=enum-member-feat
+a member feature
+    Plain
 @two is undocumented
 doc symbol=Base
-    body=
+    Intro
 
-    arg=base1
-the first member
+    Member=base1
+ description starts on a new line,
+ minimally indented
 doc symbol=Variant1
-    body=
-A paragraph
+    Intro
+    A paragraph
 
-Another paragraph (but no @var: line)
-    arg=var1
+    Another paragraph
+    Member=var1
 
-    feature=variant1-feat
+    Plain
+@var1 is undocumented
+    Feature=variant1-feat
 a feature
+    Feature=member-feat
+a member feature
 doc symbol=Variant2
-    body=
+    Intro
 
 doc symbol=Object
-    body=
+    Intro
 
-doc symbol=SugaredUnion
-    body=
-
-    arg=type
-
-doc symbol=Alternate
-    body=
-
-    arg=i
-an integer
-@b is undocumented
-    arg=b
-
-doc freeform
-    body=
-== Another subsection
-doc symbol=cmd
-    body=
-
-    arg=arg1
-the first argument
-    arg=arg2
-the second
-argument
-    arg=arg3
-
-    feature=cmd-feat1
+    Feature=union-feat1
 a feature
-    feature=cmd-feat2
-another feature
-    section=Note
-@arg3 is undocumented
-    section=Returns
-@Object
-    section=TODO
-frobnicate
-    section=Notes
-- Lorem ipsum dolor sit amet
-- Ut enim ad minim veniam
+doc symbol=Alternate
+    Intro
 
-Duis aute irure dolor
-    section=Example
--> in
-<- out
-    section=Examples
-- *verbatim*
-- {braces}
-    section=Since
+    Member=i
+description starts on the same line
+    remainder indented the same
+    @b is undocumented
+    Member=b
+
+    Feature=alt-feat
+a feature
+doc freeform
+    Plain
+Another subsection
+==================
+doc symbol=cmd
+    Intro
+
+    Member=arg1
+    description starts on a new line,
+    indented
+    Member=arg2
+description starts on the same line
+    remainder indented differently
+    Member=arg3
+
+    Feature=cmd-feat1
+a feature
+    Feature=cmd-feat2
+another feature
+    Plain
+.. note:: @arg3 is undocumented
+    Returns
+@Object
+    Errors
+some
+    Todo
+frobnicate
+    Plain
+.. admonition:: Notes
+
+ - Lorem ipsum dolor sit amet
+ - Ut enim ad minim veniam
+
+ Duis aute irure dolor
+
+.. qmp-example::
+   :title: Ideal fast-food burger situation
+
+   -> "in"
+   <- "out"
+
+Examples::
+
+ - Not a QMP code block
+ - Merely a preformatted code block literal
+ It isn't even an rST list.
+ - *verbatim*
+ - {braces}
+
+Note::
+    Ceci n'est pas une note
+    Since
 2.10
 doc symbol=cmd-boxed
-    body=
-If you're bored enough to read this, go see a video of boxed cats
-    feature=cmd-feat1
+    Intro
+    If you're bored enough to read this, go see a video of boxed
+    cats
+    Feature=cmd-feat1
 a feature
-    feature=cmd-feat2
+    Feature=cmd-feat2
 another feature
-    section=Example
--> in
+    Plain
+.. qmp-example::
 
-<- out
-doc symbol=EVT-BOXED
-    body=
+   -> "this example"
 
+   <- ... has no title ...
+doc symbol=EVT_BOXED
+    Intro
+
+    Feature=feat3
+a feature

@@ -4,8 +4,8 @@ QA output created by 191
 
 Formatting 'TEST_DIR/t.IMGFMT.base', fmt=IMGFMT size=67108864
 Formatting 'TEST_DIR/t.IMGFMT.mid', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.base backing_fmt=IMGFMT
-Formatting 'TEST_DIR/t.IMGFMT', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.mid
-Formatting 'TEST_DIR/t.IMGFMT.ovl2', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.mid
+Formatting 'TEST_DIR/t.IMGFMT', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.mid backing_fmt=IMGFMT
+Formatting 'TEST_DIR/t.IMGFMT.ovl2', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.mid backing_fmt=IMGFMT
 wrote 65536/65536 bytes at offset 1048576
 64 KiB, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
 { 'execute': 'qmp_capabilities' }
@@ -16,7 +16,11 @@ wrote 65536/65536 bytes at offset 1048576
 
 === Perform commit job ===
 
-{ 'execute': 'block-commit', 'arguments': { 'job-id': 'commit0', 'device': 'top', 'base':'TEST_DIR/t.IMGFMT.base', 'top': 'TEST_DIR/t.IMGFMT.mid' } }
+{ 'execute': 'block-commit',
+       'arguments': { 'job-id': 'commit0',
+                      'device': 'top',
+                      'base':'TEST_DIR/t.IMGFMT.base',
+                      'top': 'TEST_DIR/t.IMGFMT.mid' } }
 {
     "timestamp": {
         "seconds":  TIMESTAMP,
@@ -110,6 +114,7 @@ wrote 65536/65536 bytes at offset 1048576
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "backing-image": {
                     "virtual-size": 67108864,
@@ -146,12 +151,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.ovl2",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.ovl2"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 197120,
                 "filename": "TEST_DIR/t.IMGFMT.ovl2",
@@ -175,12 +180,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.ovl2",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.ovl2"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "backing-image": {
                     "virtual-size": 67108864,
@@ -217,12 +222,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 197120,
                 "filename": "TEST_DIR/t.IMGFMT",
@@ -246,12 +251,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "backing-image": {
                     "virtual-size": 67108864,
@@ -288,12 +293,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.mid",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.mid"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 393216,
                 "filename": "TEST_DIR/t.IMGFMT.mid",
@@ -317,12 +322,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.mid",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.mid"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 67108864,
                 "filename": "TEST_DIR/t.IMGFMT.base",
@@ -347,12 +352,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.base",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.base"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 393216,
                 "filename": "TEST_DIR/t.IMGFMT.base",
@@ -376,16 +381,11 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.base",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.base"
         }
     ]
 }
 { 'execute': 'quit' }
-{
-    "return": {
-    }
-}
 {
     "timestamp": {
         "seconds":  TIMESTAMP,
@@ -395,6 +395,10 @@ wrote 65536/65536 bytes at offset 1048576
     "data": {
         "guest": false,
         "reason": "host-qmp-quit"
+    }
+}
+{
+    "return": {
     }
 }
 image: TEST_DIR/t.IMGFMT
@@ -413,10 +417,10 @@ backing file format: IMGFMT
 === Preparing and starting VM with -drive ===
 
 Formatting 'TEST_DIR/t.IMGFMT.base', fmt=IMGFMT size=67108864
-Formatting 'TEST_DIR/t.IMGFMT.mid', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.base
-Formatting 'TEST_DIR/t.IMGFMT', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.mid
-Formatting 'TEST_DIR/t.IMGFMT.ovl2', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.mid
-Formatting 'TEST_DIR/t.IMGFMT.ovl3', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.ovl2
+Formatting 'TEST_DIR/t.IMGFMT.mid', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.base backing_fmt=IMGFMT
+Formatting 'TEST_DIR/t.IMGFMT', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.mid backing_fmt=IMGFMT
+Formatting 'TEST_DIR/t.IMGFMT.ovl2', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.mid backing_fmt=IMGFMT
+Formatting 'TEST_DIR/t.IMGFMT.ovl3', fmt=IMGFMT size=67108864 backing_file=TEST_DIR/t.IMGFMT.ovl2 backing_fmt=IMGFMT
 wrote 65536/65536 bytes at offset 1048576
 64 KiB, X ops; XX:XX:XX.X (XXX YYY/sec and XXX ops/sec)
 { 'execute': 'qmp_capabilities' }
@@ -427,7 +431,11 @@ wrote 65536/65536 bytes at offset 1048576
 
 === Perform commit job ===
 
-{ 'execute': 'block-commit', 'arguments': { 'job-id': 'commit0', 'device': 'top', 'base':'TEST_DIR/t.IMGFMT.base', 'top': 'TEST_DIR/t.IMGFMT.mid' } }
+{ 'execute': 'block-commit',
+       'arguments': { 'job-id': 'commit0',
+                      'device': 'top',
+                      'base':'TEST_DIR/t.IMGFMT.base',
+                      'top': 'TEST_DIR/t.IMGFMT.mid' } }
 {
     "timestamp": {
         "seconds":  TIMESTAMP,
@@ -521,6 +529,7 @@ wrote 65536/65536 bytes at offset 1048576
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "backing-image": {
                     "virtual-size": 67108864,
@@ -557,12 +566,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.ovl2",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.ovl2"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 197120,
                 "filename": "TEST_DIR/t.IMGFMT.ovl2",
@@ -586,12 +595,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.ovl2",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.ovl2"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "backing-image": {
                     "backing-image": {
@@ -639,12 +648,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.ovl3",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.ovl3"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 197120,
                 "filename": "TEST_DIR/t.IMGFMT.ovl3",
@@ -668,12 +677,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.ovl3",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.ovl3"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 67108864,
                 "filename": "TEST_DIR/t.IMGFMT.base",
@@ -698,12 +707,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.base",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.base"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 393216,
                 "filename": "TEST_DIR/t.IMGFMT.base",
@@ -727,12 +736,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT.base",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT.base"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "backing-image": {
                     "virtual-size": 67108864,
@@ -769,12 +778,12 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT"
         },
         {
             "iops_rd": 0,
             "detect_zeroes": "off",
+            "active": true,
             "image": {
                 "virtual-size": 197120,
                 "filename": "TEST_DIR/t.IMGFMT",
@@ -798,16 +807,11 @@ wrote 65536/65536 bytes at offset 1048576
                 "direct": false,
                 "writeback": true
             },
-            "file": "TEST_DIR/t.IMGFMT",
-            "encryption_key_missing": false
+            "file": "TEST_DIR/t.IMGFMT"
         }
     ]
 }
 { 'execute': 'quit' }
-{
-    "return": {
-    }
-}
 {
     "timestamp": {
         "seconds":  TIMESTAMP,
@@ -817,6 +821,10 @@ wrote 65536/65536 bytes at offset 1048576
     "data": {
         "guest": false,
         "reason": "host-qmp-quit"
+    }
+}
+{
+    "return": {
     }
 }
 image: TEST_DIR/t.IMGFMT

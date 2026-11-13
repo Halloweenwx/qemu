@@ -31,10 +31,13 @@ The QEMU PC System emulator simulates the following peripherals:
 
 -  CS4231A compatible sound card
 
+-  PC speaker
+
 -  PCI UHCI, OHCI, EHCI or XHCI USB controller and a virtual USB-1.1
    hub.
 
-SMP is supported with up to 255 CPUs.
+SMP is supported with a large number of virtual CPUs (upper limit is
+configuration dependent).
 
 QEMU uses the PC BIOS from the Seabios project and the Plex86/Bochs LGPL
 VGA BIOS.
@@ -49,7 +52,7 @@ must be told to not have parallel ports to have working GUS.
 
 .. parsed-literal::
 
-   |qemu_system_x86| dos.img -soundhw gus -parallel none
+   |qemu_system_x86| dos.img -device gus -parallel none
 
 Alternatively:
 
@@ -60,3 +63,20 @@ Alternatively:
 Or some other unclaimed IRQ.
 
 CS4231A is the chip used in Windows Sound System and GUSMAX products
+
+The PC speaker audio device can be configured using the pcspk-audiodev
+machine property, i.e.
+
+.. parsed-literal::
+
+   |qemu_system_x86| some.img \
+   -audiodev <backend>,id=<name> \
+   -machine pcspk-audiodev=<name>
+
+Machine-specific options
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+It supports the following machine-specific options:
+
+- ``x-south-bridge=PIIX3|piix4-isa`` (Experimental option to select a particular
+  south bridge. Default: ``PIIX3``)

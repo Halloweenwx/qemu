@@ -17,8 +17,7 @@
 #include "tests/qtest/libqos/pci.h"
 #include "tests/qtest/libqos/pci-pc.h"
 #include "fuzz.h"
-#include "fuzz/qos_fuzz.h"
-#include "fuzz/fork_fuzz.h"
+#include "qos_fuzz.h"
 
 
 #define I440FX_PCI_HOST_BRIDGE_CFG 0xcf8
@@ -39,18 +38,17 @@ enum action_id {
     ACTION_MAX
 };
 
-static void i440fx_fuzz_qtest(QTestState *s,
+static void ioport_fuzz_qtest(QTestState *s,
         const unsigned char *Data, size_t Size) {
     /*
      * loop over the Data, breaking it up into actions. each action has an
      * opcode, address offset and value
      */
-    typedef struct QTestFuzzAction {
+    struct {
         uint8_t opcode;
         uint8_t addr;
         uint32_t value;
-    } QTestFuzzAction;
-    QTestFuzzAction a;
+    } a;
 
     while (Size >= sizeof(a)) {
         /* make a copy of the action so we can normalize the values in-place */
@@ -85,25 +83,27 @@ static void i440fx_fuzz_qtest(QTestState *s,
     flush_events(s);
 }
 
-static void i440fx_fuzz_qos(QTestState *s,
+static void i440fx_fuzz_qtest(QTestState *s,
+                              const unsigned char *Data,
+                              size_t Size)
+{
+    ioport_fuzz_qtest(s, Data, Size);
+    fuzz_reset(s);
+}
+
+static void pciconfig_fuzz_qos(QTestState *s, QPCIBus *bus,
         const unsigned char *Data, size_t Size) {
     /*
-     * Same as i440fx_fuzz_qtest, but using QOS. devfn is incorporated into the
+     * Same as ioport_fuzz_qtest, but using QOS. devfn is incorporated into the
      * value written over Port IO
      */
-    typedef struct QOSFuzzAction {
+    struct {
         uint8_t opcode;
         uint8_t offset;
         int devfn;
         uint32_t value;
-    } QOSFuzzAction;
+    } a;
 
-    static QPCIBus *bus;
-    if (!bus) {
-        bus = qpci_new_pc(s, fuzz_qos_alloc);
-    }
-
-    QOSFuzzAction a;
     while (Size >= sizeof(a)) {
         memcpy(&a, Data, sizeof(a));
         switch (a.opcode % ACTION_MAX) {
@@ -132,48 +132,37 @@ static void i440fx_fuzz_qos(QTestState *s,
     flush_events(s);
 }
 
-static void i440fx_fuzz_qos_fork(QTestState *s,
-        const unsigned char *Data, size_t Size) {
-    if (fork() == 0) {
-        i440fx_fuzz_qos(s, Data, Size);
-        _Exit(0);
-    } else {
-        wait(NULL);
+static void i440fx_fuzz_qos(QTestState *s,
+                            const unsigned char *Data,
+                            size_t Size)
+{
+    static QPCIBus *bus;
+
+    if (!bus) {
+        bus = qpci_new_pc(s, fuzz_qos_alloc);
     }
+
+    pciconfig_fuzz_qos(s, bus, Data, Size);
 }
 
 static const char *i440fx_qtest_argv = TARGET_NAME " -machine accel=qtest"
-                                       "-m 0 -display none";
-static const char *i440fx_argv(FuzzTarget *t)
+                                       " -m 0 -display none";
+static GString *i440fx_argv(FuzzTarget *t)
 {
-    return i440fx_qtest_argv;
+    return g_string_new(i440fx_qtest_argv);
 }
 
-static void fork_init(void)
-{
-    counter_shm_init();
-}
 
 static void register_pci_fuzz_targets(void)
 {
     /* Uses simple qtest commands and reboots to reset state */
     fuzz_add_target(&(FuzzTarget){
                 .name = "i440fx-qtest-reboot-fuzz",
-                .description = "Fuzz the i440fx using raw qtest commands and"
+                .description = "Fuzz the i440fx using raw qtest commands and "
                                "rebooting after each run",
                 .get_init_cmdline = i440fx_argv,
                 .fuzz = i440fx_fuzz_qtest});
 
-    /* Uses libqos and forks to prevent state leakage */
-    fuzz_add_qos_target(&(FuzzTarget){
-                .name = "i440fx-qos-fork-fuzz",
-                .description = "Fuzz the i440fx using raw qtest commands and"
-                               "rebooting after each run",
-                .pre_vm_init = &fork_init,
-                .fuzz = i440fx_fuzz_qos_fork,},
-                "i440FX-pcihost",
-                &(QOSGraphTestOptions){}
-                );
 
     /*
      * Uses libqos. Doesn't do anything to reset state. Note that if we were to
@@ -182,7 +171,7 @@ static void register_pci_fuzz_targets(void)
      */
     fuzz_add_qos_target(&(FuzzTarget){
                 .name = "i440fx-qos-noreset-fuzz",
-                .description = "Fuzz the i440fx using raw qtest commands and"
+                .description = "Fuzz the i440fx using raw qtest commands and "
                                "rebooting after each run",
                 .fuzz = i440fx_fuzz_qos,},
                 "i440FX-pcihost",

@@ -1,3 +1,5 @@
+.. _qemu-ga:
+
 QEMU Guest Agent
 ================
 
@@ -28,21 +30,41 @@ configuration options on the command line. For the same key, the last
 option wins, but the lists accumulate (see below for configuration
 file format).
 
+If an allowed RPCs list is defined in the configuration, then all
+RPCs will be blocked by default, except for the allowed list.
+
+If a blocked RPCs list is defined in the configuration, then all
+RPCs will be allowed by default, except for the blocked list.
+
+If both allowed and blocked RPCs lists are defined in the configuration,
+then all RPCs will be blocked by default, then the allowed list will
+be applied, followed by the blocked list.
+
+While filesystems are frozen, all except for a designated safe set
+of RPCs will blocked, regardless of what the general configuration
+declares.
+
 Options
 -------
 
 .. program:: qemu-ga
 
+.. option:: -c, --config=PATH
+
+  Configuration file path (the default is |CONFDIR|\ ``/qemu-ga.conf``,
+  unless overridden by the QGA_CONF environment variable)
+
 .. option:: -m, --method=METHOD
 
   Transport method: one of ``unix-listen``, ``virtio-serial``, or
-  ``isa-serial`` (``virtio-serial`` is the default).
+  ``isa-serial``, or ``vsock-listen`` (``virtio-serial`` is the default).
 
 .. option:: -p, --path=PATH
 
   Device/socket path (the default for virtio-serial is
   ``/dev/virtio-ports/org.qemu.guest_agent.0``,
-  the default for isa-serial is ``/dev/ttyS0``)
+  the default for isa-serial is ``/dev/ttyS0``). Socket addresses for
+  vsock-listen are written as ``<cid>:<port>``.
 
 .. option:: -l, --logfile=PATH
 
@@ -78,10 +100,15 @@ Options
 
   Daemonize after startup (detach from terminal).
 
-.. option:: -b, --blacklist=LIST
+.. option:: -b, --block-rpcs=LIST
 
-  Comma-separated list of RPCs to disable (no spaces, ``?`` to list
-  available RPCs).
+  Comma-separated list of RPCs to disable (no spaces, use ``--block-rpcs=help``
+  to list available RPCs).
+
+.. option:: -a, --allow-rpcs=LIST
+
+  Comma-separated list of RPCs to enable (no spaces, use ``--allow-rpcs=help``
+  to list available RPCs).
 
 .. option:: -D, --dump-conf
 
@@ -124,7 +151,8 @@ pidfile        string
 fsfreeze-hook  string
 statedir       string
 verbose        boolean
-blacklist      string list
+block-rpcs     string list
+allow-rpcs     string list
 =============  ===========
 
 See also
